@@ -1,0 +1,16 @@
+<div class="page">
+  <h2 class="section-title">Upcoming Plan</h2>
+
+  {% if content and content.upcoming_plan_notes %}
+  <div class="card">{{ content.upcoming_plan_notes|safe }}</div>
+  {% else %}
+  <p class="empty-state">No upcoming plan has been added for this reporting period.</p>
+  {% endif %}
+
+  {% if content and content.final_remarks %}
+  <h3>Final Remarks</h3>
+  <div class="card">{{ content.final_remarks|safe }}</div>
+  {% endif %}
+
+  <p class="footer-note">Report Version {{ report.version }} · Generated {{ generated_date }} · Confidential</p>
+</div>

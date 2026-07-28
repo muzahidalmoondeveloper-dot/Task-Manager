@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>{{ report.title }}</title>
+  <style>
+    :root {
+      --primary-color: #1E3A8A;
+      --accent-color: #3B82F6;
+      --secondary-color: #0F172A;
+      --heading-color: #0F172A;
+      --body-color: #334155;
+      --card-background: #FFFFFF;
+      --table-header-color: #E2E8F0;
+    }
+    {{ print_css|safe }}
+    @page { size: A4 landscape; margin: 16mm 14mm 18mm 14mm; }
+    .score-hero { display: flex; align-items: center; justify-content: space-between; }
+    .score-hero .score-value { font-size: 42px; font-weight: 800; color: var(--heading-color); }
+    .score-hero .score-value span { font-size: 16px; color: #94a3b8; font-weight: 500; }
+    .perf-badge { display: inline-block; border-radius: 999px; padding: 4px 14px; font-size: 11px; font-weight: 700; }
+    .perf-Excellent { background: #d1fae5; color: #047857; }
+    .perf-Very-Good { background: #ccfbf1; color: #0f766e; }
+    .perf-Good { background: #dbeafe; color: #1d4ed8; }
+    .perf-Needs-Improvement { background: #fef3c7; color: #b45309; }
+    .perf-Poor { background: #fee2e2; color: #b91c1c; }
+    .impact-completed_early, .impact-completed_on_time, .impact-completed { background: #22C55E; }
+    .impact-completed_late { background: #F97316; }
+    .impact-overdue { background: #EF4444; }
+    .impact-pending { background: #94A3B8; }
+    .rank-cell { font-weight: 700; color: #64748b; }
+  </style>
+</head>
+<body>
+  <div class="page cover">
+    <div class="logo-row">
+      {% if org.logo_url %}<img src="{{ org.logo_url }}" />{% endif %}
+    </div>
+    <h1>Team Performance Report</h1>
+    <p class="subtitle">{{ team.name }}</p>
+    <p class="meta">Team Leader: {{ team.manager_name or "—" }} · {{ team.member_count }} member{{ "s" if team.member_count != 1 else "" }}</p>
+    <p class="meta">Report Period: {{ report.period_start }} – {{ report.period_end }}</p>
+    <p class="meta">Generated On: {{ generated_date }} by {{ generated_by }}</p>
+    <p class="meta">{{ org.name }}</p>
+    <div class="confidential">CONFIDENTIAL</div>
+  </div>
+
+  <div class="page">
+    <div class="section-title">Team Performance Summary</div>
+    <div class="card score-hero">
+      <div>
+        <div class="score-value">{{ score.rounded_score if score.has_data else "—" }}<span>/100</span></div>
+        {% if score.has_data %}
+          <span class="perf-badge perf-{{ score.performance_level|replace(' ', '-') }}">{{ score.performance_level }}</span>
+          {% if score.change_from_previous is not none %}
+            <span style="margin-left:8px;font-size:10px;color:{{ '#047857' if score.change_from_previous >= 0 else '#b91c1c' }};">
+              {{ "▲" if score.change_from_previous > 0 else ("▼" if score.change_from_previous < 0 else "•") }}
+              {{ score.change_from_previous|abs }} vs previous period
+            </span>
+          {% endif %}
+        {% else %}
+          <span class="empty-state">No task activity this period</span>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="dashboard-grid">
+      <div class="stat-card"><div class="label">Team Members</div><div class="value">{{ team.member_count }}</div></div>
+      <div class="stat-card"><div class="label">Assigned Tasks</div><div class="value">{{ summary.total_assigned }}</div></div>
+      <div class="stat-card"><div class="label">Completed Tasks</div><div class="value">{{ summary.total_completed }}</div></div>
+      <div class="stat-card"><div class="label">Overdue Tasks</div><div class="value">{{ summary.overdue }}</div></div>
+      <div class="stat-card"><div class="label">Completion Rate</div><div class="value">{{ summary.completion_rate }}%</div></div>
+      <div class="stat-card"><div class="label">On-Time Rate</div><div class="value">{{ summary.on_time_rate }}%</div></div>
+    </div>
+
+    <div class="section-title">Team Task Breakdown</div>
+    <table>
+      <thead><tr><th>Category</th><th>Count</th></tr></thead>
+      <tbody>
+        <tr><td>Completed before due date</td><td>{{ summary.completed_before_due }}</td></tr>
+        <tr><td>Completed on due date</td><td>{{ summary.completed_on_due }}</td></tr>
+        <tr><td>Completed after due date</td><td>{{ summary.completed_after_due }}</td></tr>
+        <tr><td>Completed without a due date</td><td>{{ summary.completed_no_due_date }}</td></tr>
+        <tr><td>Currently overdue</td><td>{{ summary.overdue }}</td></tr>
+        <tr><td>Pending (not yet due)</td><td>{{ summary.pending }}</td></tr>
+      </tbody>
+    </table>
+
+    <div class="section-title">Team Insights</div>
+    {% if insights %}
+      <ul>
+        {% for line in insights %}<li>{{ line }}</li>{% endfor %}
+      </ul>
+    {% else %}
+      <p class="empty-state">Not enough task activity yet to generate insights.</p>
+    {% endif %}
+  </div>
+
+  <div class="page">
+    <div class="section-title">Member Performance Ranking</div>
+    {% if members %}
+    <table>
+      <thead>
+        <tr><th>Rank</th><th>Employee</th><th>Assigned</th><th>Completed</th><th>On-Time Rate</th><th>Overdue</th><th>Score</th><th>Level</th></tr>
+      </thead>
+      <tbody>
+        {% for m in members %}
+        <tr>
+          <td class="rank-cell">{{ m.rank }}</td>
+          <td>{{ m.full_name }}</td>
+          <td>{{ m.total_assigned }}</td>
+          <td>{{ m.total_completed }}</td>
+          <td>{{ m.on_time_rate }}%</td>
+          <td>{{ m.overdue }}</td>
+          <td>{{ m.rounded_score if m.has_data else "—" }}</td>
+          <td>{% if m.has_data %}<span class="perf-badge perf-{{ m.performance_level|replace(' ', '-') }}">{{ m.performance_level }}</span>{% else %}—{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+      <p class="empty-state">This team does not currently have any members.</p>
+    {% endif %}
+  </div>
+
+  {% if include_task_details %}
+  <div class="page">
+    <div class="section-title">Task Details</div>
+    {% if tasks %}
+    <table>
+      <thead>
+        <tr><th>Task</th><th>Project</th><th>Priority</th><th>Due Date</th><th>Completed</th><th>Status</th><th>Score Impact</th></tr>
+      </thead>
+      <tbody>
+        {% for t in tasks %}
+        <tr>
+          <td>{{ t.name }}</td>
+          <td>{{ t.project_name or "—" }}</td>
+          <td>{{ t.priority|capitalize }}</td>
+          <td>{{ t.due_date or "—" }}</td>
+          <td>{{ t.completed_at.strftime("%Y-%m-%d") if t.completed_at else "—" }}</td>
+          <td>{{ t.status|replace("_", " ")|capitalize }}</td>
+          <td><span class="status-badge impact-{{ t.score_impact }}">{{ t.score_impact|replace("_", " ") }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+      <p class="empty-state">No tasks in this period.</p>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <p class="footer-note">Confidential | {{ org.name }} | Generated {{ generated_date }}</p>
+</body>
+</html>

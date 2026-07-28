@@ -1,0 +1,48 @@
+<div class="page">
+  <h2 class="section-title">Risks and Issues</h2>
+
+  <h3>Risks</h3>
+  {% if risks|length == 0 %}
+  <p class="empty-state">No active risks were identified.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>Risk</th><th>Severity</th><th>Likelihood</th><th>Owner</th><th>Mitigation Plan</th><th>Status</th></tr>
+    </thead>
+    <tbody>
+      {% for risk in risks %}
+      <tr>
+        <td>{{ risk.title }}</td>
+        <td style="text-transform: capitalize;">{{ risk.severity }}</td>
+        <td style="text-transform: capitalize;">{{ risk.likelihood }}</td>
+        <td>{{ risk.owner_name or "—" }}</td>
+        <td>{{ risk.mitigation_plan or "—" }}</td>
+        <td><span class="status-badge status-{{ risk.status }}">{{ risk.status|replace('_',' ') }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <h3>Issues</h3>
+  {% if issues|length == 0 %}
+  <p class="empty-state">No issues to report.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>Issue</th><th>Status</th><th>Owner</th><th>Resolution Plan</th><th>Target Resolution</th></tr>
+    </thead>
+    <tbody>
+      {% for issue in issues %}
+      <tr>
+        <td>{{ issue.title }}</td>
+        <td><span class="status-badge status-{{ issue.status }}">{{ issue.status|replace('_',' ') }}</span></td>
+        <td>{{ issue.owner_name or "—" }}</td>
+        <td>{{ issue.resolution_plan or "—" }}</td>
+        <td>{{ issue.target_resolution_date or "—" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>

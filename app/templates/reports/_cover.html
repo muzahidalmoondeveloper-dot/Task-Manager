@@ -1,0 +1,22 @@
+<div class="page">
+  <div class="cover">
+    <div class="logo-row">
+      {% if branding and branding.company_logo_url %}<img src="{{ branding.company_logo_url }}" alt="Company logo" />{% endif %}
+      {% if branding and branding.client_logo_url %}<img src="{{ branding.client_logo_url }}" alt="Client logo" />{% endif %}
+    </div>
+    <h1>{{ report.project.name if report.project else report.title }}</h1>
+    <p class="subtitle">{{ report.title }}</p>
+    <p class="meta">Report Type: {{ report.report_type|capitalize }}</p>
+    {% if branding and branding.client_name %}<p class="meta">Prepared for: {{ branding.client_name }}</p>{% endif %}
+    <p class="meta">Reporting Period: {{ report.period_start or "—" }} - {{ report.period_end or "—" }}</p>
+    <p class="meta">Prepared by: {{ report.created_by.full_name if report.created_by else "—" }}</p>
+    <p class="meta">Generated on: {{ generated_date }}</p>
+
+    <div class="status-row">
+      <div class="status-pill">Overall Status: <strong>{{ calculated.health_status|replace('_', ' ')|upper }}</strong></div>
+      <div class="status-pill">Overall Completion: <strong>{{ calculated.overall_progress }}%</strong></div>
+    </div>
+
+    <p class="confidential">CONFIDENTIAL</p>
+  </div>
+</div>

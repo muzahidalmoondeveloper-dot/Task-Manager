@@ -1,0 +1,18 @@
+<div class="page">
+  <h2 class="section-title">Rock Progress</h2>
+
+  {% if rocks|length == 0 %}
+  <p class="empty-state">No Rocks are available for this reporting period.</p>
+  {% endif %}
+
+  {% for rock in rocks %}
+  <div class="card avoid-break">
+    <h3>{{ rock.title }} <span class="status-badge status-{{ rock.status }}">{{ rock.status|replace('_',' ') }}</span></h3>
+    {% if rock.owner_name %}<p>Owner: {{ rock.owner_name }}</p>{% endif %}
+    {% if rock.due_date %}<p>Deadline: {{ rock.due_date }}</p>{% endif %}
+    <p>Progress: {{ rock.progress_pct }}%</p>
+    <div class="progress-bar"><div class="progress-bar-fill" style="width: {{ rock.progress_pct }}%;"></div></div>
+    {% if rock.commentary %}<p>{{ rock.commentary|safe }}</p>{% endif %}
+  </div>
+  {% endfor %}
+</div>

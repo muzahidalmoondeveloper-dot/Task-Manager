@@ -1,0 +1,24 @@
+<div class="page">
+  <h2 class="section-title">Milestone Timeline</h2>
+
+  {% if milestones|length == 0 %}
+  <p class="empty-state">No milestones are available for this reporting period.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>Milestone</th><th>Status</th><th>Planned End</th><th>Forecast End</th><th>Delay (days)</th></tr>
+    </thead>
+    <tbody>
+      {% for m in milestones %}
+      <tr>
+        <td>{{ m.title }}</td>
+        <td><span class="status-badge status-{{ m.status }}">{{ m.status|replace('_',' ') }}</span></td>
+        <td>{{ m.planned_end_date or "—" }}</td>
+        <td>{{ m.forecast_end_date or m.actual_end_date or "—" }}</td>
+        <td>{{ m.delay_days if m.delay_days is not none else "—" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
