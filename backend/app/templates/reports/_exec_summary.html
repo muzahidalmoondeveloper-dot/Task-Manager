@@ -1,0 +1,28 @@
+<div class="page">
+  <h2 class="section-title">Executive Summary</h2>
+
+  {% if content and content.executive_summary %}
+  <div class="card">{{ content.executive_summary|safe }}</div>
+  {% else %}
+  <p class="empty-state">No executive summary has been added for this reporting period.</p>
+  {% endif %}
+
+  <div class="dashboard-grid" style="grid-template-columns: repeat(2, 1fr);">
+    <div class="card">
+      <h3>Key Achievement</h3>
+      {{ (content.key_achievement if content else None)|default("<p class='empty-state'>—</p>", true)|safe }}
+    </div>
+    <div class="card">
+      <h3>Current Challenge</h3>
+      {{ (content.current_challenge if content else None)|default("<p class='empty-state'>—</p>", true)|safe }}
+    </div>
+    <div class="card">
+      <h3>Next Priority</h3>
+      {{ (content.next_priority if content else None)|default("<p class='empty-state'>—</p>", true)|safe }}
+    </div>
+    <div class="card">
+      <h3>Client Attention</h3>
+      {{ (content.client_attention if content else None)|default("<p class='empty-state'>—</p>", true)|safe }}
+    </div>
+  </div>
+</div>

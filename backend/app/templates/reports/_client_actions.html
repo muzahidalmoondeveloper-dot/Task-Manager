@@ -1,0 +1,18 @@
+<div class="page">
+  <h2 class="section-title">Client Actions Required</h2>
+
+  {% if client_actions|length == 0 %}
+  <p class="empty-state">No client actions are required for this reporting period.</p>
+  {% else %}
+  {% for action in client_actions %}
+  <div class="card avoid-break">
+    <h3>{{ action.title }} <span class="status-badge status-{{ action.status }}">{{ action.status|replace('_',' ') }}</span></h3>
+    {% if action.description %}<p>{{ action.description|safe }}</p>{% endif %}
+    <p>Responsible: {{ action.responsible_person or "Client" }}</p>
+    {% if action.due_date %}<p>Due Date: {{ action.due_date }}</p>{% endif %}
+    <p>Priority: <span style="text-transform: capitalize;">{{ action.priority }}</span></p>
+    {% if action.impact_if_delayed %}<p>Impact if Delayed: {{ action.impact_if_delayed }}</p>{% endif %}
+  </div>
+  {% endfor %}
+  {% endif %}
+</div>

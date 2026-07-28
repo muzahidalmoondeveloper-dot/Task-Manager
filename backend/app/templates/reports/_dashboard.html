@@ -1,0 +1,42 @@
+<div class="page">
+  <h2 class="section-title">Executive Dashboard</h2>
+
+  <div class="dashboard-grid">
+    <div class="stat-card">
+      <p class="label">Overall Progress</p>
+      <p class="value">{{ calculated.overall_progress }}%</p>
+    </div>
+    <div class="stat-card">
+      <p class="label">Project Health Score</p>
+      <p class="value">{{ calculated.health_score }}/100</p>
+    </div>
+    <div class="stat-card">
+      <p class="label">Rock Progress</p>
+      <p class="value">{{ calculated.rock_progress_pct }}%</p>
+    </div>
+    <div class="stat-card">
+      <p class="label">KPI Performance</p>
+      <p class="value">{{ calculated.kpi_performance_pct }}%</p>
+    </div>
+    <div class="stat-card">
+      <p class="label">Tasks Completed</p>
+      <p class="value">{{ calculated.tasks_completed }}/{{ calculated.tasks_total }}</p>
+    </div>
+    <div class="stat-card">
+      <p class="label">Milestones Completed</p>
+      <p class="value">{{ calculated.milestones_completed }}/{{ calculated.milestones_total }}</p>
+    </div>
+    <div class="stat-card">
+      <p class="label">Open Risks</p>
+      <p class="value">{{ calculated.open_risks }}</p>
+    </div>
+    <div class="stat-card">
+      <p class="label">Blocked Tasks</p>
+      <p class="value">{{ calculated.blocked_tasks }}</p>
+    </div>
+    <div class="stat-card">
+      <p class="label">Overall Rating</p>
+      <p class="value" style="text-transform: capitalize;">{{ calculated.health_rating|replace('_', ' ') }}</p>
+    </div>
+  </div>
+</div>

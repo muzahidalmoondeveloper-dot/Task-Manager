@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>{{ report.title }}</title>
+  <style>
+    :root {
+      --primary-color: {{ theme.primary_color if theme else "#1E3A8A" }};
+      --accent-color: {{ theme.accent_color if theme else "#3B82F6" }};
+      --secondary-color: {{ theme.secondary_color if theme else "#0F172A" }};
+      --heading-color: {{ theme.primary_color if theme else "#0F172A" }};
+      --body-color: #334155;
+      --card-background: #FFFFFF;
+      --table-header-color: #E2E8F0;
+    }
+    {{ print_css|safe }}
+  </style>
+</head>
+<body>
+  {% include "_cover.html" %}
+  {% include "_dashboard.html" %}
+  {% include "_exec_summary.html" %}
+  {% include "_rocks.html" %}
+  {% include "_kpis.html" %}
+  {% include "_milestones.html" %}
+  {% include "_tasks.html" %}
+  {% include "_risks_issues.html" %}
+  {% include "_client_actions.html" %}
+  {% include "_upcoming_plan.html" %}
+</body>
+</html>

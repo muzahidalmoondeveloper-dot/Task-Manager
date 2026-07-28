@@ -1,0 +1,38 @@
+<div class="page">
+  <h2 class="section-title">Task Overview</h2>
+
+  {% if tasks|length == 0 %}
+  <p class="empty-state">No tasks are available for this reporting period.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>Task Status</th><th>Count</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Completed</td><td>{{ calculated.tasks_completed }}</td></tr>
+      <tr><td>Total</td><td>{{ calculated.tasks_total }}</td></tr>
+      <tr><td>Blocked</td><td>{{ calculated.blocked_tasks }}</td></tr>
+    </tbody>
+  </table>
+
+  <table>
+    <thead>
+      <tr><th>Task</th><th>Assignee</th><th>Status</th><th>Due Date</th><th>Flags</th></tr>
+    </thead>
+    <tbody>
+      {% for task in tasks %}
+      <tr>
+        <td>{{ task.name }}</td>
+        <td>{{ task.assignee_name or "Unassigned" }}</td>
+        <td><span class="status-badge status-{{ task.status }}">{{ task.status|replace('_',' ') }}</span></td>
+        <td>{{ task.due_date or "—" }}</td>
+        <td>
+          {% if task.is_overdue %}Overdue {% endif %}
+          {% if task.is_blocked %}Blocked{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>

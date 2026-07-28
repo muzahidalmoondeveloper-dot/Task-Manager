@@ -1,0 +1,27 @@
+<div class="page">
+  <h2 class="section-title">KPI Scorecard</h2>
+
+  {% if kpis|length == 0 %}
+  <p class="empty-state">No KPI data is available.</p>
+  {% else %}
+  <table>
+    <thead>
+      <tr><th>KPI</th><th>Target</th><th>Actual</th><th>Trend</th><th>Status</th></tr>
+    </thead>
+    <tbody>
+      {% for kpi in kpis %}
+      <tr>
+        <td>{{ kpi.name }}</td>
+        <td>{{ kpi.target_value if kpi.target_value is not none else "—" }}</td>
+        <td>{{ kpi.actual_value if kpi.actual_value is not none else "—" }}</td>
+        <td style="text-transform: capitalize;">{{ kpi.trend }}</td>
+        <td><span class="status-badge status-{{ kpi.status }}">{{ kpi.status|replace('_',' ') }}</span></td>
+      </tr>
+      {% if kpi.commentary %}
+      <tr><td colspan="5">{{ kpi.commentary|safe }}</td></tr>
+      {% endif %}
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
