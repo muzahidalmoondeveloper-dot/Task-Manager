@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.org_roles import TEAM_MEMBER
-from app.models.organization import OrganizationMembership
+from app.models.organization import Organization, OrganizationMembership
 from app.models.task import Task
 
 PERFORMANCE_LEVELS = (
@@ -38,6 +38,31 @@ PERFORMANCE_LEVELS = (
 _COMPLETION_WEIGHT = 0.35
 _ON_TIME_WEIGHT = 0.40
 _OVERDUE_WEIGHT = 0.25
+
+
+@dataclass
+class ScoreWeights:
+    completion: float = _COMPLETION_WEIGHT
+    on_time: float = _ON_TIME_WEIGHT
+    overdue: float = _OVERDUE_WEIGHT
+
+
+async def get_org_score_weights(db: AsyncSession, org_id) -> ScoreWeights:
+    """Fetches the org's configured scoring weights (Organization Settings →
+    Scoreboard Weights). Falls back to the built-in defaults if the org row
+    can't be found, so scoring never hard-fails on a missing organization."""
+    result = await db.execute(
+        select(
+            Organization.scoreboard_completion_weight,
+            Organization.scoreboard_on_time_weight,
+            Organization.scoreboard_overdue_weight,
+        ).where(Organization.id == org_id)
+    )
+    row = result.first()
+    if row is None:
+        return ScoreWeights()
+    completion, on_time, overdue = row
+    return ScoreWeights(completion=completion, on_time=on_time, overdue=overdue)
 
 
 def performance_level(score: float) -> str:
@@ -284,7 +309,8 @@ class ScoreboardResult:
     task_breakdown: dict[str, int] = field(default_factory=dict)
 
 
-def compute_scoreboard(tasks: list[Task]) -> ScoreboardResult:
+def compute_scoreboard(tasks: list[Task], weights: ScoreWeights | None = None) -> ScoreboardResult:
+    weights = weights or ScoreWeights()
     today = _today()
     total_assigned = len(tasks)
 
@@ -321,18 +347,26 @@ def compute_scoreboard(tasks: list[Task]) -> ScoreboardResult:
     on_time_eligible = completed_before_due + completed_on_due + completed_after_due
 
     completion_rate = (total_completed / total_assigned) * 100
-    # No due-dated completions to judge on-time-ness — don't unfairly penalize.
-    on_time_rate = (
-        ((completed_before_due + completed_on_due) / on_time_eligible) * 100
-        if on_time_eligible > 0
-        else 100.0
-    )
+    if on_time_eligible > 0:
+        on_time_rate = ((completed_before_due + completed_on_due) / on_time_eligible) * 100
+    elif total_completed > 0:
+        # Completed tasks exist, but none had a due date to judge on-time-ness
+        # by — don't unfairly penalize for missing due dates.
+        on_time_rate = 100.0
+    else:
+        # Nothing completed yet — there's no on-time performance to credit.
+        on_time_rate = 0.0
     overdue_pct = (overdue / total_assigned) * 100
     overdue_performance_rate = 100 - overdue_pct
 
-    completion_score = completion_rate * _COMPLETION_WEIGHT
-    on_time_score = on_time_rate * _ON_TIME_WEIGHT
-    overdue_score = overdue_performance_rate * _OVERDUE_WEIGHT
+    completion_score = completion_rate * weights.completion
+    on_time_score = on_time_rate * weights.on_time
+    if total_completed == 0 and overdue == 0:
+        # Nothing done yet, and nothing overdue yet either — pending tasks
+        # that aren't due yet are neutral, not a "clean record" to reward.
+        overdue_score = 0.0
+    else:
+        overdue_score = overdue_performance_rate * weights.overdue
     total_score = max(0.0, min(100.0, completion_score + on_time_score + overdue_score))
     rounded_score = round(total_score)
 
@@ -437,6 +471,7 @@ async def _build_trend_series(
     anchor_start: date,
     anchor_end: date,
     *,
+    weights: ScoreWeights,
     employee_id: int | None = None,
     team_id: int | None = None,
     project_id: int | None = None,
@@ -452,7 +487,7 @@ async def _build_trend_series(
             window_tasks = await fetch_eligible_team_tasks(
                 db, org_id, team_id, window_start, window_end, project_id,
             )
-        window_result = compute_scoreboard(window_tasks)
+        window_result = compute_scoreboard(window_tasks, weights)
         label = window_start.strftime("%b %d") if period == "this_week" else window_start.strftime("%b %Y")
         points.append({
             "period_label": label,
@@ -492,20 +527,21 @@ async def build_employee_scoreboard(
     called by both `GET /users/{id}/scoreboard` and the Employee Performance
     PDF report, so they can never disagree."""
     period_start, period_end = resolve_period(period, start_date, end_date)
+    weights = await get_org_score_weights(db, org_id)
 
     current_tasks = await fetch_eligible_tasks(db, org_id, employee_id, period_start, period_end, project_id, team_id)
-    current = compute_scoreboard(current_tasks)
+    current = compute_scoreboard(current_tasks, weights)
 
     prev_start, prev_end = previous_period(period, period_start, period_end)
     prev_tasks = await fetch_eligible_tasks(db, org_id, employee_id, prev_start, prev_end, project_id, team_id)
-    previous = compute_scoreboard(prev_tasks)
+    previous = compute_scoreboard(prev_tasks, weights)
 
     change_from_previous = None
     if current.has_data and previous.has_data:
         change_from_previous = current.rounded_score - previous.rounded_score
 
     trend = await _build_trend_series(
-        db, org_id, period, period_start, period_end,
+        db, org_id, period, period_start, period_end, weights=weights,
         employee_id=employee_id, team_id=team_id, project_id=project_id,
     )
     explanation = build_explanation(current, previous)
@@ -568,25 +604,26 @@ async def build_team_scoreboard(
     membership's `.user`) eagerly loaded, as returned by
     `TeamRepository.get_by_id`."""
     period_start, period_end = resolve_period(period, start_date, end_date)
+    weights = await get_org_score_weights(db, org_id)
 
     current_tasks = await fetch_eligible_team_tasks(db, org_id, team.id, period_start, period_end, project_id)
-    current = compute_scoreboard(current_tasks)
+    current = compute_scoreboard(current_tasks, weights)
 
     prev_start, prev_end = previous_period(period, period_start, period_end)
     prev_tasks = await fetch_eligible_team_tasks(db, org_id, team.id, prev_start, prev_end, project_id)
-    previous = compute_scoreboard(prev_tasks)
+    previous = compute_scoreboard(prev_tasks, weights)
 
     change_from_previous = None
     if current.has_data and previous.has_data:
         change_from_previous = current.rounded_score - previous.rounded_score
 
     trend = await _build_trend_series(
-        db, org_id, period, period_start, period_end, team_id=team.id, project_id=project_id,
+        db, org_id, period, period_start, period_end, weights=weights, team_id=team.id, project_id=project_id,
     )
     earliest_window_start, earliest_window_end = trailing_periods(period, period_start, period_end, count=6)[0]
     prev_anchor_start, prev_anchor_end = previous_period(period, earliest_window_start, earliest_window_end)
     previous_trend = await _build_trend_series(
-        db, org_id, period, prev_anchor_start, prev_anchor_end, team_id=team.id, project_id=project_id,
+        db, org_id, period, prev_anchor_start, prev_anchor_end, weights=weights, team_id=team.id, project_id=project_id,
     )
 
     member_rows: list[TeamMemberScoreboardRow] = []
@@ -594,7 +631,7 @@ async def build_team_scoreboard(
         member_tasks = await fetch_eligible_tasks(
             db, org_id, membership.user_id, period_start, period_end, project_id, team.id,
         )
-        member_result = compute_scoreboard(member_tasks)
+        member_result = compute_scoreboard(member_tasks, weights)
         member_rows.append(TeamMemberScoreboardRow(
             user_id=membership.user_id,
             full_name=membership.user.full_name,
@@ -653,6 +690,7 @@ async def build_organization_scoreboard(
     truth: `fetch_eligible_tasks` + `compute_scoreboard`).
     """
     period_start, period_end = resolve_period(period, start_date, end_date)
+    weights = await get_org_score_weights(db, org_id)
 
     earliest: dict[int, tuple] = {}  # user_id -> (team, membership.created_at, user)
     for team in teams:
@@ -685,7 +723,7 @@ async def build_organization_scoreboard(
     rows: list[OrgScoreboardRow] = []
     for user_id, (team, _joined_at, user) in candidates:
         tasks = await fetch_eligible_tasks(db, org_id, user_id, period_start, period_end, None, None)
-        result = compute_scoreboard(tasks)
+        result = compute_scoreboard(tasks, weights)
         rows.append(OrgScoreboardRow(
             user_id=user_id,
             full_name=user.full_name,
@@ -727,11 +765,12 @@ async def build_team_rankings(
     number shown on that team's own Team Scoreboard tab (pooling every
     member's eligible tasks, not one row per member)."""
     period_start, period_end = resolve_period(period, start_date, end_date)
+    weights = await get_org_score_weights(db, org_id)
 
     rows: list[TeamRankingRow] = []
     for team in teams:
         tasks = await fetch_eligible_team_tasks(db, org_id, team.id, period_start, period_end)
-        result = compute_scoreboard(tasks)
+        result = compute_scoreboard(tasks, weights)
         rows.append(TeamRankingRow(
             team_id=team.id,
             team_name=team.name,
@@ -771,6 +810,7 @@ async def build_manager_rankings(
     `compute_scoreboard` call so a manager of multiple teams is scored on
     their overall managed output, not an average of separate team scores."""
     period_start, period_end = resolve_period(period, start_date, end_date)
+    weights = await get_org_score_weights(db, org_id)
 
     by_manager: dict[int, dict] = {}
     for team in teams:
@@ -789,7 +829,7 @@ async def build_manager_rankings(
         tasks: list[Task] = []
         for team in entry["teams"]:
             tasks.extend(await fetch_eligible_team_tasks(db, org_id, team.id, period_start, period_end))
-        result = compute_scoreboard(tasks)
+        result = compute_scoreboard(tasks, weights)
         rows.append(ManagerRankingRow(
             manager_id=manager_id,
             manager_name=entry["manager"].full_name,

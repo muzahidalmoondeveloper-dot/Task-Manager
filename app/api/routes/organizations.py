@@ -40,6 +40,8 @@ from app.schemas.organization import (
     OrganizationSetupComplete,
     OrganizationUpdate,
     PlanLimitsRead,
+    ScoreboardWeightsRead,
+    ScoreboardWeightsUpdate,
     SlugCheckResponse,
     SubscriptionRead,
     UpdateMemberRoleRequest,
@@ -262,6 +264,26 @@ async def update_current_org(
     await db.commit()
     await db.refresh(org)
     return OrganizationRead.model_validate(org)
+
+
+@router.get("/current/scoreboard-weights", response_model=ScoreboardWeightsRead)
+async def get_scoreboard_weights(tenant: TenantContext = Depends(get_tenant_context)):
+    return ScoreboardWeightsRead.model_validate(tenant.organization)
+
+
+@router.put("/current/scoreboard-weights", response_model=ScoreboardWeightsRead)
+async def update_scoreboard_weights(
+    payload: ScoreboardWeightsUpdate,
+    tenant: TenantContext = Depends(require_org_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    org = tenant.organization
+    org.scoreboard_completion_weight = payload.scoreboard_completion_weight
+    org.scoreboard_on_time_weight = payload.scoreboard_on_time_weight
+    org.scoreboard_overdue_weight = payload.scoreboard_overdue_weight
+    await db.commit()
+    await db.refresh(org)
+    return ScoreboardWeightsRead.model_validate(org)
 
 
 @router.delete("/current", status_code=http_status.HTTP_204_NO_CONTENT)

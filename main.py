@@ -153,6 +153,15 @@ async def lifespan(app: FastAPI):
         await conn.execute(text(
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS icon VARCHAR(200)"
         ))
+        await conn.execute(text(
+            "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS scoreboard_completion_weight DOUBLE PRECISION NOT NULL DEFAULT 0.35"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS scoreboard_on_time_weight DOUBLE PRECISION NOT NULL DEFAULT 0.40"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS scoreboard_overdue_weight DOUBLE PRECISION NOT NULL DEFAULT 0.25"
+        ))
 
     await seed_admin()
 
