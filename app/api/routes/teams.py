@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.database import get_db
-from app.core.org_roles import ORG_MANAGEMENT_ROLES, PROJECT_MANAGER
+from app.core.org_roles import ORG_MANAGEMENT_ROLES, PROJECT_MANAGER, TEAM_MEMBER
 from app.core.tenant import TenantContext, get_tenant_context, require_org_admin, require_org_manager
 from app.models.team import Team
 from app.repositories.team_repository import TeamRepository
@@ -39,6 +39,8 @@ async def list_teams(tenant: TenantContext = Depends(get_tenant_context)):
     repo = TeamRepository(tenant.db, tenant.organization_id)
     if tenant.is_admin_or_owner or tenant.org_role == PROJECT_MANAGER:
         teams = await repo.list_all()
+    elif tenant.org_role == TEAM_MEMBER:
+        teams = await repo.list_for_member(tenant.user.id)
     else:
         teams = await repo.list_for_manager(tenant.user.id)
     return [_serialize(t) for t in teams]

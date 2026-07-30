@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -68,6 +70,12 @@ async def update_issue(
     issue = result.scalar_one_or_none()
     if not issue:
         raise HTTPException(status_code=404, detail="Issue not found")
+
+    if payload.status == "resolved" and issue.status != "resolved":
+        issue.resolved_at = datetime.now(timezone.utc)
+    elif payload.status is not None and payload.status != "resolved" and issue.status == "resolved":
+        issue.resolved_at = None
+
     for field, value in payload.model_dump(exclude_none=True, exclude={"links"}).items():
         setattr(issue, field, value)
     if payload.links is not None:
