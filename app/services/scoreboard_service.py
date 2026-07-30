@@ -361,9 +361,12 @@ def compute_scoreboard(tasks: list[Task], weights: ScoreWeights | None = None) -
 
     completion_score = completion_rate * weights.completion
     on_time_score = on_time_rate * weights.on_time
-    if total_completed == 0 and overdue == 0:
-        # Nothing done yet, and nothing overdue yet either — pending tasks
-        # that aren't due yet are neutral, not a "clean record" to reward.
+    if total_completed == 0:
+        # Nothing completed yet — the overdue component must never manufacture
+        # positive score out of not-yet-due pending tasks (a low overdue_pct
+        # relative to total_assigned would otherwise still score positively
+        # even with zero real output). Overdue can only ever drag a score
+        # down once there's actual completed work to drag down from.
         overdue_score = 0.0
     else:
         overdue_score = overdue_performance_rate * weights.overdue

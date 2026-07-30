@@ -1,3 +1,4 @@
+import random
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -18,6 +19,7 @@ from app.schemas.meeting import (
     DecisionCreate, DecisionOut,
     MeetingCreateTask, MeetingTaskOut,
     MeetingSummaryOut,
+    MeetingParticipantOut, ParticipantJoinUpdate, ParticipantScoreUpdate, SelectSpeakerRequest,
 )
 
 router = APIRouter(prefix="/teams/{team_id}/meetings", tags=["meetings"])
@@ -132,6 +134,168 @@ async def update_meeting(
     return meeting
 
 
+@router.patch("/{meeting_id}/participants/{user_id}", response_model=MeetingParticipantOut)
+async def set_participant_joined(
+    team_id: int,
+    meeting_id: int,
+    user_id: int,
+    payload: ParticipantJoinUpdate,
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Toggle a participant's attendance for the live meeting. Like the rest
+    of this router, host-only enforcement is left to the frontend (`canManage`)
+    rather than a server-side role check, matching start/pause/end/agenda/etc."""
+    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    result = await db.execute(
+        select(MeetingParticipant).where(
+            MeetingParticipant.meeting_id == meeting.id,
+            MeetingParticipant.user_id == user_id,
+        )
+    )
+    participant = result.scalar_one_or_none()
+    if not participant:
+        raise HTTPException(status_code=404, detail="Participant not found")
+
+    participant.joined_at = datetime.now(timezone.utc) if payload.joined else None
+    await db.commit()
+    await db.refresh(participant)
+    return participant
+
+
+@router.patch("/{meeting_id}/participants/{user_id}/score", response_model=MeetingParticipantOut)
+async def set_participant_score(
+    team_id: int,
+    meeting_id: int,
+    user_id: int,
+    payload: ParticipantScoreUpdate,
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Wrap-up rating: an attendee submits their own score for the meeting.
+    Self-only is enforced by the frontend (only your own row's Score button
+    is enabled), matching the router's usual convention."""
+    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    result = await db.execute(
+        select(MeetingParticipant).where(
+            MeetingParticipant.meeting_id == meeting.id,
+            MeetingParticipant.user_id == user_id,
+        )
+    )
+    participant = result.scalar_one_or_none()
+    if not participant:
+        raise HTTPException(status_code=404, detail="Participant not found")
+
+    participant.score = payload.score
+    participant.score_note = payload.note
+    participant.scored_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(participant)
+    return participant
+
+
+# ─── Personal check-in speaking order (L10 meetings) ─────────────────────────
+
+def _checkin_pool(meeting: Meeting) -> list[MeetingParticipant]:
+    """Only joined participants are eligible for the speaking order — matches
+    'display a Speaking Order section containing only the joined participants'."""
+    return [p for p in meeting.participants if p.joined_at is not None]
+
+
+async def _checkin_advance(meeting: Meeting, db: AsyncSession, *, skipped: bool) -> None:
+    if meeting.checkin_current_participant_id:
+        current = next((p for p in meeting.participants if p.id == meeting.checkin_current_participant_id), None)
+        if current:
+            current.spoken_at = datetime.now(timezone.utc)
+            current.skipped = skipped
+
+    remaining = [p for p in _checkin_pool(meeting) if p.spoken_at is None]
+    meeting.checkin_current_participant_id = random.choice(remaining).id if remaining else None
+    await db.commit()
+
+
+@router.post("/{meeting_id}/checkin/next", response_model=MeetingOut)
+async def checkin_next_speaker(
+    team_id: int,
+    meeting_id: int,
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Marks the currently-picked speaker as done (if any) and randomly picks
+    the next speaker from the eligible pool who haven't gone yet. Called once
+    with no current pick to start the roulette, and again each time the host
+    clicks the highlighted avatar to advance."""
+    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    await _checkin_advance(meeting, db, skipped=False)
+    # Re-select rather than db.refresh(): refresh() doesn't reliably cascade
+    # eager-reload nested lazy="selectin" attributes (e.g. participants[*].user)
+    # after expire_on_commit, which can crash response serialization.
+    return await _get_meeting(team_id, meeting_id, tenant, db)
+
+
+@router.post("/{meeting_id}/checkin/skip", response_model=MeetingOut)
+async def checkin_skip_speaker(
+    team_id: int,
+    meeting_id: int,
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Like checkin/next, but flags the passed-over speaker as `skipped`
+    rather than having actually spoken, for a distinct "Skipped" label."""
+    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    if not meeting.checkin_current_participant_id:
+        raise HTTPException(status_code=400, detail="No current speaker to skip.")
+    await _checkin_advance(meeting, db, skipped=True)
+    return await _get_meeting(team_id, meeting_id, tenant, db)
+
+
+@router.post("/{meeting_id}/checkin/select", response_model=MeetingOut)
+async def checkin_select_speaker(
+    team_id: int,
+    meeting_id: int,
+    payload: SelectSpeakerRequest,
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Host manually picks a specific eligible participant as the next
+    speaker, bypassing the random roulette. Marks the previous current
+    speaker as spoken first, same as checkin/next."""
+    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+
+    if meeting.checkin_current_participant_id:
+        current = next((p for p in meeting.participants if p.id == meeting.checkin_current_participant_id), None)
+        if current:
+            current.spoken_at = datetime.now(timezone.utc)
+            current.skipped = False
+
+    target = next(
+        (p for p in _checkin_pool(meeting) if p.user_id == payload.user_id and p.spoken_at is None), None
+    )
+    if not target:
+        raise HTTPException(status_code=400, detail="That participant is not eligible to speak.")
+
+    meeting.checkin_current_participant_id = target.id
+    await db.commit()
+    return await _get_meeting(team_id, meeting_id, tenant, db)
+
+
+@router.post("/{meeting_id}/checkin/reset", response_model=MeetingOut)
+async def checkin_reset(
+    team_id: int,
+    meeting_id: int,
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Clears the speaking-order state so the check-in can be run again."""
+    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    for p in meeting.participants:
+        p.spoken_at = None
+        p.skipped = False
+    meeting.checkin_current_participant_id = None
+    await db.commit()
+    return await _get_meeting(team_id, meeting_id, tenant, db)
+
+
 @router.delete("/{meeting_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_meeting(
     team_id: int,
@@ -156,13 +320,18 @@ async def start_meeting(
     meeting = await _get_meeting(team_id, meeting_id, tenant, db)
     if meeting.status not in ("scheduled", "paused"):
         raise HTTPException(status_code=400, detail=f"Cannot start a meeting with status '{meeting.status}'")
+    if meeting.status == "scheduled" and not any(p.joined_at for p in meeting.participants):
+        raise HTTPException(status_code=400, detail="At least one participant must join before starting the meeting.")
     meeting.status = "ongoing"
     if not meeting.started_at:
         meeting.started_at = datetime.now(timezone.utc)
+        if meeting.current_agenda_item_id is None and meeting.agenda_items:
+            first_pending = next((a for a in meeting.agenda_items if a.status != "done"), None)
+            if first_pending:
+                meeting.current_agenda_item_id = first_pending.id
     meeting.paused_at = None
     await db.commit()
-    await db.refresh(meeting)
-    return meeting
+    return await _get_meeting(team_id, meeting_id, tenant, db)
 
 
 @router.post("/{meeting_id}/pause", response_model=MeetingOut)
@@ -298,6 +467,32 @@ async def reorder_agenda(
     await db.commit()
     await db.refresh(meeting)
     return meeting.agenda_items
+
+
+@router.post("/{meeting_id}/agenda/next", response_model=MeetingOut)
+async def advance_agenda(
+    team_id: int,
+    meeting_id: int,
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Marks the current agenda item done (if any) and advances the pointer
+    to the next not-done item by sort_order, or null if none remain."""
+    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+
+    if meeting.current_agenda_item_id:
+        current = next((a for a in meeting.agenda_items if a.id == meeting.current_agenda_item_id), None)
+        if current:
+            current.status = "done"
+
+    next_item = next(
+        (a for a in meeting.agenda_items if a.status != "done" and a.id != meeting.current_agenda_item_id),
+        None,
+    )
+    meeting.current_agenda_item_id = next_item.id if next_item else None
+
+    await db.commit()
+    return await _get_meeting(team_id, meeting_id, tenant, db)
 
 
 # ─── Notes ────────────────────────────────────────────────────────────────────

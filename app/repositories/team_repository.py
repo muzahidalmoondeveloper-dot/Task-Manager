@@ -38,6 +38,16 @@ class TeamRepository(TenantRepository):
         result = await self.db.execute(stmt)
         return list(result.scalars().unique().all())
 
+    async def list_for_member(self, user_id: int) -> list[Team]:
+        stmt = (
+            self._base_query()
+            .join(TeamMembership, TeamMembership.team_id == Team.id)
+            .where(TeamMembership.user_id == user_id)
+            .order_by(Team.name.asc())
+        )
+        result = await self.db.execute(stmt)
+        return list(result.scalars().unique().all())
+
     async def get_by_id(self, team_id: int) -> Team | None:
         stmt = self._base_query().where(Team.id == team_id)
         result = await self.db.execute(stmt)
