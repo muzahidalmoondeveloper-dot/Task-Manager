@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, Uuid, func
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -27,6 +27,13 @@ class Organization(Base):
     # pending_setup | active — pending_setup until the creation wizard completes
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="active", index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    # Employee Scoreboard scoring weights — must sum to 1.0, enforced at the
+    # API layer (ScoreboardWeightsUpdate), not by a DB constraint.
+    scoreboard_completion_weight: Mapped[float] = mapped_column(Float, nullable=False, default=0.35, server_default="0.35")
+    scoreboard_on_time_weight: Mapped[float] = mapped_column(Float, nullable=False, default=0.40, server_default="0.40")
+    scoreboard_overdue_weight: Mapped[float] = mapped_column(Float, nullable=False, default=0.25, server_default="0.25")
+
     owner_id: Mapped[int] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"),
         nullable=False,

@@ -76,6 +76,32 @@ class OrganizationSetupComplete(BaseModel):
     industry: str | None = None
 
 
+class ScoreboardWeightsRead(BaseModel):
+    scoreboard_completion_weight: float
+    scoreboard_on_time_weight: float
+    scoreboard_overdue_weight: float
+
+    model_config = {"from_attributes": True}
+
+
+class ScoreboardWeightsUpdate(BaseModel):
+    scoreboard_completion_weight: float = Field(ge=0, le=1)
+    scoreboard_on_time_weight: float = Field(ge=0, le=1)
+    scoreboard_overdue_weight: float = Field(ge=0, le=1)
+
+    @field_validator("scoreboard_overdue_weight")
+    @classmethod
+    def validate_sum(cls, v, info):
+        completion = info.data.get("scoreboard_completion_weight")
+        on_time = info.data.get("scoreboard_on_time_weight")
+        if completion is None or on_time is None:
+            return v
+        total = completion + on_time + v
+        if abs(total - 1.0) > 0.01:
+            raise ValueError(f"Weights must sum to 100% (got {round(total * 100, 1)}%).")
+        return v
+
+
 class SlugCheckResponse(BaseModel):
     slug: str
     available: bool

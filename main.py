@@ -153,6 +153,44 @@ async def lifespan(app: FastAPI):
         await conn.execute(text(
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS icon VARCHAR(200)"
         ))
+        await conn.execute(text(
+            "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS scoreboard_completion_weight DOUBLE PRECISION NOT NULL DEFAULT 0.35"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS scoreboard_on_time_weight DOUBLE PRECISION NOT NULL DEFAULT 0.40"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS scoreboard_overdue_weight DOUBLE PRECISION NOT NULL DEFAULT 0.25"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meeting_participants ADD COLUMN IF NOT EXISTS joined_at TIMESTAMPTZ"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meeting_participants ADD COLUMN IF NOT EXISTS spoken_at TIMESTAMPTZ"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS checkin_current_participant_id INTEGER "
+            "REFERENCES meeting_participants(id) ON DELETE SET NULL"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meeting_participants ADD COLUMN IF NOT EXISTS selected BOOLEAN NOT NULL DEFAULT TRUE"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meeting_participants ADD COLUMN IF NOT EXISTS skipped BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS current_agenda_item_id INTEGER "
+            "REFERENCES meeting_agenda_items(id) ON DELETE SET NULL"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meeting_participants ADD COLUMN IF NOT EXISTS score DOUBLE PRECISION"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meeting_participants ADD COLUMN IF NOT EXISTS score_note TEXT"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meeting_participants ADD COLUMN IF NOT EXISTS scored_at TIMESTAMPTZ"
+        ))
 
     await seed_admin()
 

@@ -1,6 +1,6 @@
 from datetime import datetime, date
 from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class UserRef(BaseModel):
@@ -24,7 +24,28 @@ class MeetingParticipantOut(BaseModel):
     id: int
     user_id: Optional[int] = None
     user: Optional[UserRef] = None
+    selected: bool = True
+    joined_at: Optional[datetime] = None
+    spoken_at: Optional[datetime] = None
+    skipped: bool = False
+    score: Optional[float] = None
+    score_note: Optional[str] = None
+    scored_at: Optional[datetime] = None
     model_config = {"from_attributes": True}
+
+
+class ParticipantJoinUpdate(BaseModel):
+    joined: bool
+
+
+class ParticipantScoreUpdate(BaseModel):
+    score: float = Field(ge=1, le=10)
+    note: Optional[str] = None
+
+
+
+class SelectSpeakerRequest(BaseModel):
+    user_id: int
 
 
 # ─── Agenda ───────────────────────────────────────────────────────────────────
@@ -147,6 +168,8 @@ class MeetingOut(BaseModel):
     organizer_id: Optional[int] = None
     team_id: int
     organizer: Optional[UserRef] = None
+    checkin_current_participant_id: Optional[int] = None
+    current_agenda_item_id: Optional[int] = None
     participants: list[MeetingParticipantOut] = []
     agenda_items: list[AgendaItemOut] = []
     notes: list[NoteOut] = []
