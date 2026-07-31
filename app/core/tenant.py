@@ -5,10 +5,11 @@ from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.auth_errors import AppException, AuthError, ErrorDef, TokenError
 from app.core.database import get_db
-from app.core.org_roles import APP_MANAGEMENT_ROLES, OWNER, ORG_MANAGEMENT_ROLES
+from app.core.org_roles import APP_MANAGEMENT_ROLES, OWNER, ORG_MANAGEMENT_ROLES, PROJECT_MANAGER
 from app.core.plan_limits import PlanLimits, get_plan_limits
 from app.core.security import decode_access_token
 from app.core.token_cache import TokenCache, get_token_cache
@@ -65,6 +66,11 @@ _ORG_MANAGER_REQUIRED = ErrorDef(
     status=http_status.HTTP_403_FORBIDDEN,
     message="Team manager, admin, or owner access required.",
 )
+_SUBSCRIPTION_PAST_DUE = ErrorDef(
+    code="SUBSCRIPTION_PAST_DUE",
+    status=http_status.HTTP_402_PAYMENT_REQUIRED,
+    message="Your organization's subscription needs a payment method. Please update billing to continue.",
+)
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -79,7 +85,10 @@ class TenantContext:
 
     @property
     def plan_limits(self) -> PlanLimits:
-        return get_plan_limits(self.organization.plan)
+        sub = self.organization.subscription
+        extra_teams = sub.extra_teams if sub else 0
+        extra_users = sub.extra_users if sub else 0
+        return get_plan_limits(self.organization.plan, extra_teams, extra_users)
 
     @property
     def org_role(self) -> str:
@@ -91,13 +100,26 @@ class TenantContext:
 
     @property
     def is_admin_or_owner(self) -> bool:
-        """True for Owner and Admin — org-level administration."""
-        return self.membership.role in ORG_MANAGEMENT_ROLES
+        """True for Owner and Admin, or anyone additionally granted admin
+        privileges on top of their functional role (e.g. a team_manager or
+        project_manager who's also been made an admin) — org-level administration."""
+        return self.membership.role in ORG_MANAGEMENT_ROLES or self.membership.is_org_admin
 
     @property
     def is_manager_or_above(self) -> bool:
-        """True for Owner, Admin, and Team Manager — app-level management."""
-        return self.membership.role in APP_MANAGEMENT_ROLES
+        """True for Owner, Admin, and Team Manager, or anyone additionally
+        granted team-manager privileges on top of their functional role (e.g.
+        a project_manager who's also been made a team manager) — app-level
+        management."""
+        return self.membership.role in APP_MANAGEMENT_ROLES or self.membership.is_team_manager
+
+    @property
+    def has_project_manager_access(self) -> bool:
+        """True for the functional Project Manager role, or anyone
+        additionally granted project-manager privileges on top of their
+        functional role (e.g. a team_manager who's also been made a project
+        manager)."""
+        return self.membership.role == PROJECT_MANAGER or self.membership.is_project_manager
 
 
 async def get_tenant_context(
@@ -144,7 +166,11 @@ async def get_tenant_context(
         raise TokenError.invalid("Invalid organization identifier in token.")
 
     # ── Load organization ─────────────────────────────────────────────────────
-    result = await db.execute(select(Organization).where(Organization.id == org_id))
+    result = await db.execute(
+        select(Organization)
+        .where(Organization.id == org_id)
+        .options(selectinload(Organization.subscription))
+    )
     organization = result.scalar_one_or_none()
 
     if organization is None:
@@ -200,6 +226,24 @@ async def require_org_manager(
     """Owner, Admin, or Team Manager — teams / projects / tasks mutations."""
     if not tenant.is_manager_or_above:
         raise AppException(_ORG_MANAGER_REQUIRED)
+    return tenant
+
+
+def check_active_billing(tenant: TenantContext) -> None:
+    """Blocks creation of new teams/projects/members when the org's
+    subscription is past_due/cancelled/incomplete_expired (e.g. the trial
+    ended with no payment method). Existing resources stay fully usable —
+    call this explicitly only from routes that create new capacity-consuming
+    resources (team/project creation, member invites), not globally."""
+    sub = tenant.organization.subscription
+    if sub is not None and sub.status in ("past_due", "incomplete_expired", "cancelled"):
+        raise AppException(_SUBSCRIPTION_PAST_DUE)
+
+
+async def require_active_billing(
+    tenant: TenantContext = Depends(get_tenant_context),
+) -> TenantContext:
+    check_active_billing(tenant)
     return tenant
 
 

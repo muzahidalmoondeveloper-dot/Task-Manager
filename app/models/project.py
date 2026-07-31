@@ -16,6 +16,8 @@ class Project(Base):
 
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    logo_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
     status: Mapped[str] = mapped_column(
         String(50),
         default="active",

@@ -27,6 +27,7 @@ from app.api.routes import task_requests
 from app.api.routes import scoreboard
 from app.api.routes import team_scoreboard
 from app.api.routes import organization_scoreboard
+from app.api.routes import billing
 import app.models.issue  # noqa: F401  — register Issue
 import app.models.meeting  # noqa: F401  — register Meeting models
 import app.models.chat  # noqa: F401  — register models for auto table creation
@@ -191,6 +192,53 @@ async def lifespan(app: FastAPI):
         await conn.execute(text(
             "ALTER TABLE meeting_participants ADD COLUMN IF NOT EXISTS scored_at TIMESTAMPTZ"
         ))
+        await conn.execute(text(
+            "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS billing_interval VARCHAR(20) NOT NULL DEFAULT 'monthly'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS cancel_at_period_end BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS extra_teams INTEGER NOT NULL DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS extra_users INTEGER NOT NULL DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS stripe_extra_teams_item_id VARCHAR(255)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS stripe_extra_users_item_id VARCHAR(255)"
+        ))
+        # Pre-launch remap: free/professional/enterprise tiers are retired in
+        # favor of just Starter/Business — no live paying customers are
+        # affected by this rewrite. free -> starter (lowest paid tier);
+        # professional/enterprise -> business (highest remaining tier, since
+        # both were higher-capacity tiers than "starter").
+        await conn.execute(text(
+            "UPDATE organizations SET plan = 'starter' WHERE plan = 'free'"
+        ))
+        await conn.execute(text(
+            "UPDATE subscriptions SET plan = 'starter' WHERE plan = 'free'"
+        ))
+        await conn.execute(text(
+            "UPDATE organizations SET plan = 'business' WHERE plan IN ('professional', 'enterprise')"
+        ))
+        await conn.execute(text(
+            "UPDATE subscriptions SET plan = 'business' WHERE plan IN ('professional', 'enterprise')"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE organization_memberships ADD COLUMN IF NOT EXISTS is_org_admin BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS logo_url VARCHAR(500)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE organization_memberships ADD COLUMN IF NOT EXISTS is_team_manager BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE organization_memberships ADD COLUMN IF NOT EXISTS is_project_manager BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
 
     await seed_admin()
 
@@ -251,10 +299,15 @@ app.include_router(task_requests.router, prefix=settings.API_PREFIX)
 app.include_router(scoreboard.router, prefix=settings.API_PREFIX)
 app.include_router(team_scoreboard.router, prefix=settings.API_PREFIX)
 app.include_router(organization_scoreboard.router, prefix=settings.API_PREFIX)
+app.include_router(billing.router, prefix=settings.API_PREFIX)
 
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+
+settings.media_root_path.mkdir(parents=True, exist_ok=True)
+app.mount("/media", StaticFiles(directory=settings.media_root_path), name="media")
 
 
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"

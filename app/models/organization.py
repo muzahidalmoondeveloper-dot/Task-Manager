@@ -23,7 +23,7 @@ class Organization(Base):
     logo_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     website: Mapped[str | None] = mapped_column(String(500), nullable=True)
     industry: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    plan: Mapped[str] = mapped_column(String(50), nullable=False, default="free", index=True)
+    plan: Mapped[str] = mapped_column(String(50), nullable=False, default="starter", index=True)
     # pending_setup | active — pending_setup until the creation wizard completes
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="active", index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
@@ -86,6 +86,15 @@ class OrganizationMembership(Base):
     )
     # owner | admin | team_manager | team_member
     role: Mapped[str] = mapped_column(String(50), nullable=False, default=TEAM_MEMBER, index=True)
+    # Additive admin privileges layered on top of `role` — lets a team_manager
+    # or project_manager keep their functional role while also getting
+    # admin-equivalent access, instead of replacing their role with "admin".
+    is_org_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # Additive Team Manager / Project Manager privileges layered on top of
+    # `role` — lets a project_manager also act as a team manager (or vice
+    # versa) without losing their primary functional role.
+    is_team_manager: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    is_project_manager: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     joined_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -146,10 +155,12 @@ class Subscription(Base):
         unique=True,
         index=True,
     )
-    plan: Mapped[str] = mapped_column(String(50), nullable=False, default="free")
-    # trialing | active | past_due | cancelled | paused
+    plan: Mapped[str] = mapped_column(String(50), nullable=False, default="starter")
+    # trialing | active | past_due | cancelled | paused | incomplete_expired
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="active", index=True)
     seats: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    # monthly | annual — chosen at signup, not switchable self-serve in v1
+    billing_interval: Mapped[str] = mapped_column(String(20), nullable=False, default="monthly", server_default="monthly")
     trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     current_period_start: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -157,11 +168,18 @@ class Subscription(Base):
     current_period_end: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    # Stripe stubs — populated once billing is wired up
+    cancel_at_period_end: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # Purchased add-on quantities beyond the plan's base caps.
+    extra_teams: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    extra_users: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     stripe_subscription_id: Mapped[str | None] = mapped_column(
         String(255), nullable=True, unique=True, index=True
     )
     stripe_customer_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    # Stripe subscription item IDs for the add-on line items, so quantities
+    # can be patched in place instead of recreating the line item each time.
+    stripe_extra_teams_item_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    stripe_extra_users_item_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

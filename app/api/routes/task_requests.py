@@ -52,7 +52,7 @@ async def _notify_recipients(tenant: TenantContext, project_id: int) -> list[Use
         .join(ProjectMembership, ProjectMembership.user_id == User.id)
         .where(
             OrganizationMembership.organization_id == tenant.organization_id,
-            OrganizationMembership.role == PROJECT_MANAGER,
+            (OrganizationMembership.role == PROJECT_MANAGER) | (OrganizationMembership.is_project_manager.is_(True)),
             ProjectMembership.project_id == project_id,
         )
     )

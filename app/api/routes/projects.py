@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, UploadFile
+from fastapi import File as FastAPIFile
 from fastapi import status as http_status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,7 +9,7 @@ from app.api.routes.teams import _serialize as serialize_team
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.database import get_db
 from app.core.org_roles import CLIENT, PROJECT_MANAGER
-from app.core.tenant import TenantContext, get_tenant_context, require_org_admin, require_org_manager
+from app.core.tenant import TenantContext, check_active_billing, get_tenant_context, require_org_admin, require_org_manager
 from app.models.issue import Issue
 from app.models.kpi import KPI
 from app.models.objective import Objective
@@ -28,6 +29,7 @@ from app.schemas.project import (
     ProjectUpdate,
 )
 from app.schemas.rock import RockOut
+from app.services import logo_upload_service
 
 router = APIRouter(prefix="/projects", tags=["Projects"])
 
@@ -36,21 +38,30 @@ _PLAN_LIMIT = ErrorDef(code="PLAN_LIMIT_EXCEEDED", status=http_status.HTTP_402_P
 _NOT_ASSIGNED = ErrorDef(code="PROJECT_NOT_ASSIGNED", status=http_status.HTTP_403_FORBIDDEN, message="You are not assigned to this project.")
 _CLIENT_FORBIDDEN = ErrorDef(code="CLIENT_ITEMS_FORBIDDEN", status=http_status.HTTP_403_FORBIDDEN, message="Clients view project progress through Reports, not this endpoint.")
 
+_LOGO_DIR_NAME = "project_logos"
+
 
 _PROJECT_SCOPED_ROLES = {PROJECT_MANAGER, CLIENT}
 
 
-async def _require_project_access(tenant: TenantContext, repo: ProjectRepository, project_id: int) -> None:
+def _is_project_scoped(tenant: TenantContext) -> bool:
     """Project Managers and Clients only see projects they're assigned to;
-    every other role keeps today's org-wide project visibility."""
-    if tenant.org_role in _PROJECT_SCOPED_ROLES and not await repo.is_member(project_id, tenant.user.id):
+    every other role (including a Project Manager who's also been granted
+    team-manager privileges) keeps today's org-wide project visibility."""
+    if tenant.org_role not in _PROJECT_SCOPED_ROLES:
+        return False
+    return not tenant.is_manager_or_above
+
+
+async def _require_project_access(tenant: TenantContext, repo: ProjectRepository, project_id: int) -> None:
+    if _is_project_scoped(tenant) and not await repo.is_member(project_id, tenant.user.id):
         raise AppException(_NOT_ASSIGNED)
 
 
 @router.get("", response_model=list[ProjectRead])
 async def list_projects(tenant: TenantContext = Depends(get_tenant_context)):
     repo = ProjectRepository(tenant.db, tenant.organization_id)
-    if tenant.org_role in _PROJECT_SCOPED_ROLES:
+    if _is_project_scoped(tenant):
         return [ProjectRead.model_validate(p) for p in await repo.list_for_user(tenant.user.id)]
     return [ProjectRead.model_validate(p) for p in await repo.list_all()]
 
@@ -60,6 +71,7 @@ async def create_project(
     payload: ProjectCreate,
     tenant: TenantContext = Depends(require_org_manager),
 ):
+    check_active_billing(tenant)
     limits = tenant.plan_limits
     if limits.max_projects != -1:
         repo_check = ProjectRepository(tenant.db, tenant.organization_id)
@@ -94,6 +106,42 @@ async def update_project(
         raise AppException(_NOT_FOUND)
     updated = await repo.update(project, payload)
     return ProjectRead.model_validate(updated)
+
+
+@router.post("/{project_id}/logo", response_model=ProjectRead)
+async def upload_project_logo(
+    project_id: int,
+    tenant: TenantContext = Depends(require_org_manager),
+    file: UploadFile = FastAPIFile(...),
+):
+    repo = ProjectRepository(tenant.db, tenant.organization_id)
+    project = await repo.get_by_id(project_id)
+    if project is None:
+        raise AppException(_NOT_FOUND)
+
+    new_url = await logo_upload_service.save_logo(file, _LOGO_DIR_NAME, project_id)
+    logo_upload_service.delete_logo_file(project.logo_url, _LOGO_DIR_NAME)
+    project.logo_url = new_url
+    await tenant.db.commit()
+    await tenant.db.refresh(project)
+    return ProjectRead.model_validate(project)
+
+
+@router.delete("/{project_id}/logo", response_model=ProjectRead)
+async def delete_project_logo(
+    project_id: int,
+    tenant: TenantContext = Depends(require_org_manager),
+):
+    repo = ProjectRepository(tenant.db, tenant.organization_id)
+    project = await repo.get_by_id(project_id)
+    if project is None:
+        raise AppException(_NOT_FOUND)
+
+    logo_upload_service.delete_logo_file(project.logo_url, _LOGO_DIR_NAME)
+    project.logo_url = None
+    await tenant.db.commit()
+    await tenant.db.refresh(project)
+    return ProjectRead.model_validate(project)
 
 
 @router.delete("/{project_id}", status_code=http_status.HTTP_204_NO_CONTENT)
@@ -214,13 +262,16 @@ def _serialize_member(membership) -> ProjectMemberOut:
 
 
 async def _pm_user_ids(tenant: TenantContext, user_ids: list[int]) -> set[int]:
+    """Users who count as 'the Project Manager' for assignment purposes:
+    those with the functional project_manager role, plus anyone (e.g. a team
+    manager) additionally granted project-manager privileges."""
     if not user_ids:
         return set()
     result = await tenant.db.execute(
         select(OrganizationMembership.user_id).where(
             OrganizationMembership.organization_id == tenant.organization_id,
             OrganizationMembership.user_id.in_(user_ids),
-            OrganizationMembership.role == PROJECT_MANAGER,
+            (OrganizationMembership.role == PROJECT_MANAGER) | (OrganizationMembership.is_project_manager.is_(True)),
         )
     )
     return {row[0] for row in result.all()}

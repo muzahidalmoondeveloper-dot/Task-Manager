@@ -1,3 +1,4 @@
+import dataclasses
 from dataclasses import dataclass
 
 
@@ -21,58 +22,42 @@ class PlanLimits:
 
 
 PLAN_LIMITS: dict[str, PlanLimits] = {
-    "free": PlanLimits(
-        max_members=5,
-        max_teams=3,
-        max_projects=5,
-        max_tasks_per_month=50,
-        has_ai_features=False,
-        has_integrations=False,
-        has_api_access=False,
-        storage_gb=1,
-    ),
     "starter": PlanLimits(
+        max_members=10,
+        max_teams=3,
+        max_projects=-1,
+        max_tasks_per_month=-1,
+        has_ai_features=True,
+        has_integrations=True,
+        has_api_access=True,
+        storage_gb=10,
+    ),
+    "business": PlanLimits(
         max_members=20,
         max_teams=10,
         max_projects=-1,
         max_tasks_per_month=-1,
         has_ai_features=True,
-        has_integrations=False,
-        has_api_access=False,
-        storage_gb=10,
-    ),
-    "professional": PlanLimits(
-        max_members=100,
-        max_teams=-1,
-        max_projects=-1,
-        max_tasks_per_month=-1,
-        has_ai_features=True,
         has_integrations=True,
         has_api_access=True,
-        storage_gb=100,
-    ),
-    "enterprise": PlanLimits(
-        max_members=-1,
-        max_teams=-1,
-        max_projects=-1,
-        max_tasks_per_month=-1,
-        has_ai_features=True,
-        has_integrations=True,
-        has_api_access=True,
-        storage_gb=-1,
+        storage_gb=50,
     ),
 }
 
 PLAN_DISPLAY_NAMES: dict[str, str] = {
-    "free": "Free",
     "starter": "Starter",
-    "professional": "Professional",
-    "enterprise": "Enterprise",
+    "business": "Business",
 }
 
 ALL_PLANS = list(PLAN_LIMITS.keys())
 
 
-def get_plan_limits(plan: str) -> PlanLimits:
-    # Subscription checks temporarily disabled — always return enterprise limits
-    return PLAN_LIMITS["enterprise"]
+def get_plan_limits(plan: str, extra_teams: int = 0, extra_users: int = 0) -> PlanLimits:
+    """Effective limits for a plan, including any purchased add-on quantities.
+    Unlimited (-1) fields stay unlimited regardless of add-ons."""
+    base = PLAN_LIMITS.get(plan, PLAN_LIMITS["starter"])
+    return dataclasses.replace(
+        base,
+        max_teams=base.max_teams if base.max_teams == -1 else base.max_teams + extra_teams,
+        max_members=base.max_members if base.max_members == -1 else base.max_members + extra_users,
+    )

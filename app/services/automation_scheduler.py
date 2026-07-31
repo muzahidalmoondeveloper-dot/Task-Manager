@@ -206,7 +206,7 @@ async def run_daily_ai_task_sync() -> None:
                         sync_result.get("transcripts_imported", 0),
                     )
 
-                    ai_result = await analyze_yesterday_sources_for_user(db=db, user=user)
+                    ai_result = await analyze_yesterday_sources_for_user(db=db, user=user, org_id=org_id)
                     logger.info(
                         "Scheduler: AI extraction done | user_id=%s"
                         " | sources=%s tasks_created=%s",

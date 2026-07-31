@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.database import get_db
-from app.core.tenant import TenantContext, get_tenant_context, require_org_admin, require_org_manager
+from app.core.tenant import TenantContext, get_tenant_context, require_org_admin
 from app.models.objective import Objective
 from app.models.org_role import OrgRole
 from app.models.org_value import OrgValue
@@ -90,7 +90,7 @@ async def list_objective_rocks(tenant: TenantContext = Depends(get_tenant_contex
 
 
 @router.post("/objectives", response_model=ObjectiveRead, status_code=status.HTTP_201_CREATED)
-async def create_objective(payload: ObjectiveCreate, tenant: TenantContext = Depends(require_org_manager), db: AsyncSession = Depends(get_db)):
+async def create_objective(payload: ObjectiveCreate, tenant: TenantContext = Depends(require_org_admin), db: AsyncSession = Depends(get_db)):
     await _validate_project_id(payload.project_id, tenant, db)
     obj = Objective(**payload.model_dump(), created_by_id=tenant.user.id, organization_id=tenant.organization_id)
     db.add(obj)
@@ -100,7 +100,7 @@ async def create_objective(payload: ObjectiveCreate, tenant: TenantContext = Dep
 
 
 @router.patch("/objectives/{obj_id}", response_model=ObjectiveRead)
-async def update_objective(obj_id: int, payload: ObjectiveUpdate, tenant: TenantContext = Depends(require_org_manager), db: AsyncSession = Depends(get_db)):
+async def update_objective(obj_id: int, payload: ObjectiveUpdate, tenant: TenantContext = Depends(require_org_admin), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Objective).where(Objective.id == obj_id, Objective.organization_id == tenant.organization_id).options(selectinload(Objective.owner)))
     obj = result.scalar_one_or_none()
     if not obj:
@@ -116,7 +116,7 @@ async def update_objective(obj_id: int, payload: ObjectiveUpdate, tenant: Tenant
 
 
 @router.delete("/objectives/{obj_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_objective(obj_id: int, tenant: TenantContext = Depends(require_org_manager), db: AsyncSession = Depends(get_db)):
+async def delete_objective(obj_id: int, tenant: TenantContext = Depends(require_org_admin), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Objective).where(Objective.id == obj_id, Objective.organization_id == tenant.organization_id))
     obj = result.scalar_one_or_none()
     if not obj:

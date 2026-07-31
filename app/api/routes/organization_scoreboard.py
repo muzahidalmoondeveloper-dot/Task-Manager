@@ -133,13 +133,25 @@ async def get_manager_rankings(
     tenant: TenantContext = Depends(get_tenant_context),
 ):
     """Manager leaderboard — every visible manager ranked by the combined
-    score across every team they manage."""
+    score across every team and/or project they manage. The full manager
+    roster (including anyone not currently assigned a team/project) and
+    Project Manager assignments are both org-wide, so they're only included
+    for Owner/Admin (whose team visibility is already org-wide) — a Team
+    Manager's own restricted view stays scoped to their own team(s), same as
+    before."""
     teams = await _visible_teams(tenant)
+    project_manager_assignments = []
+    all_manager_users = []
+    if tenant.is_admin_or_owner:
+        project_manager_assignments = await scoring.fetch_project_manager_assignments(tenant.db, tenant.organization_id)
+        all_manager_users = await scoring.fetch_all_manager_capable_users(tenant.db, tenant.organization_id)
 
     try:
         result_period, period_start, period_end, rows = await scoring.build_manager_rankings(
             tenant.db, tenant.organization_id, teams, period,
             start_date=start_date, end_date=end_date,
+            project_manager_assignments=project_manager_assignments,
+            all_manager_users=all_manager_users,
         )
     except ValueError:
         raise AppException(_INVALID_PERIOD)
@@ -150,6 +162,7 @@ async def get_manager_rankings(
             manager_id=row.manager_id,
             manager_name=row.manager_name,
             team_count=row.team_count,
+            project_count=row.project_count,
             employee_count=row.employee_count,
             has_data=row.result.has_data,
             rounded_score=row.result.rounded_score if row.result.has_data else None,

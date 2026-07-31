@@ -29,7 +29,7 @@ class OrganizationRepository:
         name: str,
         slug: str,
         owner_id: int,
-        plan: str = "free",
+        plan: str = "starter",
         status: str = "active",
     ) -> Organization:
         org = Organization(
@@ -134,6 +134,33 @@ class OrganizationRepository:
         self, membership: OrganizationMembership, role: str
     ) -> OrganizationMembership:
         membership.role = role
+        await self.db.flush()
+        return membership
+
+    async def update_member_admin_flag(
+        self, membership: OrganizationMembership, is_org_admin: bool
+    ) -> OrganizationMembership:
+        """Additive admin privileges, independent of `role` — lets a
+        team_manager or project_manager also be granted admin access."""
+        membership.is_org_admin = is_org_admin
+        await self.db.flush()
+        return membership
+
+    async def update_member_team_manager_flag(
+        self, membership: OrganizationMembership, is_team_manager: bool
+    ) -> OrganizationMembership:
+        """Additive team-manager privileges, independent of `role` — lets a
+        project_manager also act as a team manager while keeping their role."""
+        membership.is_team_manager = is_team_manager
+        await self.db.flush()
+        return membership
+
+    async def update_member_project_manager_flag(
+        self, membership: OrganizationMembership, is_project_manager: bool
+    ) -> OrganizationMembership:
+        """Additive project-manager privileges, independent of `role` — lets a
+        team_manager also act as a project manager while keeping their role."""
+        membership.is_project_manager = is_project_manager
         await self.db.flush()
         return membership
 
@@ -246,7 +273,17 @@ class OrganizationRepository:
         return result.scalar_one_or_none()
 
     async def get_or_create_subscription(
-        self, org_id: uuid.UUID, plan: str = "free"
+        self,
+        org_id: uuid.UUID,
+        plan: str = "starter",
+        *,
+        billing_interval: str = "monthly",
+        status: str = "active",
+        trial_ends_at: datetime | None = None,
+        stripe_customer_id: str | None = None,
+        stripe_subscription_id: str | None = None,
+        current_period_start: datetime | None = None,
+        current_period_end: datetime | None = None,
     ) -> Subscription:
         sub = await self.get_subscription(org_id)
         if sub:
@@ -255,8 +292,14 @@ class OrganizationRepository:
             id=uuid.uuid4(),
             organization_id=org_id,
             plan=plan,
-            status="active",
+            status=status,
             seats=5,
+            billing_interval=billing_interval,
+            trial_ends_at=trial_ends_at,
+            stripe_customer_id=stripe_customer_id,
+            stripe_subscription_id=stripe_subscription_id,
+            current_period_start=current_period_start,
+            current_period_end=current_period_end,
         )
         self.db.add(sub)
         await self.db.flush()

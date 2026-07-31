@@ -87,6 +87,9 @@ async def _issue_token_pair(
     org_id: uuid.UUID | None = None,
     org_role: str | None = None,
     org_status: str | None = None,
+    org_is_admin: bool = False,
+    org_is_team_manager: bool = False,
+    org_is_project_manager: bool = False,
 ) -> TokenResponse:
     """Issue access + refresh tokens, persist the refresh token."""
     access_token, _jti, exp = create_access_token(
@@ -94,8 +97,14 @@ async def _issue_token_pair(
         extra_claims={"email": user.email},
         org_id=org_id,
         org_role=org_role,
+        org_is_admin=org_is_admin,
+        org_is_team_manager=org_is_team_manager,
+        org_is_project_manager=org_is_project_manager,
     )
-    refresh_str, refresh_hash, refresh_exp = create_refresh_token(subject=str(user.id), org_id=org_id, org_role=org_role)
+    refresh_str, refresh_hash, refresh_exp = create_refresh_token(
+        subject=str(user.id), org_id=org_id, org_role=org_role, org_is_admin=org_is_admin,
+        org_is_team_manager=org_is_team_manager, org_is_project_manager=org_is_project_manager,
+    )
 
     token_repo = RefreshTokenRepository(db)
     await token_repo.save(
@@ -111,7 +120,12 @@ async def _issue_token_pair(
         # The role that matters to the frontend is the user's role within the
         # *current* organization, not their global default — override it here
         # so `user.role` always reflects org_role from the active tenant context.
-        user_read = user_read.model_copy(update={"role": org_role})
+        user_read = user_read.model_copy(update={
+            "role": org_role,
+            "is_org_admin": org_is_admin,
+            "is_team_manager": org_is_team_manager,
+            "is_project_manager": org_is_project_manager,
+        })
 
     return TokenResponse(
         access_token=access_token,
@@ -125,8 +139,8 @@ async def _issue_token_pair(
 async def _resolve_org_for_user(
     user: User,
     db: AsyncSession,
-) -> tuple[uuid.UUID | None, str | None, str | None, list[OrgSummary]]:
-    """Return (org_id, org_role, org_status, all_orgs).
+) -> tuple[uuid.UUID | None, str | None, str | None, list[OrgSummary], bool, bool, bool]:
+    """Return (org_id, org_role, org_status, all_orgs, org_is_admin, org_is_team_manager, org_is_project_manager).
 
     Selection priority:
       1. user.last_active_organization_id  (if still an active member)
@@ -146,12 +160,15 @@ async def _resolve_org_for_user(
     rows = result.all()
 
     if not rows:
-        return None, None, None, []
+        return None, None, None, [], False, False, False
 
     # Determine the org to activate
     selected_id: uuid.UUID | None = None
     selected_role: str | None = None
     selected_status: str | None = None
+    selected_is_admin: bool = False
+    selected_is_team_manager: bool = False
+    selected_is_project_manager: bool = False
 
     if user.last_active_organization_id:
         for org, membership in rows:
@@ -159,6 +176,9 @@ async def _resolve_org_for_user(
                 selected_id = org.id
                 selected_role = membership.role
                 selected_status = org.status
+                selected_is_admin = membership.is_org_admin
+                selected_is_team_manager = membership.is_team_manager
+                selected_is_project_manager = membership.is_project_manager
                 break
 
     # Fall back to earliest joined org
@@ -167,6 +187,9 @@ async def _resolve_org_for_user(
         selected_id = org.id
         selected_role = membership.role
         selected_status = org.status
+        selected_is_admin = membership.is_org_admin
+        selected_is_team_manager = membership.is_team_manager
+        selected_is_project_manager = membership.is_project_manager
 
     orgs = [
         OrgSummary(
@@ -174,6 +197,7 @@ async def _resolve_org_for_user(
             name=org.name,
             slug=org.slug,
             plan=org.plan,
+            logo_url=org.logo_url,
             role=membership.role,
             status=org.status,
             is_current=(org.id == selected_id),
@@ -181,7 +205,7 @@ async def _resolve_org_for_user(
         for org, membership in rows
     ]
 
-    return selected_id, selected_role, selected_status, orgs
+    return selected_id, selected_role, selected_status, orgs, selected_is_admin, selected_is_team_manager, selected_is_project_manager
 
 
 # ── Registration ──────────────────────────────────────────────────────────────
@@ -328,9 +352,10 @@ async def login(
         )
 
     # Resolve org context
-    org_id, org_role, org_status, orgs = await _resolve_org_for_user(user, db)
+    org_id, org_role, org_status, orgs, org_is_admin, org_is_team_manager, org_is_project_manager = await _resolve_org_for_user(user, db)
     token_pair = await _issue_token_pair(
-        user, db, token_cache, org_id=org_id, org_role=org_role, org_status=org_status
+        user, db, token_cache, org_id=org_id, org_role=org_role, org_status=org_status, org_is_admin=org_is_admin,
+        org_is_team_manager=org_is_team_manager, org_is_project_manager=org_is_project_manager,
     )
 
     return LoginPasswordResponse(
@@ -380,9 +405,10 @@ async def verify_login_otp(
     await db.commit()
     await db.refresh(user)
 
-    org_id, org_role, org_status, orgs = await _resolve_org_for_user(user, db)
+    org_id, org_role, org_status, orgs, org_is_admin, org_is_team_manager, org_is_project_manager = await _resolve_org_for_user(user, db)
     token_pair = await _issue_token_pair(
-        user, db, token_cache, org_id=org_id, org_role=org_role, org_status=org_status
+        user, db, token_cache, org_id=org_id, org_role=org_role, org_status=org_status, org_is_admin=org_is_admin,
+        org_is_team_manager=org_is_team_manager, org_is_project_manager=org_is_project_manager,
     )
 
     return LoginPasswordResponse(
@@ -436,6 +462,7 @@ async def my_organizations(
             name=org.name,
             slug=org.slug,
             plan=org.plan,
+            logo_url=org.logo_url,
             role=membership.role,
             status=org.status,
             is_current=(org.id == current_org_id),
@@ -482,7 +509,9 @@ async def select_organization(
     await db.refresh(current_user)
 
     return await _issue_token_pair(
-        current_user, db, token_cache, org_id=org_id, org_role=membership.role, org_status=org.status
+        current_user, db, token_cache, org_id=org_id, org_role=membership.role, org_status=org.status,
+        org_is_admin=membership.is_org_admin,
+        org_is_team_manager=membership.is_team_manager, org_is_project_manager=membership.is_project_manager,
     )
 
 
@@ -531,6 +560,9 @@ async def accept_invitation(
         current_user, db, token_cache,
         org_id=invitation.organization_id,
         org_role=membership.role,
+        org_is_admin=membership.is_org_admin,
+        org_is_team_manager=membership.is_team_manager,
+        org_is_project_manager=membership.is_project_manager,
     )
 
 
@@ -591,6 +623,9 @@ async def register_and_accept_invitation(
         user, db, token_cache,
         org_id=invitation.organization_id,
         org_role=membership.role,
+        org_is_admin=membership.is_org_admin,
+        org_is_team_manager=membership.is_team_manager,
+        org_is_project_manager=membership.is_project_manager,
     )
 
 
@@ -694,6 +729,9 @@ async def refresh_access_token(
     # (The client must re-call select-organization if the org context is lost)
     org_id_raw = payload.get("org_id")
     org_role = payload.get("org_role")
+    org_is_admin = bool(payload.get("org_is_admin", False))
+    org_is_team_manager = bool(payload.get("org_is_team_manager", False))
+    org_is_project_manager = bool(payload.get("org_is_project_manager", False))
     try:
         org_id = uuid.UUID(str(org_id_raw)) if org_id_raw else None
     except (ValueError, AttributeError):
@@ -704,8 +742,14 @@ async def refresh_access_token(
         extra_claims={"email": user.email},
         org_id=org_id,
         org_role=org_role,
+        org_is_admin=org_is_admin,
+        org_is_team_manager=org_is_team_manager,
+        org_is_project_manager=org_is_project_manager,
     )
-    new_refresh_str, new_hash, new_exp = create_refresh_token(subject=str(user.id), org_id=org_id, org_role=org_role)
+    new_refresh_str, new_hash, new_exp = create_refresh_token(
+        subject=str(user.id), org_id=org_id, org_role=org_role, org_is_admin=org_is_admin,
+        org_is_team_manager=org_is_team_manager, org_is_project_manager=org_is_project_manager,
+    )
     await token_repo.save(
         token_hash=new_hash,
         user_id=user.id,
@@ -774,7 +818,15 @@ async def get_me(
     if org_role is not None:
         # Reflect the user's role in their *current* organization rather than
         # their global default — keeps the profile in sync with the active tenant.
-        user_read = user_read.model_copy(update={"role": org_role})
+        org_is_admin = bool(token_payload.get("org_is_admin", False))
+        org_is_team_manager = bool(token_payload.get("org_is_team_manager", False))
+        org_is_project_manager = bool(token_payload.get("org_is_project_manager", False))
+        user_read = user_read.model_copy(update={
+            "role": org_role,
+            "is_org_admin": org_is_admin,
+            "is_team_manager": org_is_team_manager,
+            "is_project_manager": org_is_project_manager,
+        })
 
     org_status: str | None = None
     raw_org_id = token_payload.get("org_id")

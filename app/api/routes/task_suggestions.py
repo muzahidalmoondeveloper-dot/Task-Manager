@@ -20,7 +20,7 @@ async def sync_yesterday_sources(
     """Analyse yesterday's emails and meeting transcripts and create tasks directly."""
     enforce_feature(tenant, "has_ai_features")
     logger.info("Manual sync triggered by user: id=%s email=%s", tenant.user.id, tenant.user.email)
-    result = await analyze_yesterday_sources_for_user(db=db, user=tenant.user)
+    result = await analyze_yesterday_sources_for_user(db=db, user=tenant.user, org_id=tenant.organization_id)
 
     return {
         "period": "yesterday",

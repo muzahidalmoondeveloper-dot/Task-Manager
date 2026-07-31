@@ -157,6 +157,7 @@ class ManagerRankingRow(BaseModel):
     manager_id: int
     manager_name: str
     team_count: int
+    project_count: int = 0
     employee_count: int
     has_data: bool
     rounded_score: int | None = None

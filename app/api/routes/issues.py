@@ -7,7 +7,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.tenant import TenantContext, get_tenant_context
 from app.models.issue import Issue, IssueLink
+from app.repositories.project_repository import ProjectRepository
 from app.schemas.issue import EntityLinkIn, IssueCreate, IssueUpdate, IssueOut
+
+_ISSUE_CREATE_FORBIDDEN = HTTPException(
+    status_code=status.HTTP_403_FORBIDDEN,
+    detail="You can only create issues under a project you are assigned to.",
+)
 
 
 def _apply_links(issue: Issue, links: list[EntityLinkIn]) -> None:
@@ -44,6 +50,13 @@ async def create_issue(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    if not tenant.is_manager_or_above:
+        if not tenant.has_project_manager_access:
+            raise _ISSUE_CREATE_FORBIDDEN
+        project_repo = ProjectRepository(db, tenant.organization_id)
+        if payload.project_id is None or not await project_repo.is_member(payload.project_id, tenant.user.id):
+            raise _ISSUE_CREATE_FORBIDDEN
+
     issue = Issue(team_id=team_id, organization_id=tenant.organization_id, **payload.model_dump(exclude={"links"}))
     _apply_links(issue, payload.links)
     db.add(issue)

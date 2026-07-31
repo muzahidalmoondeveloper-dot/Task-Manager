@@ -3,7 +3,8 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, UploadFile
+from fastapi import File as FastAPIFile
 from fastapi import status as http_status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +17,7 @@ from app.core.plan_limits import get_plan_limits
 from app.core.security import create_access_token, create_refresh_token, hash_token
 from app.core.tenant import (
     TenantContext,
+    check_active_billing,
     enforce_member_limit,
     get_tenant_context,
     require_org_admin,
@@ -47,7 +49,10 @@ from app.schemas.organization import (
     UpdateMemberRoleRequest,
 )
 from app.schemas.user import UserRead
+from app.services import logo_upload_service, stripe_service
 from app.services.email_service import EmailService
+
+_LOGO_DIR_NAME = "organization_logos"
 
 # How many organizations a single user may own at once — a simple, generous
 # hard cap (plan tiers in this app are per-organization, not per-user, so a
@@ -107,6 +112,11 @@ _INVITATION_ALREADY_ACCEPTED = ErrorDef(
     code="INVITATION_ALREADY_ACCEPTED",
     status=http_status.HTTP_400_BAD_REQUEST,
     message="This invitation has already been accepted.",
+)
+_BILLING_SETUP_FAILED = ErrorDef(
+    code="BILLING_SETUP_FAILED",
+    status=http_status.HTTP_502_BAD_GATEWAY,
+    message="Could not set up billing for this organization. Please try again.",
 )
 
 router = APIRouter(prefix="/organizations", tags=["Organizations"])
@@ -191,11 +201,34 @@ async def create_organization(
         name=payload.name,
         slug=slug,
         owner_id=current_user.id,
-        plan="free",
+        plan=payload.plan,
         status="pending_setup",
     )
     await repo.add_member(org.id, current_user.id, role=OWNER)
-    await repo.get_or_create_subscription(org.id, plan="free")
+
+    try:
+        customer = stripe_service.create_customer(org, current_user)
+        stripe_subscription = stripe_service.create_trial_subscription(
+            customer_id=customer["id"],
+            plan=payload.plan,
+            interval=payload.billing_interval,
+            org_id=str(org.id),
+        )
+    except Exception:
+        raise AppException(_BILLING_SETUP_FAILED)
+
+    fields = stripe_service.extract_subscription_fields(stripe_subscription)
+    await repo.get_or_create_subscription(
+        org.id,
+        plan=payload.plan,
+        billing_interval=payload.billing_interval,
+        status=fields["status"] or "trialing",
+        trial_ends_at=fields["trial_ends_at"],
+        stripe_customer_id=customer["id"],
+        stripe_subscription_id=stripe_subscription["id"],
+        current_period_start=fields["current_period_start"],
+        current_period_end=fields["current_period_end"],
+    )
 
     # The newly created org becomes the user's active org going forward.
     current_user.last_active_organization_id = org.id
@@ -266,6 +299,34 @@ async def update_current_org(
     return OrganizationRead.model_validate(org)
 
 
+@router.post("/current/logo", response_model=OrganizationRead)
+async def upload_current_org_logo(
+    tenant: TenantContext = Depends(require_org_admin),
+    db: AsyncSession = Depends(get_db),
+    file: UploadFile = FastAPIFile(...),
+):
+    org = tenant.organization
+    new_url = await logo_upload_service.save_logo(file, _LOGO_DIR_NAME, org.id)
+    logo_upload_service.delete_logo_file(org.logo_url, _LOGO_DIR_NAME)
+    org.logo_url = new_url
+    await db.commit()
+    await db.refresh(org)
+    return OrganizationRead.model_validate(org)
+
+
+@router.delete("/current/logo", response_model=OrganizationRead)
+async def delete_current_org_logo(
+    tenant: TenantContext = Depends(require_org_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    org = tenant.organization
+    logo_upload_service.delete_logo_file(org.logo_url, _LOGO_DIR_NAME)
+    org.logo_url = None
+    await db.commit()
+    await db.refresh(org)
+    return OrganizationRead.model_validate(org)
+
+
 @router.get("/current/scoreboard-weights", response_model=ScoreboardWeightsRead)
 async def get_scoreboard_weights(tenant: TenantContext = Depends(get_tenant_context)):
     return ScoreboardWeightsRead.model_validate(tenant.organization)
@@ -311,9 +372,10 @@ async def list_members(
             organization_id=m.organization_id,
             user_id=m.user_id,
             role=m.role,
+            is_org_admin=m.is_org_admin,
             is_active=m.is_active,
             joined_at=m.joined_at,
-            user=UserRead.model_validate(u),
+            user=UserRead.model_validate(u).model_copy(update={"role": m.role, "is_org_admin": m.is_org_admin}),
         )
         for m, u in rows
     ]
@@ -365,9 +427,10 @@ async def update_member_role(
         organization_id=updated.organization_id,
         user_id=updated.user_id,
         role=updated.role,
+        is_org_admin=updated.is_org_admin,
         is_active=updated.is_active,
         joined_at=updated.joined_at,
-        user=UserRead.model_validate(user),
+        user=UserRead.model_validate(user).model_copy(update={"role": updated.role, "is_org_admin": updated.is_org_admin}),
     )
 
 
@@ -383,6 +446,7 @@ async def invite_member(
     tenant: TenantContext = Depends(require_org_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    check_active_billing(tenant)
     await enforce_member_limit(tenant, db)
 
     repo = OrganizationRepository(db)

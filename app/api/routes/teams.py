@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.database import get_db
 from app.core.org_roles import ORG_MANAGEMENT_ROLES, PROJECT_MANAGER, TEAM_MEMBER
-from app.core.tenant import TenantContext, get_tenant_context, require_org_admin, require_org_manager
+from app.core.tenant import TenantContext, check_active_billing, get_tenant_context, require_org_admin, require_org_manager
 from app.models.team import Team
 from app.repositories.team_repository import TeamRepository
 from app.repositories.user_repository import UserRepository
@@ -36,6 +36,10 @@ def _serialize(team: Team) -> TeamDetailRead:
 
 @router.get("", response_model=list[TeamDetailRead])
 async def list_teams(tenant: TenantContext = Depends(get_tenant_context)):
+    # Project managers are scoped to their assigned project(s) for project
+    # visibility (see projects.py's _PROJECT_SCOPED_ROLES), but per their role
+    # definition they can still view every team read-only — e.g. to assign a
+    # team when creating an issue or task under their project.
     repo = TeamRepository(tenant.db, tenant.organization_id)
     if tenant.is_admin_or_owner or tenant.org_role == PROJECT_MANAGER:
         teams = await repo.list_all()
@@ -52,6 +56,7 @@ async def create_team(
     tenant: TenantContext = Depends(require_org_manager),
     db: AsyncSession = Depends(get_db),
 ):
+    check_active_billing(tenant)
     limits = tenant.plan_limits
     if limits.max_teams != -1:
         repo_check = TeamRepository(db, tenant.organization_id)

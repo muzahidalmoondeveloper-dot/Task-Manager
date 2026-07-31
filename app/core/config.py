@@ -96,6 +96,20 @@ class Settings(BaseSettings):
     MEDIA_ROOT: str = "media"
     PDF_OUTPUT_DIR: str = "media/reports/pdfs"
 
+    # ── Stripe billing ───────────────────────────────────────────────────────
+    STRIPE_SECRET_KEY: str | None = None
+    STRIPE_WEBHOOK_SECRET: str | None = None
+    STRIPE_TRIAL_DAYS: int = 14
+
+    STRIPE_PRICE_STARTER_MONTHLY: str | None = None
+    STRIPE_PRICE_STARTER_ANNUAL: str | None = None
+    STRIPE_PRICE_BUSINESS_MONTHLY: str | None = None
+    STRIPE_PRICE_BUSINESS_ANNUAL: str | None = None
+    STRIPE_PRICE_EXTRA_TEAM_MONTHLY: str | None = None
+    STRIPE_PRICE_EXTRA_TEAM_ANNUAL: str | None = None
+    STRIPE_PRICE_EXTRA_USER_MONTHLY: str | None = None
+    STRIPE_PRICE_EXTRA_USER_ANNUAL: str | None = None
+
     model_config = SettingsConfigDict(
         env_file=str(_ENV_FILE),
         env_file_encoding="utf-8",
@@ -113,6 +127,13 @@ class Settings(BaseSettings):
     @property
     def celery_backend(self) -> str:
         return self.CELERY_RESULT_BACKEND or self.REDIS_URL or "redis://localhost:6379/0"
+
+    @property
+    def media_root_path(self) -> Path:
+        """Absolute path to the media storage directory (uploads, generated
+        PDFs), resolved relative to the `backend/` directory regardless of
+        the process's working directory."""
+        return Path(__file__).resolve().parent.parent.parent / self.MEDIA_ROOT
 
 
 @lru_cache

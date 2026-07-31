@@ -22,6 +22,22 @@ def _slugify(value: str) -> str:
 class OrganizationCreate(BaseModel):
     name: str = Field(min_length=2, max_length=255)
     slug: str | None = Field(default=None, min_length=2, max_length=100)
+    plan: str = Field(default="starter")
+    billing_interval: str = Field(default="monthly")
+
+    @field_validator("plan")
+    @classmethod
+    def validate_plan(cls, v: str) -> str:
+        if v not in ALL_PLANS:
+            raise ValueError(f"Plan must be one of: {', '.join(ALL_PLANS)}")
+        return v
+
+    @field_validator("billing_interval")
+    @classmethod
+    def validate_billing_interval(cls, v: str) -> str:
+        if v not in ("monthly", "annual"):
+            raise ValueError("billing_interval must be 'monthly' or 'annual'")
+        return v
 
     @field_validator("name")
     @classmethod
@@ -113,6 +129,7 @@ class OrgSummary(BaseModel):
     name: str
     slug: str
     plan: str
+    logo_url: str | None = None
     role: str       # user's role in this org
     status: str = "active"
     is_current: bool = False  # True when this is the JWT-active org
@@ -127,6 +144,9 @@ class MembershipRead(BaseModel):
     organization_id: uuid.UUID
     user_id: int
     role: str
+    is_org_admin: bool = False
+    is_team_manager: bool = False
+    is_project_manager: bool = False
     is_active: bool
     joined_at: datetime
     user: UserRead
@@ -187,13 +207,32 @@ class SubscriptionRead(BaseModel):
     plan: str
     status: str
     seats: int
+    billing_interval: str
     trial_ends_at: datetime | None
     current_period_start: datetime | None
     current_period_end: datetime | None
+    cancel_at_period_end: bool
+    extra_teams: int
+    extra_users: int
     stripe_subscription_id: str | None
     stripe_customer_id: str | None
 
     model_config = {"from_attributes": True}
+
+
+class BillingStatusRead(BaseModel):
+    status: str
+    trial_ends_at: datetime | None
+    is_locked: bool
+
+
+class AddonUpdateRequest(BaseModel):
+    extra_teams: int = Field(ge=0, le=500)
+    extra_users: int = Field(ge=0, le=500)
+
+
+class BillingPortalResponse(BaseModel):
+    url: str
 
 
 class PlanLimitsRead(BaseModel):

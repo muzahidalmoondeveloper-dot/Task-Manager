@@ -36,6 +36,7 @@ class ProjectRead(BaseModel):
     id: int
     name: str
     description: str | None
+    logo_url: str | None = None
     status: str
     created_by_id: int
     created_at: datetime
