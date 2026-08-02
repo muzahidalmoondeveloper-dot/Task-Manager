@@ -8,7 +8,7 @@ from fastapi.responses import Response
 from app.api.routes.scoreboard import _require_can_view_scoreboard
 from app.api.routes.team_scoreboard import _get_team_or_404, _require_can_view_team_scoreboard
 from app.core.auth_errors import AppException, ErrorDef
-from app.core.org_roles import CLIENT
+from app.core.org_roles import CLIENT, TEAM_MEMBER
 from app.core.tenant import TenantContext, get_tenant_context, require_org_manager
 from app.models.report import Report, ReportContent
 from app.repositories.project_repository import ProjectRepository
@@ -348,6 +348,23 @@ async def _serve_pdf(tenant: TenantContext, report_id: int, *, as_attachment: bo
     report = await _get_report_or_404(tenant, report_id)
     if not await _can_view(tenant, report):
         raise AppException(ErrorDef(code="REPORT_FORBIDDEN", status=http_status.HTTP_403_FORBIDDEN, message="You do not have access to this report."))
+
+    # Team members may view reports they have access to, but never download
+    # them — downloading is reserved for managers/admins/owners (and project
+    # managers, for their own projects' reports). An additive admin/manager/
+    # PM flag on a team_member's membership still grants download access.
+    is_plain_team_member = (
+        tenant.org_role == TEAM_MEMBER
+        and not tenant.is_admin_or_owner
+        and not tenant.is_manager_or_above
+        and not tenant.has_project_manager_access
+    )
+    if as_attachment and is_plain_team_member:
+        raise AppException(ErrorDef(
+            code="REPORT_DOWNLOAD_FORBIDDEN",
+            status=http_status.HTTP_403_FORBIDDEN,
+            message="Team members can view this report but do not have download access.",
+        ))
 
     pdf_service = PdfRenderService()
 
