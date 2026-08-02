@@ -4,7 +4,9 @@ from fastapi import APIRouter, Depends, Query
 from fastapi import status as http_status
 
 from app.core.auth_errors import AppException, ErrorDef
+from app.core.org_roles import CLIENT
 from app.core.tenant import TenantContext, get_tenant_context
+from app.repositories.organization_repository import OrganizationRepository
 from app.repositories.project_repository import ProjectRepository
 from app.repositories.task_repository import TaskRepository
 from app.repositories.team_repository import TeamRepository
@@ -22,6 +24,7 @@ from app.services import scoreboard_service as scoring
 router = APIRouter(prefix="/users/{user_id}/scoreboard", tags=["Scoreboard"])
 
 _USER_NOT_FOUND = ErrorDef(code="USER_NOT_FOUND", status=http_status.HTTP_404_NOT_FOUND, message="User not found.")
+_NOT_APPLICABLE = ErrorDef(code="SCOREBOARD_NOT_APPLICABLE", status=http_status.HTTP_400_BAD_REQUEST, message="Clients do not have a scoreboard.")
 _FORBIDDEN = ErrorDef(code="SCOREBOARD_FORBIDDEN", status=http_status.HTTP_403_FORBIDDEN, message="You do not have permission to view this employee's scoreboard.")
 _INVALID_PERIOD = ErrorDef(code="SCOREBOARD_INVALID_PERIOD", status=http_status.HTTP_400_BAD_REQUEST, message="Invalid period or date range.")
 
@@ -35,6 +38,15 @@ _PERIOD_LABELS = {
 
 
 async def _require_can_view_scoreboard(tenant: TenantContext, target_user_id: int) -> None:
+    # Scoreboards only exist for staff — clients (and anyone no longer an
+    # active member of this org) never have one, regardless of who's asking.
+    org_repo = OrganizationRepository(tenant.db)
+    target_membership = await org_repo.get_membership(tenant.organization_id, target_user_id)
+    if target_membership is None or not target_membership.is_active:
+        raise AppException(_USER_NOT_FOUND)
+    if target_membership.role == CLIENT:
+        raise AppException(_NOT_APPLICABLE)
+
     if tenant.user.id == target_user_id:
         return
     if tenant.is_admin_or_owner:
