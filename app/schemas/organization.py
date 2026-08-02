@@ -1,8 +1,8 @@
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 from app.core.org_roles import ALL_ORG_ROLES, TEAM_MEMBER
 from app.core.plan_limits import ALL_PLANS, PlanLimits
@@ -22,6 +22,22 @@ def _slugify(value: str) -> str:
 class OrganizationCreate(BaseModel):
     name: str = Field(min_length=2, max_length=255)
     slug: str | None = Field(default=None, min_length=2, max_length=100)
+    plan: str = Field(default="starter")
+    billing_interval: str = Field(default="monthly")
+
+    @field_validator("plan")
+    @classmethod
+    def validate_plan(cls, v: str) -> str:
+        if v not in ALL_PLANS:
+            raise ValueError(f"Plan must be one of: {', '.join(ALL_PLANS)}")
+        return v
+
+    @field_validator("billing_interval")
+    @classmethod
+    def validate_billing_interval(cls, v: str) -> str:
+        if v not in ("monthly", "annual"):
+            raise ValueError("billing_interval must be 'monthly' or 'annual'")
+        return v
 
     @field_validator("name")
     @classmethod
@@ -113,6 +129,7 @@ class OrgSummary(BaseModel):
     name: str
     slug: str
     plan: str
+    logo_url: str | None = None
     role: str       # user's role in this org
     status: str = "active"
     is_current: bool = False  # True when this is the JWT-active org
@@ -127,6 +144,9 @@ class MembershipRead(BaseModel):
     organization_id: uuid.UUID
     user_id: int
     role: str
+    is_org_admin: bool = False
+    is_team_manager: bool = False
+    is_project_manager: bool = False
     is_active: bool
     joined_at: datetime
     user: UserRead
@@ -179,6 +199,78 @@ class AcceptInvitationRequest(BaseModel):
     token: str
 
 
+# ── Client invitations (shared invitation service) ─────────────────────────────
+
+class _RefUser(BaseModel):
+    id: int
+    full_name: str | None = None
+    email: str
+
+    model_config = {"from_attributes": True}
+
+
+class _RefProject(BaseModel):
+    id: int
+    name: str
+
+    model_config = {"from_attributes": True}
+
+
+class _RefTemplate(BaseModel):
+    id: int
+    name: str
+
+    model_config = {"from_attributes": True}
+
+
+class ClientInvitationCreate(BaseModel):
+    email: EmailStr
+    project_id: int
+    client_name: str | None = Field(default=None, max_length=255)
+    company_name: str | None = Field(default=None, max_length=255)
+    phone_number: str | None = Field(default=None, max_length=50)
+    project_manager_id: int | None = None
+    onboarding_template_id: int | None = None
+    message: str | None = None
+    expires_in_days: int = Field(default=3, ge=1, le=30)
+    save_as_draft: bool = False
+
+
+class ClientInvitationRead(BaseModel):
+    id: uuid.UUID
+    organization_id: uuid.UUID
+    email: str
+    client_name: str | None = None
+    company_name: str | None = None
+    phone_number: str | None = None
+    role: str
+    status: str
+    message: str | None = None
+    token: str
+    project: _RefProject | None = None
+    project_manager: _RefUser | None = None
+    onboarding_template: _RefTemplate | None = None
+    onboarding_id: int | None = None
+    invited_by: _RefUser
+    expires_at: datetime
+    accepted_at: datetime | None = None
+    opened_at: datetime | None = None
+    revoked_at: datetime | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+    @model_validator(mode="after")
+    def compute_effective_status(self):
+        if self.status in ("accepted", "revoked", "draft"):
+            return self
+        now = datetime.now(timezone.utc)
+        expires_at = self.expires_at if self.expires_at.tzinfo else self.expires_at.replace(tzinfo=timezone.utc)
+        if expires_at < now:
+            self.status = "expired"
+        return self
+
+
 # ── Subscription & Usage ──────────────────────────────────────────────────────
 
 class SubscriptionRead(BaseModel):
@@ -187,13 +279,32 @@ class SubscriptionRead(BaseModel):
     plan: str
     status: str
     seats: int
+    billing_interval: str
     trial_ends_at: datetime | None
     current_period_start: datetime | None
     current_period_end: datetime | None
+    cancel_at_period_end: bool
+    extra_teams: int
+    extra_users: int
     stripe_subscription_id: str | None
     stripe_customer_id: str | None
 
     model_config = {"from_attributes": True}
+
+
+class BillingStatusRead(BaseModel):
+    status: str
+    trial_ends_at: datetime | None
+    is_locked: bool
+
+
+class AddonUpdateRequest(BaseModel):
+    extra_teams: int = Field(ge=0, le=500)
+    extra_users: int = Field(ge=0, le=500)
+
+
+class BillingPortalResponse(BaseModel):
+    url: str
 
 
 class PlanLimitsRead(BaseModel):

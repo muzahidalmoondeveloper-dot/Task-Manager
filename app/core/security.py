@@ -89,6 +89,9 @@ def create_access_token(
     extra_claims: dict[str, Any] | None = None,
     org_id: "uuid.UUID | None" = None,
     org_role: str | None = None,
+    org_is_admin: bool = False,
+    org_is_team_manager: bool = False,
+    org_is_project_manager: bool = False,
 ) -> tuple[str, str, int]:
     """Return (encoded_token, jti, exp_unix_timestamp).
 
@@ -116,6 +119,9 @@ def create_access_token(
         payload["org_id"] = str(org_id)
     if org_role is not None:
         payload["org_role"] = org_role
+        payload["org_is_admin"] = org_is_admin
+        payload["org_is_team_manager"] = org_is_team_manager
+        payload["org_is_project_manager"] = org_is_project_manager
 
     if extra_claims:
         payload.update(extra_claims)
@@ -143,6 +149,9 @@ def create_refresh_token(
     expires_delta: timedelta | None = None,
     org_id: "uuid.UUID | None" = None,
     org_role: str | None = None,
+    org_is_admin: bool = False,
+    org_is_team_manager: bool = False,
+    org_is_project_manager: bool = False,
 ) -> tuple[str, str, int]:
     """Return (encoded_token, sha256_hash, exp_unix_timestamp).
 
@@ -168,6 +177,9 @@ def create_refresh_token(
         payload["org_id"] = str(org_id)
     if org_role is not None:
         payload["org_role"] = org_role
+        payload["org_is_admin"] = org_is_admin
+        payload["org_is_team_manager"] = org_is_team_manager
+        payload["org_is_project_manager"] = org_is_project_manager
 
     token = jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
     token_hash = hash_token(token)

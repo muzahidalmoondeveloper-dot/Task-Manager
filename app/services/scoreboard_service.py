@@ -23,9 +23,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.org_roles import TEAM_MEMBER
+from app.core.org_roles import PROJECT_MANAGER, TEAM_MANAGER, TEAM_MEMBER
 from app.models.organization import Organization, OrganizationMembership
+from app.models.project import Project, ProjectMembership
 from app.models.task import Task
+from app.models.user import User
 
 PERFORMANCE_LEVELS = (
     (90, "Excellent"),
@@ -270,6 +272,99 @@ async def fetch_eligible_team_tasks(
             eligible.append(task)
 
     return eligible
+
+
+async def fetch_eligible_project_tasks(
+    db: AsyncSession,
+    org_id,
+    project_id: int,
+    period_start: date,
+    period_end: date,
+) -> list[Task]:
+    """Same eligibility rule as `fetch_eligible_tasks`, but pools every task
+    under the project (across whichever team(s) it spans) instead of scoping
+    to one assignee or one team — used to score a Project Manager on their
+    project's overall output."""
+    period_end_dt = datetime.combine(period_end, datetime.max.time(), tzinfo=timezone.utc)
+    period_start_dt = datetime.combine(period_start, datetime.min.time(), tzinfo=timezone.utc)
+    today = _today()
+    is_current_period = period_end >= today
+
+    stmt = select(Task).options(selectinload(Task.project)).where(
+        Task.organization_id == org_id,
+        Task.project_id == project_id,
+    )
+
+    result = await db.execute(stmt)
+    all_tasks = list(result.scalars().all())
+
+    eligible = []
+    for task in all_tasks:
+        completed_in_range = (
+            task.completed_at is not None
+            and period_start_dt <= task.completed_at <= period_end_dt
+        )
+        due_in_range = task.due_date is not None and period_start <= task.due_date <= period_end
+        no_due_created_in_range = (
+            task.due_date is None
+            and task.created_at is not None
+            and period_start_dt <= task.created_at <= period_end_dt
+        )
+        carried_over_overdue = (
+            is_current_period
+            and task.completed_at is None
+            and task.status != "done"
+            and task.due_date is not None
+            and task.due_date < period_start
+            and task.due_date < today
+        )
+        if completed_in_range or due_in_range or no_due_created_in_range or carried_over_overdue:
+            eligible.append(task)
+
+    return eligible
+
+
+async def fetch_all_manager_capable_users(db: AsyncSession, org_id) -> list[User]:
+    """Every active org member who holds manager-level capability — the
+    functional team_manager/project_manager role, or anyone additionally
+    granted either via the additive flags — regardless of whether they
+    currently manage any team or project. Used so the Manager scoreboard
+    lists the full manager roster (with 0s / "No data" where nothing is
+    assigned yet) instead of only those with an active assignment."""
+    result = await db.execute(
+        select(User)
+        .join(OrganizationMembership, OrganizationMembership.user_id == User.id)
+        .where(
+            OrganizationMembership.organization_id == org_id,
+            OrganizationMembership.is_active.is_(True),
+            (
+                (OrganizationMembership.role == TEAM_MANAGER)
+                | (OrganizationMembership.role == PROJECT_MANAGER)
+                | (OrganizationMembership.is_team_manager.is_(True))
+                | (OrganizationMembership.is_project_manager.is_(True))
+            ),
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def fetch_project_manager_assignments(db: AsyncSession, org_id) -> list[tuple[Project, User]]:
+    """Every (project, manager) pair in the org where the assigned member
+    counts as 'the Project Manager' for that project — the functional
+    project_manager role, or anyone additionally granted project-manager
+    privileges (mirrors `_pm_user_ids` in projects.py)."""
+    result = await db.execute(
+        select(Project, User)
+        .join(ProjectMembership, ProjectMembership.project_id == Project.id)
+        .join(User, User.id == ProjectMembership.user_id)
+        .join(OrganizationMembership, OrganizationMembership.user_id == User.id)
+        .where(
+            Project.organization_id == org_id,
+            OrganizationMembership.organization_id == org_id,
+            (OrganizationMembership.role == PROJECT_MANAGER) | (OrganizationMembership.is_project_manager.is_(True)),
+        )
+    )
+    return list(result.all())
 
 
 def score_impact_label(task, today: date) -> str:
@@ -797,6 +892,7 @@ class ManagerRankingRow:
     team_count: int
     employee_count: int
     result: ScoreboardResult
+    project_count: int = 0
     rank: int = 0
 
 
@@ -807,36 +903,70 @@ async def build_manager_rankings(
     period: str,
     start_date: date | None = None,
     end_date: date | None = None,
+    project_manager_assignments: list[tuple[Project, User]] | None = None,
+    all_manager_users: list[User] | None = None,
 ) -> tuple[str, date, date, list[ManagerRankingRow]]:
     """Ranks every caller-visible manager by the combined score across every
-    team they manage — pools all of their teams' eligible tasks into a single
-    `compute_scoreboard` call so a manager of multiple teams is scored on
-    their overall managed output, not an average of separate team scores."""
+    team and/or project they manage — pools all of their managed teams' and
+    projects' eligible tasks into a single `compute_scoreboard` call, so a
+    manager of several teams/projects (or someone additionally granted both
+    Team Manager and Project Manager privileges) is scored on their overall
+    managed output, not an average of separate scores.
+
+    `all_manager_users`, if given, seeds a row (0 teams/projects, "No data")
+    for every manager-capable user up front, so the full roster shows even
+    for those not currently assigned to manage anything."""
     period_start, period_end = resolve_period(period, start_date, end_date)
     weights = await get_org_score_weights(db, org_id)
 
     by_manager: dict[int, dict] = {}
+    for user in (all_manager_users or []):
+        by_manager.setdefault(user.id, {
+            "manager": user,
+            "teams": [],
+            "projects": [],
+            "employee_ids": set(),
+        })
+
     for team in teams:
         if team.team_manager is None:
             continue
         entry = by_manager.setdefault(team.team_manager_id, {
             "manager": team.team_manager,
             "teams": [],
+            "projects": [],
             "employee_ids": set(),
         })
         entry["teams"].append(team)
         entry["employee_ids"].update(m.user_id for m in team.memberships)
+
+    for project, manager_user in (project_manager_assignments or []):
+        entry = by_manager.setdefault(manager_user.id, {
+            "manager": manager_user,
+            "teams": [],
+            "projects": [],
+            "employee_ids": set(),
+        })
+        entry["projects"].append(project)
 
     rows: list[ManagerRankingRow] = []
     for manager_id, entry in by_manager.items():
         tasks: list[Task] = []
         for team in entry["teams"]:
             tasks.extend(await fetch_eligible_team_tasks(db, org_id, team.id, period_start, period_end))
+        for project in entry["projects"]:
+            tasks.extend(await fetch_eligible_project_tasks(db, org_id, project.id, period_start, period_end))
+        # De-dupe: a task can surface via both its team and its project when
+        # the same manager holds both roles, or a project spans a managed team.
+        tasks = list({task.id: task for task in tasks}.values())
+        entry["employee_ids"].update(t.assignee_id for t in tasks if t.assignee_id is not None)
+
         result = compute_scoreboard(tasks, weights)
         rows.append(ManagerRankingRow(
             manager_id=manager_id,
             manager_name=entry["manager"].full_name,
             team_count=len(entry["teams"]),
+            project_count=len(entry["projects"]),
             employee_count=len(entry["employee_ids"]),
             result=result,
         ))

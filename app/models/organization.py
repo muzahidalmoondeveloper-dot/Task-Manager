@@ -23,7 +23,7 @@ class Organization(Base):
     logo_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     website: Mapped[str | None] = mapped_column(String(500), nullable=True)
     industry: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    plan: Mapped[str] = mapped_column(String(50), nullable=False, default="free", index=True)
+    plan: Mapped[str] = mapped_column(String(50), nullable=False, default="starter", index=True)
     # pending_setup | active — pending_setup until the creation wizard completes
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="active", index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
@@ -86,6 +86,15 @@ class OrganizationMembership(Base):
     )
     # owner | admin | team_manager | team_member
     role: Mapped[str] = mapped_column(String(50), nullable=False, default=TEAM_MEMBER, index=True)
+    # Additive admin privileges layered on top of `role` — lets a team_manager
+    # or project_manager keep their functional role while also getting
+    # admin-equivalent access, instead of replacing their role with "admin".
+    is_org_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # Additive Team Manager / Project Manager privileges layered on top of
+    # `role` — lets a project_manager also act as a team manager (or vice
+    # versa) without losing their primary functional role.
+    is_team_manager: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    is_project_manager: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     joined_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -129,8 +138,35 @@ class OrganizationInvitation(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
+    # ── Client-invitation metadata (unused/null for ordinary staff invites) ────
+    client_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    company_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    phone_number: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    onboarding_template_id: Mapped[int | None] = mapped_column(
+        ForeignKey("onboarding_templates.id", ondelete="SET NULL"), nullable=True,
+    )
+    # Desired Project Manager at invite time — copied onto the ClientOnboarding
+    # created when the invitation is accepted.
+    project_manager_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
+    )
+    # Set once acceptance creates the onboarding record, so "View onboarding"
+    # can jump straight to it from the invitations list.
+    onboarding_id: Mapped[int | None] = mapped_column(
+        ForeignKey("client_onboardings.id", ondelete="SET NULL"), nullable=True,
+    )
+    # draft | sent | opened | accepted | expired | revoked — "expired" is also
+    # derived at read time from expires_at, this column tracks the rest.
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="sent", server_default="sent")
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     organization: Mapped["Organization"] = relationship("Organization", back_populates="invitations")
     invited_by: Mapped["User"] = relationship("User", foreign_keys=[invited_by_id])  # type: ignore[name-defined]
+    project_manager: Mapped["User | None"] = relationship("User", foreign_keys=[project_manager_id], lazy="selectin")  # type: ignore[name-defined]
+    project: Mapped["Project | None"] = relationship("Project", foreign_keys=[project_id], lazy="selectin")  # type: ignore[name-defined]
+    onboarding_template: Mapped["OnboardingTemplate | None"] = relationship("OnboardingTemplate", foreign_keys=[onboarding_template_id], lazy="selectin")  # type: ignore[name-defined]
 
 
 class Subscription(Base):
@@ -146,10 +182,12 @@ class Subscription(Base):
         unique=True,
         index=True,
     )
-    plan: Mapped[str] = mapped_column(String(50), nullable=False, default="free")
-    # trialing | active | past_due | cancelled | paused
+    plan: Mapped[str] = mapped_column(String(50), nullable=False, default="starter")
+    # trialing | active | past_due | cancelled | paused | incomplete_expired
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="active", index=True)
     seats: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    # monthly | annual — chosen at signup, not switchable self-serve in v1
+    billing_interval: Mapped[str] = mapped_column(String(20), nullable=False, default="monthly", server_default="monthly")
     trial_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     current_period_start: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -157,11 +195,18 @@ class Subscription(Base):
     current_period_end: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    # Stripe stubs — populated once billing is wired up
+    cancel_at_period_end: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # Purchased add-on quantities beyond the plan's base caps.
+    extra_teams: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    extra_users: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     stripe_subscription_id: Mapped[str | None] = mapped_column(
         String(255), nullable=True, unique=True, index=True
     )
     stripe_customer_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    # Stripe subscription item IDs for the add-on line items, so quantities
+    # can be patched in place instead of recreating the line item each time.
+    stripe_extra_teams_item_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    stripe_extra_users_item_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

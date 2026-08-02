@@ -29,7 +29,7 @@ async def _ensure_default_org(db, admin_id: int) -> None:
             id=uuid.uuid4(),
             name="Default Organization",
             slug=DEFAULT_ORG_SLUG,
-            plan="professional",
+            plan="business",
             is_active=True,
             owner_id=admin_id,
         )
@@ -66,11 +66,11 @@ async def _ensure_default_org(db, admin_id: int) -> None:
         db.add(Subscription(
             id=_uuid.uuid4(),
             organization_id=org.id,
-            plan="professional",
+            plan="business",
             status="active",
             seats=-1,
         ))
-        logger.info("Default subscription created (plan=professional).")
+        logger.info("Default subscription created (plan=business).")
 
     await db.commit()
 

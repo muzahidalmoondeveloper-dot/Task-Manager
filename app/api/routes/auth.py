@@ -26,10 +26,12 @@ from app.core.security import (
 from app.core.token_cache import TokenCache, get_token_cache
 from app.models.organization import Organization, OrganizationMembership
 from app.models.user import User
+from app.repositories.onboarding_repository import ClientOnboardingRepository, OnboardingTemplateRepository
 from app.repositories.organization_repository import OrganizationRepository
 from app.repositories.project_repository import ProjectRepository
 from app.repositories.refresh_token_repository import RefreshTokenRepository
 from app.repositories.user_repository import UserRepository
+from app.schemas.onboarding import ClientOnboardingCreate
 from app.schemas.auth import (
     AcceptInvitationRequest,
     AuthenticatedUserResponse,
@@ -68,6 +70,11 @@ _INVITATION_NOT_FOUND = ErrorDef(
     status=http_status.HTTP_404_NOT_FOUND,
     message="Invitation not found.",
 )
+_INVITATION_REVOKED = ErrorDef(
+    code="INVITATION_REVOKED",
+    status=http_status.HTTP_400_BAD_REQUEST,
+    message="This invitation has been revoked.",
+)
 _ORG_NOT_FOUND = ErrorDef(
     code="ORG_NOT_FOUND",
     status=http_status.HTTP_404_NOT_FOUND,
@@ -87,6 +94,9 @@ async def _issue_token_pair(
     org_id: uuid.UUID | None = None,
     org_role: str | None = None,
     org_status: str | None = None,
+    org_is_admin: bool = False,
+    org_is_team_manager: bool = False,
+    org_is_project_manager: bool = False,
 ) -> TokenResponse:
     """Issue access + refresh tokens, persist the refresh token."""
     access_token, _jti, exp = create_access_token(
@@ -94,8 +104,14 @@ async def _issue_token_pair(
         extra_claims={"email": user.email},
         org_id=org_id,
         org_role=org_role,
+        org_is_admin=org_is_admin,
+        org_is_team_manager=org_is_team_manager,
+        org_is_project_manager=org_is_project_manager,
     )
-    refresh_str, refresh_hash, refresh_exp = create_refresh_token(subject=str(user.id), org_id=org_id, org_role=org_role)
+    refresh_str, refresh_hash, refresh_exp = create_refresh_token(
+        subject=str(user.id), org_id=org_id, org_role=org_role, org_is_admin=org_is_admin,
+        org_is_team_manager=org_is_team_manager, org_is_project_manager=org_is_project_manager,
+    )
 
     token_repo = RefreshTokenRepository(db)
     await token_repo.save(
@@ -111,7 +127,12 @@ async def _issue_token_pair(
         # The role that matters to the frontend is the user's role within the
         # *current* organization, not their global default — override it here
         # so `user.role` always reflects org_role from the active tenant context.
-        user_read = user_read.model_copy(update={"role": org_role})
+        user_read = user_read.model_copy(update={
+            "role": org_role,
+            "is_org_admin": org_is_admin,
+            "is_team_manager": org_is_team_manager,
+            "is_project_manager": org_is_project_manager,
+        })
 
     return TokenResponse(
         access_token=access_token,
@@ -125,8 +146,8 @@ async def _issue_token_pair(
 async def _resolve_org_for_user(
     user: User,
     db: AsyncSession,
-) -> tuple[uuid.UUID | None, str | None, str | None, list[OrgSummary]]:
-    """Return (org_id, org_role, org_status, all_orgs).
+) -> tuple[uuid.UUID | None, str | None, str | None, list[OrgSummary], bool, bool, bool]:
+    """Return (org_id, org_role, org_status, all_orgs, org_is_admin, org_is_team_manager, org_is_project_manager).
 
     Selection priority:
       1. user.last_active_organization_id  (if still an active member)
@@ -146,12 +167,15 @@ async def _resolve_org_for_user(
     rows = result.all()
 
     if not rows:
-        return None, None, None, []
+        return None, None, None, [], False, False, False
 
     # Determine the org to activate
     selected_id: uuid.UUID | None = None
     selected_role: str | None = None
     selected_status: str | None = None
+    selected_is_admin: bool = False
+    selected_is_team_manager: bool = False
+    selected_is_project_manager: bool = False
 
     if user.last_active_organization_id:
         for org, membership in rows:
@@ -159,6 +183,9 @@ async def _resolve_org_for_user(
                 selected_id = org.id
                 selected_role = membership.role
                 selected_status = org.status
+                selected_is_admin = membership.is_org_admin
+                selected_is_team_manager = membership.is_team_manager
+                selected_is_project_manager = membership.is_project_manager
                 break
 
     # Fall back to earliest joined org
@@ -167,6 +194,9 @@ async def _resolve_org_for_user(
         selected_id = org.id
         selected_role = membership.role
         selected_status = org.status
+        selected_is_admin = membership.is_org_admin
+        selected_is_team_manager = membership.is_team_manager
+        selected_is_project_manager = membership.is_project_manager
 
     orgs = [
         OrgSummary(
@@ -174,6 +204,7 @@ async def _resolve_org_for_user(
             name=org.name,
             slug=org.slug,
             plan=org.plan,
+            logo_url=org.logo_url,
             role=membership.role,
             status=org.status,
             is_current=(org.id == selected_id),
@@ -181,7 +212,7 @@ async def _resolve_org_for_user(
         for org, membership in rows
     ]
 
-    return selected_id, selected_role, selected_status, orgs
+    return selected_id, selected_role, selected_status, orgs, selected_is_admin, selected_is_team_manager, selected_is_project_manager
 
 
 # ── Registration ──────────────────────────────────────────────────────────────
@@ -328,9 +359,10 @@ async def login(
         )
 
     # Resolve org context
-    org_id, org_role, org_status, orgs = await _resolve_org_for_user(user, db)
+    org_id, org_role, org_status, orgs, org_is_admin, org_is_team_manager, org_is_project_manager = await _resolve_org_for_user(user, db)
     token_pair = await _issue_token_pair(
-        user, db, token_cache, org_id=org_id, org_role=org_role, org_status=org_status
+        user, db, token_cache, org_id=org_id, org_role=org_role, org_status=org_status, org_is_admin=org_is_admin,
+        org_is_team_manager=org_is_team_manager, org_is_project_manager=org_is_project_manager,
     )
 
     return LoginPasswordResponse(
@@ -380,9 +412,10 @@ async def verify_login_otp(
     await db.commit()
     await db.refresh(user)
 
-    org_id, org_role, org_status, orgs = await _resolve_org_for_user(user, db)
+    org_id, org_role, org_status, orgs, org_is_admin, org_is_team_manager, org_is_project_manager = await _resolve_org_for_user(user, db)
     token_pair = await _issue_token_pair(
-        user, db, token_cache, org_id=org_id, org_role=org_role, org_status=org_status
+        user, db, token_cache, org_id=org_id, org_role=org_role, org_status=org_status, org_is_admin=org_is_admin,
+        org_is_team_manager=org_is_team_manager, org_is_project_manager=org_is_project_manager,
     )
 
     return LoginPasswordResponse(
@@ -436,6 +469,7 @@ async def my_organizations(
             name=org.name,
             slug=org.slug,
             plan=org.plan,
+            logo_url=org.logo_url,
             role=membership.role,
             status=org.status,
             is_current=(org.id == current_org_id),
@@ -482,8 +516,44 @@ async def select_organization(
     await db.refresh(current_user)
 
     return await _issue_token_pair(
-        current_user, db, token_cache, org_id=org_id, org_role=membership.role, org_status=org.status
+        current_user, db, token_cache, org_id=org_id, org_role=membership.role, org_status=org.status,
+        org_is_admin=membership.is_org_admin,
+        org_is_team_manager=membership.is_team_manager, org_is_project_manager=membership.is_project_manager,
     )
+
+
+async def _create_onboarding_from_invitation(db: AsyncSession, invitation, client_user_id: int) -> int | None:
+    """Client-invitation acceptance side effect: create the ClientOnboarding
+    record (from the invitation's chosen template, if any) so the client
+    lands straight on their checklist. Safe to call even without a template —
+    creates a draft onboarding with no steps that staff can still assign a
+    template to later. No-ops if one already exists for this client+project
+    (defends against a double-accept race)."""
+    if invitation.project_id is None:
+        return None
+
+    onboarding_repo = ClientOnboardingRepository(db, invitation.organization_id)
+    existing = await onboarding_repo.list_all(client_user_id=client_user_id)
+    for record in existing:
+        if record.project_id == invitation.project_id:
+            return record.id
+
+    template = None
+    if invitation.onboarding_template_id is not None:
+        template_repo = OnboardingTemplateRepository(db, invitation.organization_id)
+        template = await template_repo.get_by_id(invitation.onboarding_template_id)
+
+    onboarding = await onboarding_repo.create(
+        ClientOnboardingCreate(
+            client_user_id=client_user_id,
+            project_id=invitation.project_id,
+            project_manager_id=invitation.project_manager_id,
+            template_id=invitation.onboarding_template_id if template else None,
+        ),
+        created_by_id=invitation.invited_by_id,
+        template=template,
+    )
+    return onboarding.id
 
 
 # ── Accept invitation ─────────────────────────────────────────────────────────
@@ -504,6 +574,9 @@ async def accept_invitation(
     if invitation.accepted_at is not None:
         raise AppException(_INVITATION_ACCEPTED)
 
+    if invitation.status == "revoked":
+        raise AppException(_INVITATION_REVOKED)
+
     now = datetime.now(timezone.utc)
     expires_at = invitation.expires_at
     if expires_at.tzinfo is None:
@@ -523,6 +596,7 @@ async def accept_invitation(
     if invitation.project_id is not None:
         project_repo = ProjectRepository(db, invitation.organization_id)
         await project_repo.add_member(invitation.project_id, current_user.id)
+        invitation.onboarding_id = await _create_onboarding_from_invitation(db, invitation, current_user.id)
 
     await org_repo.accept_invitation(invitation)
     await db.commit()
@@ -531,6 +605,9 @@ async def accept_invitation(
         current_user, db, token_cache,
         org_id=invitation.organization_id,
         org_role=membership.role,
+        org_is_admin=membership.is_org_admin,
+        org_is_team_manager=membership.is_team_manager,
+        org_is_project_manager=membership.is_project_manager,
     )
 
 
@@ -558,6 +635,9 @@ async def register_and_accept_invitation(
     if invitation.accepted_at is not None:
         raise AppException(_INVITATION_ACCEPTED)
 
+    if invitation.status == "revoked":
+        raise AppException(_INVITATION_REVOKED)
+
     now = datetime.now(timezone.utc)
     expires_at = invitation.expires_at
     if expires_at.tzinfo is None:
@@ -582,6 +662,7 @@ async def register_and_accept_invitation(
     if invitation.project_id is not None:
         project_repo = ProjectRepository(db, invitation.organization_id)
         await project_repo.add_member(invitation.project_id, user.id)
+        invitation.onboarding_id = await _create_onboarding_from_invitation(db, invitation, user.id)
 
     await org_repo.accept_invitation(invitation)
     await db.commit()
@@ -591,6 +672,9 @@ async def register_and_accept_invitation(
         user, db, token_cache,
         org_id=invitation.organization_id,
         org_role=membership.role,
+        org_is_admin=membership.is_org_admin,
+        org_is_team_manager=membership.is_team_manager,
+        org_is_project_manager=membership.is_project_manager,
     )
 
 
@@ -608,6 +692,9 @@ async def invitation_preview(
 
     if invitation is None:
         raise AppException(_INVITATION_NOT_FOUND)
+
+    if invitation.status == "revoked":
+        raise AppException(_INVITATION_REVOKED)
 
     now = datetime.now(timezone.utc)
     expires_at = invitation.expires_at
@@ -632,6 +719,13 @@ async def invitation_preview(
         project = await project_repo.get_by_id(invitation.project_id)
         project_name = project.name if project else None
 
+    # Record that the invitee opened the link — client invitations surface
+    # this as an "opened" status on the invitations management list.
+    org_repo = OrganizationRepository(db)
+    if invitation.status == "sent":
+        await org_repo.mark_invitation_opened(invitation)
+        await db.commit()
+
     return {
         "email": invitation.email,
         "role": invitation.role,
@@ -639,6 +733,10 @@ async def invitation_preview(
         "organization_id": str(invitation.organization_id),
         "project_id": invitation.project_id,
         "project_name": project_name,
+        "client_name": invitation.client_name,
+        "company_name": invitation.company_name,
+        "project_manager_name": invitation.project_manager.full_name if invitation.project_manager else None,
+        "onboarding_template_name": invitation.onboarding_template.name if invitation.onboarding_template else None,
         "expires_at": invitation.expires_at.isoformat(),
         "invited_by_name": inviter_name,
         # Lets the accept-invitation page show the single right action —
@@ -694,6 +792,9 @@ async def refresh_access_token(
     # (The client must re-call select-organization if the org context is lost)
     org_id_raw = payload.get("org_id")
     org_role = payload.get("org_role")
+    org_is_admin = bool(payload.get("org_is_admin", False))
+    org_is_team_manager = bool(payload.get("org_is_team_manager", False))
+    org_is_project_manager = bool(payload.get("org_is_project_manager", False))
     try:
         org_id = uuid.UUID(str(org_id_raw)) if org_id_raw else None
     except (ValueError, AttributeError):
@@ -704,8 +805,14 @@ async def refresh_access_token(
         extra_claims={"email": user.email},
         org_id=org_id,
         org_role=org_role,
+        org_is_admin=org_is_admin,
+        org_is_team_manager=org_is_team_manager,
+        org_is_project_manager=org_is_project_manager,
     )
-    new_refresh_str, new_hash, new_exp = create_refresh_token(subject=str(user.id), org_id=org_id, org_role=org_role)
+    new_refresh_str, new_hash, new_exp = create_refresh_token(
+        subject=str(user.id), org_id=org_id, org_role=org_role, org_is_admin=org_is_admin,
+        org_is_team_manager=org_is_team_manager, org_is_project_manager=org_is_project_manager,
+    )
     await token_repo.save(
         token_hash=new_hash,
         user_id=user.id,
@@ -774,7 +881,15 @@ async def get_me(
     if org_role is not None:
         # Reflect the user's role in their *current* organization rather than
         # their global default — keeps the profile in sync with the active tenant.
-        user_read = user_read.model_copy(update={"role": org_role})
+        org_is_admin = bool(token_payload.get("org_is_admin", False))
+        org_is_team_manager = bool(token_payload.get("org_is_team_manager", False))
+        org_is_project_manager = bool(token_payload.get("org_is_project_manager", False))
+        user_read = user_read.model_copy(update={
+            "role": org_role,
+            "is_org_admin": org_is_admin,
+            "is_team_manager": org_is_team_manager,
+            "is_project_manager": org_is_project_manager,
+        })
 
     org_status: str | None = None
     raw_org_id = token_payload.get("org_id")

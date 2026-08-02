@@ -4,7 +4,8 @@ from fastapi import APIRouter, Depends
 from fastapi import status as http_status
 
 from app.core.auth_errors import AppException, ErrorDef
-from app.core.org_roles import CLIENT, PROJECT_MANAGER
+from app.core.org_roles import CLIENT
+from app.core.project_permissions import require_can_invite_to_project
 from app.core.tenant import TenantContext, get_tenant_context
 from app.repositories.organization_repository import OrganizationRepository
 from app.repositories.project_repository import ProjectRepository
@@ -20,16 +21,6 @@ _ALREADY_MEMBER = ErrorDef(code="ALREADY_PROJECT_MEMBER", status=http_status.HTT
 _INVITATION_NOT_FOUND = ErrorDef(code="INVITATION_NOT_FOUND", status=http_status.HTTP_404_NOT_FOUND, message="Invitation not found.")
 
 
-async def _require_can_invite(tenant: TenantContext, project_repo: ProjectRepository, project_id: int) -> None:
-    """Owner/Admin/Team Manager can invite clients to any project; a Project
-    Manager can only invite clients to a project they're assigned to."""
-    if tenant.is_manager_or_above:
-        return
-    if tenant.org_role == PROJECT_MANAGER and await project_repo.is_member(project_id, tenant.user.id):
-        return
-    raise AppException(_NOT_ALLOWED)
-
-
 @router.post("", response_model=InvitationRead, status_code=http_status.HTTP_201_CREATED)
 async def invite_client(
     project_id: int,
@@ -41,7 +32,7 @@ async def invite_client(
     if project is None:
         raise AppException(_PROJECT_NOT_FOUND)
 
-    await _require_can_invite(tenant, project_repo, project_id)
+    await require_can_invite_to_project(tenant, project_repo, project_id)
 
     email = str(payload.email).lower().strip()
     user_repo = UserRepository(tenant.db)
@@ -80,7 +71,7 @@ async def list_client_invitations(
     project_repo = ProjectRepository(tenant.db, tenant.organization_id)
     if await project_repo.get_by_id(project_id) is None:
         raise AppException(_PROJECT_NOT_FOUND)
-    await _require_can_invite(tenant, project_repo, project_id)
+    await require_can_invite_to_project(tenant, project_repo, project_id)
 
     org_repo = OrganizationRepository(tenant.db)
     pending = await org_repo.list_pending_invitations(tenant.organization_id)
@@ -96,7 +87,7 @@ async def revoke_client_invitation(
     project_repo = ProjectRepository(tenant.db, tenant.organization_id)
     if await project_repo.get_by_id(project_id) is None:
         raise AppException(_PROJECT_NOT_FOUND)
-    await _require_can_invite(tenant, project_repo, project_id)
+    await require_can_invite_to_project(tenant, project_repo, project_id)
 
     org_repo = OrganizationRepository(tenant.db)
     invitation = await org_repo.get_invitation_by_id(tenant.organization_id, invitation_id)

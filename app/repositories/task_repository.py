@@ -111,6 +111,28 @@ class TaskRepository(TenantRepository):
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
 
+    async def list_by_team_ids(self, team_ids: list[int]) -> list[Task]:
+        if not team_ids:
+            return []
+        stmt = (
+            self._base_stmt()
+            .where(Task.team_id.in_(team_ids))
+            .order_by(Task.due_date.asc(), Task.created_at.desc())
+        )
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+
+    async def list_by_project_ids(self, project_ids: list[int]) -> list[Task]:
+        if not project_ids:
+            return []
+        stmt = (
+            self._base_stmt()
+            .where(Task.project_id.in_(project_ids))
+            .order_by(Task.due_date.asc(), Task.created_at.desc())
+        )
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+
     async def get_by_id(self, task_id: int) -> Task | None:
         stmt = self._base_stmt().where(Task.id == task_id)
         result = await self.db.execute(stmt)

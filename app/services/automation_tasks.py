@@ -590,12 +590,13 @@ async def analyze_yesterday_sources_for_user(
     *,
     db: AsyncSession,
     user: User,
+    org_id,
 ) -> dict:
     extractor = AITaskExtractor()
-    task_repo = TaskRepository(db)
+    task_repo = TaskRepository(db, org_id)
     user_repo = UserRepository(db)
-    project_repo = ProjectRepository(db)
-    team_repo = TeamRepository(db)
+    project_repo = ProjectRepository(db, org_id)
+    team_repo = TeamRepository(db, org_id)
 
     users = await user_repo.list_all()
     projects = await project_repo.list_all()
