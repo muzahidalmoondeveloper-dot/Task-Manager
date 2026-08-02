@@ -26,10 +26,12 @@ from app.core.security import (
 from app.core.token_cache import TokenCache, get_token_cache
 from app.models.organization import Organization, OrganizationMembership
 from app.models.user import User
+from app.repositories.onboarding_repository import ClientOnboardingRepository, OnboardingTemplateRepository
 from app.repositories.organization_repository import OrganizationRepository
 from app.repositories.project_repository import ProjectRepository
 from app.repositories.refresh_token_repository import RefreshTokenRepository
 from app.repositories.user_repository import UserRepository
+from app.schemas.onboarding import ClientOnboardingCreate
 from app.schemas.auth import (
     AcceptInvitationRequest,
     AuthenticatedUserResponse,
@@ -67,6 +69,11 @@ _INVITATION_NOT_FOUND = ErrorDef(
     code="INVITATION_NOT_FOUND",
     status=http_status.HTTP_404_NOT_FOUND,
     message="Invitation not found.",
+)
+_INVITATION_REVOKED = ErrorDef(
+    code="INVITATION_REVOKED",
+    status=http_status.HTTP_400_BAD_REQUEST,
+    message="This invitation has been revoked.",
 )
 _ORG_NOT_FOUND = ErrorDef(
     code="ORG_NOT_FOUND",
@@ -515,6 +522,40 @@ async def select_organization(
     )
 
 
+async def _create_onboarding_from_invitation(db: AsyncSession, invitation, client_user_id: int) -> int | None:
+    """Client-invitation acceptance side effect: create the ClientOnboarding
+    record (from the invitation's chosen template, if any) so the client
+    lands straight on their checklist. Safe to call even without a template —
+    creates a draft onboarding with no steps that staff can still assign a
+    template to later. No-ops if one already exists for this client+project
+    (defends against a double-accept race)."""
+    if invitation.project_id is None:
+        return None
+
+    onboarding_repo = ClientOnboardingRepository(db, invitation.organization_id)
+    existing = await onboarding_repo.list_all(client_user_id=client_user_id)
+    for record in existing:
+        if record.project_id == invitation.project_id:
+            return record.id
+
+    template = None
+    if invitation.onboarding_template_id is not None:
+        template_repo = OnboardingTemplateRepository(db, invitation.organization_id)
+        template = await template_repo.get_by_id(invitation.onboarding_template_id)
+
+    onboarding = await onboarding_repo.create(
+        ClientOnboardingCreate(
+            client_user_id=client_user_id,
+            project_id=invitation.project_id,
+            project_manager_id=invitation.project_manager_id,
+            template_id=invitation.onboarding_template_id if template else None,
+        ),
+        created_by_id=invitation.invited_by_id,
+        template=template,
+    )
+    return onboarding.id
+
+
 # ── Accept invitation ─────────────────────────────────────────────────────────
 
 @router.post("/accept-invitation", response_model=TokenResponse)
@@ -532,6 +573,9 @@ async def accept_invitation(
 
     if invitation.accepted_at is not None:
         raise AppException(_INVITATION_ACCEPTED)
+
+    if invitation.status == "revoked":
+        raise AppException(_INVITATION_REVOKED)
 
     now = datetime.now(timezone.utc)
     expires_at = invitation.expires_at
@@ -552,6 +596,7 @@ async def accept_invitation(
     if invitation.project_id is not None:
         project_repo = ProjectRepository(db, invitation.organization_id)
         await project_repo.add_member(invitation.project_id, current_user.id)
+        invitation.onboarding_id = await _create_onboarding_from_invitation(db, invitation, current_user.id)
 
     await org_repo.accept_invitation(invitation)
     await db.commit()
@@ -590,6 +635,9 @@ async def register_and_accept_invitation(
     if invitation.accepted_at is not None:
         raise AppException(_INVITATION_ACCEPTED)
 
+    if invitation.status == "revoked":
+        raise AppException(_INVITATION_REVOKED)
+
     now = datetime.now(timezone.utc)
     expires_at = invitation.expires_at
     if expires_at.tzinfo is None:
@@ -614,6 +662,7 @@ async def register_and_accept_invitation(
     if invitation.project_id is not None:
         project_repo = ProjectRepository(db, invitation.organization_id)
         await project_repo.add_member(invitation.project_id, user.id)
+        invitation.onboarding_id = await _create_onboarding_from_invitation(db, invitation, user.id)
 
     await org_repo.accept_invitation(invitation)
     await db.commit()
@@ -644,6 +693,9 @@ async def invitation_preview(
     if invitation is None:
         raise AppException(_INVITATION_NOT_FOUND)
 
+    if invitation.status == "revoked":
+        raise AppException(_INVITATION_REVOKED)
+
     now = datetime.now(timezone.utc)
     expires_at = invitation.expires_at
     if expires_at.tzinfo is None:
@@ -667,6 +719,13 @@ async def invitation_preview(
         project = await project_repo.get_by_id(invitation.project_id)
         project_name = project.name if project else None
 
+    # Record that the invitee opened the link — client invitations surface
+    # this as an "opened" status on the invitations management list.
+    org_repo = OrganizationRepository(db)
+    if invitation.status == "sent":
+        await org_repo.mark_invitation_opened(invitation)
+        await db.commit()
+
     return {
         "email": invitation.email,
         "role": invitation.role,
@@ -674,6 +733,10 @@ async def invitation_preview(
         "organization_id": str(invitation.organization_id),
         "project_id": invitation.project_id,
         "project_name": project_name,
+        "client_name": invitation.client_name,
+        "company_name": invitation.company_name,
+        "project_manager_name": invitation.project_manager.full_name if invitation.project_manager else None,
+        "onboarding_template_name": invitation.onboarding_template.name if invitation.onboarding_template else None,
         "expires_at": invitation.expires_at.isoformat(),
         "invited_by_name": inviter_name,
         # Lets the accept-invitation page show the single right action —

@@ -23,11 +23,15 @@ from app.api.routes import risks
 from app.api.routes import reports
 from app.api.routes import notes
 from app.api.routes import project_invitations
+from app.api.routes import client_invitations
 from app.api.routes import task_requests
 from app.api.routes import scoreboard
 from app.api.routes import team_scoreboard
 from app.api.routes import organization_scoreboard
 from app.api.routes import billing
+from app.api.routes import onboarding
+from app.api.routes import onboarding_steps
+from app.api.routes import dashboard
 import app.models.issue  # noqa: F401  — register Issue
 import app.models.meeting  # noqa: F401  — register Meeting models
 import app.models.chat  # noqa: F401  — register models for auto table creation
@@ -44,6 +48,7 @@ import app.models.risk  # noqa: F401  — register Risk
 import app.models.report  # noqa: F401  — register Report and all report snapshot/theme/branding tables
 import app.models.note  # noqa: F401  — register Note
 import app.models.task_request  # noqa: F401  — register TaskRequest
+import app.models.onboarding  # noqa: F401  — register OnboardingTemplate, OnboardingTemplateStep, ClientOnboarding, ClientOnboardingStep
 from contextlib import asynccontextmanager
 import logging
 from app.services.automation_scheduler import start_scheduler, stop_scheduler
@@ -126,6 +131,39 @@ async def lifespan(app: FastAPI):
         ))
         await conn.execute(text(
             "ALTER TABLE organization_invitations ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE organization_invitations ADD COLUMN IF NOT EXISTS client_name VARCHAR(255)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE organization_invitations ADD COLUMN IF NOT EXISTS company_name VARCHAR(255)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE organization_invitations ADD COLUMN IF NOT EXISTS phone_number VARCHAR(50)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE organization_invitations ADD COLUMN IF NOT EXISTS message TEXT"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE organization_invitations ADD COLUMN IF NOT EXISTS onboarding_template_id INTEGER REFERENCES onboarding_templates(id) ON DELETE SET NULL"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE organization_invitations ADD COLUMN IF NOT EXISTS project_manager_id INTEGER REFERENCES users(id) ON DELETE SET NULL"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE organization_invitations ADD COLUMN IF NOT EXISTS onboarding_id INTEGER REFERENCES client_onboardings(id) ON DELETE SET NULL"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE organization_invitations ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'sent'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE organization_invitations ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE organization_invitations ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ"
+        ))
+        await conn.execute(text(
+            "UPDATE organization_invitations SET status = 'accepted' WHERE accepted_at IS NOT NULL AND status = 'sent'"
         ))
         await conn.execute(text(
             "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE"
@@ -239,6 +277,9 @@ async def lifespan(app: FastAPI):
         await conn.execute(text(
             "ALTER TABLE organization_memberships ADD COLUMN IF NOT EXISTS is_project_manager BOOLEAN NOT NULL DEFAULT FALSE"
         ))
+        await conn.execute(text(
+            "ALTER TABLE client_onboarding_steps ADD COLUMN IF NOT EXISTS review_comment TEXT"
+        ))
 
     await seed_admin()
 
@@ -295,11 +336,15 @@ app.include_router(risks.router, prefix=settings.API_PREFIX)
 app.include_router(reports.router, prefix=settings.API_PREFIX)
 app.include_router(notes.router, prefix=settings.API_PREFIX)
 app.include_router(project_invitations.router, prefix=settings.API_PREFIX)
+app.include_router(client_invitations.router, prefix=settings.API_PREFIX)
 app.include_router(task_requests.router, prefix=settings.API_PREFIX)
 app.include_router(scoreboard.router, prefix=settings.API_PREFIX)
 app.include_router(team_scoreboard.router, prefix=settings.API_PREFIX)
 app.include_router(organization_scoreboard.router, prefix=settings.API_PREFIX)
 app.include_router(billing.router, prefix=settings.API_PREFIX)
+app.include_router(onboarding.router, prefix=settings.API_PREFIX)
+app.include_router(onboarding_steps.router, prefix=settings.API_PREFIX)
+app.include_router(dashboard.router, prefix=settings.API_PREFIX)
 
 @app.get("/health")
 async def health_check():

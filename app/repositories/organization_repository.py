@@ -248,6 +248,7 @@ class OrganizationRepository:
         self, invitation: OrganizationInvitation
     ) -> OrganizationInvitation:
         invitation.accepted_at = datetime.now(timezone.utc)
+        invitation.status = "accepted"
         await self.db.flush()
         return invitation
 
@@ -263,6 +264,126 @@ class OrganizationRepository:
             )
         )
         return list(result.scalars().all())
+
+    # ── Client invitations (shared invitation service) ──────────────────────────
+
+    async def create_client_invitation(
+        self,
+        *,
+        org_id: uuid.UUID,
+        email: str,
+        invited_by_id: int,
+        project_id: int,
+        client_name: str | None = None,
+        company_name: str | None = None,
+        phone_number: str | None = None,
+        project_manager_id: int | None = None,
+        onboarding_template_id: int | None = None,
+        message: str | None = None,
+        expires_in_days: int = 3,
+        save_as_draft: bool = False,
+    ) -> OrganizationInvitation:
+        from app.core.org_roles import CLIENT
+
+        invitation = OrganizationInvitation(
+            id=uuid.uuid4(),
+            organization_id=org_id,
+            email=email.lower().strip(),
+            role=CLIENT,
+            project_id=project_id,
+            invited_by_id=invited_by_id,
+            client_name=client_name,
+            company_name=company_name,
+            phone_number=phone_number,
+            project_manager_id=project_manager_id,
+            onboarding_template_id=onboarding_template_id,
+            message=message,
+            token=secrets.token_urlsafe(48),
+            expires_at=datetime.now(timezone.utc) + timedelta(days=expires_in_days),
+            status="draft" if save_as_draft else "sent",
+        )
+        self.db.add(invitation)
+        await self.db.flush()
+        return invitation
+
+    async def get_active_client_invitation(
+        self, org_id: uuid.UUID, email: str, project_id: int
+    ) -> OrganizationInvitation | None:
+        """An invitation is 'active' (blocks a duplicate) while it's a draft
+        or has been sent/opened and hasn't expired yet."""
+        now = datetime.now(timezone.utc)
+        result = await self.db.execute(
+            select(OrganizationInvitation).where(
+                OrganizationInvitation.organization_id == org_id,
+                OrganizationInvitation.email == email.lower().strip(),
+                OrganizationInvitation.project_id == project_id,
+                OrganizationInvitation.status.in_(["draft", "sent", "opened"]),
+                OrganizationInvitation.expires_at > now,
+            )
+        )
+        return result.scalars().first()
+
+    async def list_client_invitations(self, org_id: uuid.UUID) -> list[OrganizationInvitation]:
+        from app.core.org_roles import CLIENT
+
+        result = await self.db.execute(
+            select(OrganizationInvitation)
+            .options(
+                selectinload(OrganizationInvitation.invited_by),
+                selectinload(OrganizationInvitation.project_manager),
+                selectinload(OrganizationInvitation.project),
+                selectinload(OrganizationInvitation.onboarding_template),
+            )
+            .where(
+                OrganizationInvitation.organization_id == org_id,
+                OrganizationInvitation.role == CLIENT,
+            )
+            .order_by(OrganizationInvitation.created_at.desc())
+        )
+        return list(result.scalars().all())
+
+    async def get_client_invitation_by_id(
+        self, org_id: uuid.UUID, invitation_id: uuid.UUID
+    ) -> OrganizationInvitation | None:
+        result = await self.db.execute(
+            select(OrganizationInvitation)
+            .options(
+                selectinload(OrganizationInvitation.invited_by),
+                selectinload(OrganizationInvitation.project_manager),
+                selectinload(OrganizationInvitation.project),
+                selectinload(OrganizationInvitation.onboarding_template),
+            )
+            .where(
+                OrganizationInvitation.id == invitation_id,
+                OrganizationInvitation.organization_id == org_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def rotate_invitation_token(self, invitation: OrganizationInvitation) -> OrganizationInvitation:
+        invitation.token = secrets.token_urlsafe(48)
+        invitation.expires_at = datetime.now(timezone.utc) + timedelta(hours=INVITATION_EXPIRE_HOURS)
+        invitation.status = "sent"
+        invitation.opened_at = None
+        await self.db.flush()
+        return invitation
+
+    async def mark_invitation_opened(self, invitation: OrganizationInvitation) -> OrganizationInvitation:
+        if invitation.status == "sent":
+            invitation.status = "opened"
+            invitation.opened_at = datetime.now(timezone.utc)
+            await self.db.flush()
+        return invitation
+
+    async def revoke_invitation_soft(self, invitation: OrganizationInvitation) -> OrganizationInvitation:
+        invitation.status = "revoked"
+        invitation.revoked_at = datetime.now(timezone.utc)
+        await self.db.flush()
+        return invitation
+
+    async def delete_invitation(self, invitation: OrganizationInvitation) -> None:
+        await self.db.delete(invitation)
+        await self.db.flush()
 
     # ── Subscription ──────────────────────────────────────────────────────────
 

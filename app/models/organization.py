@@ -138,8 +138,35 @@ class OrganizationInvitation(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
+    # ── Client-invitation metadata (unused/null for ordinary staff invites) ────
+    client_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    company_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    phone_number: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    onboarding_template_id: Mapped[int | None] = mapped_column(
+        ForeignKey("onboarding_templates.id", ondelete="SET NULL"), nullable=True,
+    )
+    # Desired Project Manager at invite time — copied onto the ClientOnboarding
+    # created when the invitation is accepted.
+    project_manager_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
+    )
+    # Set once acceptance creates the onboarding record, so "View onboarding"
+    # can jump straight to it from the invitations list.
+    onboarding_id: Mapped[int | None] = mapped_column(
+        ForeignKey("client_onboardings.id", ondelete="SET NULL"), nullable=True,
+    )
+    # draft | sent | opened | accepted | expired | revoked — "expired" is also
+    # derived at read time from expires_at, this column tracks the rest.
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="sent", server_default="sent")
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     organization: Mapped["Organization"] = relationship("Organization", back_populates="invitations")
     invited_by: Mapped["User"] = relationship("User", foreign_keys=[invited_by_id])  # type: ignore[name-defined]
+    project_manager: Mapped["User | None"] = relationship("User", foreign_keys=[project_manager_id], lazy="selectin")  # type: ignore[name-defined]
+    project: Mapped["Project | None"] = relationship("Project", foreign_keys=[project_id], lazy="selectin")  # type: ignore[name-defined]
+    onboarding_template: Mapped["OnboardingTemplate | None"] = relationship("OnboardingTemplate", foreign_keys=[onboarding_template_id], lazy="selectin")  # type: ignore[name-defined]
 
 
 class Subscription(Base):

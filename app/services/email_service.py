@@ -105,6 +105,9 @@ class EmailService:
         project_name: str,
         inviter_name: str,
         token: str,
+        client_name: str | None = None,
+        message: str | None = None,
+        template_name: str | None = None,
     ) -> None:
         from app.core.config import get_settings
         frontend_url = get_settings().FRONTEND_URL
@@ -118,21 +121,30 @@ class EmailService:
             return
 
         subject = f"You've been invited to view {project_name}"
+        greeting = f"Hi {client_name.split()[0]}, " if client_name else ""
+
+        body_paragraphs = [
+            f"{greeting}<strong>{inviter_name}</strong> has invited you to view the progress of "
+            f"<strong>{project_name}</strong> at <strong>{org_name}</strong>.",
+            "Click the button below to set up your account — you'll be able to view "
+            "the project's status, complete your onboarding checklist, and submit task requests.",
+        ]
+        if message:
+            body_paragraphs.append(f"<em>\"{message}\"</em>")
+
+        details = [
+            ("Project", project_name),
+            ("Organization", org_name),
+            ("Invited by", inviter_name),
+        ]
+        if template_name:
+            details.append(("Onboarding checklist", template_name))
 
         html = self._build_html(
             subject=subject,
             headline="You're invited to track a project!",
-            body_paragraphs=[
-                f"<strong>{inviter_name}</strong> has invited you to view the progress of "
-                f"<strong>{project_name}</strong> at <strong>{org_name}</strong>.",
-                "Click the button below to set up your account — you'll be able to view "
-                "the project's status and submit task requests.",
-            ],
-            details=[
-                ("Project", project_name),
-                ("Organization", org_name),
-                ("Invited by", inviter_name),
-            ],
+            body_paragraphs=body_paragraphs,
+            details=details,
             cta_url=accept_url,
             cta_label="View Invitation",
         )

@@ -1,8 +1,8 @@
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 from app.core.org_roles import ALL_ORG_ROLES, TEAM_MEMBER
 from app.core.plan_limits import ALL_PLANS, PlanLimits
@@ -197,6 +197,78 @@ class ClientInvitationRequest(BaseModel):
 
 class AcceptInvitationRequest(BaseModel):
     token: str
+
+
+# ── Client invitations (shared invitation service) ─────────────────────────────
+
+class _RefUser(BaseModel):
+    id: int
+    full_name: str | None = None
+    email: str
+
+    model_config = {"from_attributes": True}
+
+
+class _RefProject(BaseModel):
+    id: int
+    name: str
+
+    model_config = {"from_attributes": True}
+
+
+class _RefTemplate(BaseModel):
+    id: int
+    name: str
+
+    model_config = {"from_attributes": True}
+
+
+class ClientInvitationCreate(BaseModel):
+    email: EmailStr
+    project_id: int
+    client_name: str | None = Field(default=None, max_length=255)
+    company_name: str | None = Field(default=None, max_length=255)
+    phone_number: str | None = Field(default=None, max_length=50)
+    project_manager_id: int | None = None
+    onboarding_template_id: int | None = None
+    message: str | None = None
+    expires_in_days: int = Field(default=3, ge=1, le=30)
+    save_as_draft: bool = False
+
+
+class ClientInvitationRead(BaseModel):
+    id: uuid.UUID
+    organization_id: uuid.UUID
+    email: str
+    client_name: str | None = None
+    company_name: str | None = None
+    phone_number: str | None = None
+    role: str
+    status: str
+    message: str | None = None
+    token: str
+    project: _RefProject | None = None
+    project_manager: _RefUser | None = None
+    onboarding_template: _RefTemplate | None = None
+    onboarding_id: int | None = None
+    invited_by: _RefUser
+    expires_at: datetime
+    accepted_at: datetime | None = None
+    opened_at: datetime | None = None
+    revoked_at: datetime | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+    @model_validator(mode="after")
+    def compute_effective_status(self):
+        if self.status in ("accepted", "revoked", "draft"):
+            return self
+        now = datetime.now(timezone.utc)
+        expires_at = self.expires_at if self.expires_at.tzinfo else self.expires_at.replace(tzinfo=timezone.utc)
+        if expires_at < now:
+            self.status = "expired"
+        return self
 
 
 # ── Subscription & Usage ──────────────────────────────────────────────────────
