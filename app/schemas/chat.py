@@ -41,3 +41,17 @@ class ChatMessageResponse(BaseModel):
     user_message: ChatMessageRead
     assistant_message: ChatMessageRead
     actions: list[ChatAction] = []
+
+
+class ApprovalRequestRead(BaseModel):
+    id: int
+    session_id: int
+    change_set_id: int
+    requested_by_id: int
+    approver_role: str
+    reason: str
+    status: str
+    expires_at: datetime
+    created_at: datetime
+
+    model_config = {"from_attributes": True}

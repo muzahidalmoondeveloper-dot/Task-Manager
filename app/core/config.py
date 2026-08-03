@@ -61,9 +61,18 @@ class Settings(BaseSettings):
 
 
     # ── LLM provider selection ───────────────────────────────────────────────
-    # Set LLM_PROVIDER to one of: ollama | openai | gemini | generic
+    # Set LLM_PROVIDER to one of: ollama | openai | anthropic | gemini | generic
+    # Developer-only configuration — there is no admin/end-user-facing UI to
+    # change these; they're read once at process start (app/services/llm/factory.py).
     LLM_PROVIDER: str = "ollama"
     DEFAULT_MODEL: str | None = None
+
+    # Optional LLM Gateway fallback (spec Section 37) — if set, a second
+    # provider of this name is built alongside the primary and used when the
+    # primary's circuit breaker trips after repeated failures. Leave unset to
+    # disable fallback entirely (the default — matches today's behavior).
+    LLM_FALLBACK_PROVIDER: str | None = None
+    FALLBACK_MODEL: str | None = None
 
     # Ollama (default provider)
     OLLAMA_API_KEY: str | None = None
@@ -72,6 +81,9 @@ class Settings(BaseSettings):
 
     # OpenAI
     OPENAI_API_KEY: str | None = None
+
+    # Anthropic (Claude)
+    ANTHROPIC_API_KEY: str | None = None
 
     # Google Gemini
     GEMINI_API_KEY: str | None = None

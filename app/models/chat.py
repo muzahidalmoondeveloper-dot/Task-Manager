@@ -24,6 +24,18 @@ class ChatSession(Base):
     )
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
+    # Explicit conversation state machine (spec Section 8) — idle |
+    # awaiting_confirmation | awaiting_manager_approval |
+    # awaiting_admin_approval. Interpreting/retrieving/etc. are transient
+    # sub-states of a single request and aren't persisted between turns.
+    state: Mapped[str] = mapped_column(String(30), nullable=False, default="idle", server_default="idle")
+    pending_change_set_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ai_change_sets.id", ondelete="SET NULL"), nullable=True,
+    )
+    pending_approval_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ai_approval_requests.id", ondelete="SET NULL"), nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
