@@ -129,8 +129,8 @@ Classify the user's message into exactly ONE of these intents:
 - list_tasks: user wants to see, find, or summarise their tasks (e.g. "how many tasks", "show my tasks", "list all tasks")
 - update_task: user wants to change or update tasks — including bulk operations like "mark all tasks as done", "set everything to in_progress"
 - delete_task: user wants to delete or remove tasks — including bulk operations like "delete all tasks", "remove all tasks", "delete all of task", "please delete all of task"
-- analyze_text: user pasted an email, meeting transcript, or document and wants tasks extracted OR wants a summary/analysis of previously shared content
-- db_query: user is asking an analytical or lookup question about data in the system — e.g. "how many users are there", "list all projects", "what tasks are overdue", "who is in team Alpha", "what is the progress of project X", "how many tasks are done", "show active projects", "what tasks does John have", "system statistics", "workload summary", "who are the admins", "how many teams", "tasks due this week", "list all issues", "show open issues", "what rocks does team X have", "show all rocks", "show our KPIs", "how is KPI X doing", "upcoming meetings", "list meetings", "client requests", "task requests from clients"
+- analyze_text: user pasted an email, meeting transcript, or document IN THIS MESSAGE and wants tasks extracted, OR explicitly asks to summarise/analyse a document/transcript/email they shared earlier in this conversation (e.g. "summarise that email", "extract tasks from the transcript above"). Do NOT use this for a short question or command that merely mentions an app entity (tasks, Rocks, KPIs, projects, issues) — those are db_query or general, even if the wording contains "explain" or "summarise" (e.g. "explain my rocks", "summarise my week" are db_query, not analyze_text — there is no pasted document to extract from).
+- db_query: user is asking an analytical or lookup question about data in the system — e.g. "how many users are there", "list all projects", "what tasks are overdue", "who is in team Alpha", "what is the progress of project X", "how many tasks are done", "show active projects", "what tasks does John have", "system statistics", "workload summary", "who are the admins", "how many teams", "tasks due this week", "list all issues", "show open issues", "what rocks does team X have", "show all rocks", "show our KPIs", "how is KPI X doing", "upcoming meetings", "list meetings", "client requests", "task requests from clients", "explain my rocks", "explain my tasks", "summarise my week"
 - convert_request_to_task: user wants to turn a submitted client task request into a real task — e.g. "convert that request into a task", "approve the client's request and make it a task", "turn request 5 into a task"
 - general: any other question, greeting, or request not covered above
 
@@ -190,6 +190,8 @@ _ANALYZE_TEXT_SYSTEM = """You are a task extraction assistant. Read the provided
 
 If the user asks to summarise or analyse content from earlier in the conversation, look at the Conversation history to find that content.
 
+IMPORTANT: Only extract tasks from genuine source material — a pasted email, meeting transcript, document, or notes. If "User instruction" is just a short question, greeting, or command about the app itself (e.g. "explain my rocks", "what should I do today") with no actual document/transcript/email text to extract from, return an EMPTY tasks array. Never invent a task out of the user's own question — e.g. the message "explain my rocks" must NOT produce a task named anything like "Explain rocks" or "Explain User's Rocks".
+
 {users_block}
 Return ONLY a JSON object:
 {{
@@ -242,7 +244,7 @@ Sub-intent values and when to use them:
 - team_members: "who is in team X", "members of team Beta", "team X members", "who belongs to team X"
 - team_workload: "workload of team X", "team Alpha tasks", "how busy is team X", "team X task count"
 - workload_summary: "overall summary", "workload overview", "system stats", "system overview", "dashboard stats", "give me a summary"
-- rock_list: "show all rocks", "list rocks", "what rocks are there", "our quarterly rocks"
+- rock_list: "show all rocks", "list rocks", "what rocks are there", "our quarterly rocks", "explain my rocks", "explain rocks"
 - rock_by_team: "rocks for team X", "team Alpha's rocks", "what rocks does team X have"
 - issue_list: "show all issues", "list issues", "what issues are there"
 - issue_open: "open issues", "unresolved issues", "issues that aren't closed"
@@ -320,7 +322,10 @@ class ChatService:
         # safe because a fresh ChatService instance is created per HTTP
         # request (see app/api/routes/chat.py), so this never leaks across turns.
         self._trace_id = str(uuid.uuid4())
-        logger.info("Chat turn started: trace_id=%s user=%s", self._trace_id, user.id)
+        logger.info(
+            "Chat turn started: trace_id=%s user=%s session=%s query=%r",
+            self._trace_id, user.id, session_id, message,
+        )
 
         # 1. Get or create session
         session = await self._get_or_create_session(user, session_id, message)
@@ -385,6 +390,8 @@ class ChatService:
         steps = [message]
         if not file_context and message.strip():
             steps = await planner.maybe_split_goals(self._llm, message)
+            if len(steps) > 1:
+                logger.info("Planner split query into %d steps: %r", len(steps), steps)
 
         step_replies: list[str] = []
         actions: list[ChatAction] = []
@@ -400,6 +407,8 @@ class ChatService:
             step_replies[0] if len(step_replies) == 1
             else "\n\n".join(f"**{i}.** {r}" for i, r in enumerate(step_replies, 1))
         )
+
+        logger.info("Chat turn reply: trace_id=%s session=%s reply=%r", self._trace_id, session.id, reply)
 
         # 8. Persist assistant reply
         assistant_msg = await self._chat_repo.add_message(session.id, "assistant", reply)
@@ -448,8 +457,8 @@ class ChatService:
         intent_input = step_message if file_context else effective_message
         intent, intent_confidence = await self._detect_intent(intent_input, history_text)
         logger.info(
-            "Detected intent: %s (confidence=%.2f, file_attached=%s)",
-            intent, intent_confidence, bool(file_context),
+            "Detected intent: %s (confidence=%.2f, file_attached=%s) for query=%r",
+            intent, intent_confidence, bool(file_context), step_message,
         )
 
         if intent in self._AMBIGUITY_GATED_INTENTS and intent_confidence < self._AMBIGUITY_CONFIDENCE_FLOOR:
@@ -1019,7 +1028,13 @@ class ChatService:
         )
         data = _parse_json_safe(result.text)
 
-        raw_tasks: list[dict] = data.get("tasks", [])
+        # Defense-in-depth against the extraction prompt fabricating a task
+        # out of a short question/command (e.g. "explain my rocks") rather
+        # than genuine pasted content — never write a low-confidence guess
+        # to the database, even if the prompt above still tries to.
+        raw_tasks: list[dict] = [
+            t for t in data.get("tasks", []) if (t.get("confidence") or "").lower() != "low"
+        ]
         summary: str = data.get("summary", "")
 
         if not raw_tasks:

@@ -1,7 +1,7 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, Uuid, func
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -151,6 +151,9 @@ class OrganizationInvitation(Base):
     project_manager_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
     )
+    # Desired onboarding due date at invite time — copied onto the
+    # ClientOnboarding created when the invitation is accepted.
+    due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     # Set once acceptance creates the onboarding record, so "View onboarding"
     # can jump straight to it from the invitations list.
     onboarding_id: Mapped[int | None] = mapped_column(

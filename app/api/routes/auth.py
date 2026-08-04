@@ -524,11 +524,14 @@ async def select_organization(
 
 async def _create_onboarding_from_invitation(db: AsyncSession, invitation, client_user_id: int) -> int | None:
     """Client-invitation acceptance side effect: create the ClientOnboarding
-    record (from the invitation's chosen template, if any) so the client
-    lands straight on their checklist. Safe to call even without a template —
-    creates a draft onboarding with no steps that staff can still assign a
-    template to later. No-ops if one already exists for this client+project
-    (defends against a double-accept race)."""
+    record from the invitation's template so the client lands straight on
+    their checklist. `invite_client` already validated the template exists
+    and has steps before the invitation was ever sent, so this should always
+    resolve to a real template; ClientOnboardingRepository.create() still
+    enforces it (raises rather than creating a blank onboarding) as a last
+    line of defense against a template being deleted in between. No-ops if
+    an onboarding already exists for this client+project (defends against a
+    double-accept race)."""
     if invitation.project_id is None:
         return None
 
@@ -549,6 +552,7 @@ async def _create_onboarding_from_invitation(db: AsyncSession, invitation, clien
             project_id=invitation.project_id,
             project_manager_id=invitation.project_manager_id,
             template_id=invitation.onboarding_template_id if template else None,
+            due_date=invitation.due_date,
         ),
         created_by_id=invitation.invited_by_id,
         template=template,

@@ -152,6 +152,9 @@ async def lifespan(app: FastAPI):
             "ALTER TABLE organization_invitations ADD COLUMN IF NOT EXISTS project_manager_id INTEGER REFERENCES users(id) ON DELETE SET NULL"
         ))
         await conn.execute(text(
+            "ALTER TABLE organization_invitations ADD COLUMN IF NOT EXISTS due_date DATE"
+        ))
+        await conn.execute(text(
             "ALTER TABLE organization_invitations ADD COLUMN IF NOT EXISTS onboarding_id INTEGER REFERENCES client_onboardings(id) ON DELETE SET NULL"
         ))
         await conn.execute(text(
