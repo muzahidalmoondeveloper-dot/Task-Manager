@@ -49,6 +49,7 @@ import app.models.report  # noqa: F401  — register Report and all report snaps
 import app.models.note  # noqa: F401  — register Note
 import app.models.task_request  # noqa: F401  — register TaskRequest
 import app.models.onboarding  # noqa: F401  — register OnboardingTemplate, OnboardingTemplateStep, ClientOnboarding, ClientOnboardingStep
+import app.models.copilot  # noqa: F401  — register AIChangeSet, AIOperation, AITopic, AIToolExecution
 from contextlib import asynccontextmanager
 import logging
 from app.services.automation_scheduler import start_scheduler, stop_scheduler
@@ -279,6 +280,24 @@ async def lifespan(app: FastAPI):
         ))
         await conn.execute(text(
             "ALTER TABLE client_onboarding_steps ADD COLUMN IF NOT EXISTS review_comment TEXT"
+        ))
+        # Conversation state machine (spec Section 8) — chat_sessions is a
+        # pre-existing table so create_all() won't add these columns; the
+        # FK targets (ai_change_sets, ai_approval_requests) are brand-new
+        # tables created by create_all() earlier in this same block.
+        await conn.execute(text(
+            "ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS state VARCHAR(30) NOT NULL DEFAULT 'idle'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS pending_change_set_id INTEGER "
+            "REFERENCES ai_change_sets(id) ON DELETE SET NULL"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS pending_approval_id INTEGER "
+            "REFERENCES ai_approval_requests(id) ON DELETE SET NULL"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE ai_tool_executions ADD COLUMN IF NOT EXISTS trace_id VARCHAR(36)"
         ))
 
     await seed_admin()

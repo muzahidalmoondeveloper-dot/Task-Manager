@@ -21,6 +21,7 @@ from app.models.team import Team
 from app.models.user import User
 from app.repositories.integration_repository import IntegrationRepository
 from app.services.background_email import bg_send_due_date_reminder
+from app.services.copilot.proactive import run_daily_brief
 
 logger = logging.getLogger("automation_scheduler")
 
@@ -226,6 +227,21 @@ async def run_daily_ai_task_sync() -> None:
     logger.info("Scheduler: AI task sync END")
 
 
+# ─── Job: proactive daily copilot brief ──────────────────────────────────────
+
+async def run_daily_copilot_brief() -> None:
+    """Proactive Copilot (spec Section 7) — overdue/workload digest for
+    owners/admins/team_managers, delivered as an in-app notification."""
+    logger.info("Scheduler: daily copilot brief START")
+    try:
+        async with AsyncSessionLocal() as db:
+            sent = await run_daily_brief(db)
+            logger.info("Scheduler: daily copilot brief sent to %s recipient(s)", sent)
+    except Exception:
+        logger.exception("Scheduler: daily copilot brief failed")
+    logger.info("Scheduler: daily copilot brief END")
+
+
 # ─── Scheduler setup ──────────────────────────────────────────────────────────
 
 def start_scheduler() -> None:
@@ -262,6 +278,19 @@ def start_scheduler() -> None:
         hour=8,
         minute=0,
         id="due_date_email_reminders",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Proactive daily copilot brief — daily at 07:00 UTC, ahead of the
+    # due-date email reminders above.
+    scheduler.add_job(
+        run_daily_copilot_brief,
+        trigger="cron",
+        hour=7,
+        minute=0,
+        id="daily_copilot_brief",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
