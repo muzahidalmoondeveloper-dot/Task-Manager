@@ -18,6 +18,7 @@ router = APIRouter(prefix="/client-invitations", tags=["Client Invitations"])
 
 _PROJECT_NOT_FOUND = ErrorDef(code="PROJECT_NOT_FOUND", status=http_status.HTTP_404_NOT_FOUND, message="Project not found.")
 _TEMPLATE_NOT_FOUND = ErrorDef(code="ONBOARDING_TEMPLATE_NOT_FOUND", status=http_status.HTTP_404_NOT_FOUND, message="Onboarding template not found.")
+_TEMPLATE_REQUIRED = ErrorDef(code="ONBOARDING_TEMPLATE_REQUIRED", status=http_status.HTTP_422_UNPROCESSABLE_ENTITY, message="Create or configure an onboarding template first.")
 _INVALID_PM = ErrorDef(code="INVALID_PROJECT_MANAGER", status=http_status.HTTP_400_BAD_REQUEST, message="Selected project manager is not a valid org member.")
 _ALREADY_MEMBER = ErrorDef(code="ALREADY_PROJECT_MEMBER", status=http_status.HTTP_400_BAD_REQUEST, message="This person already has access to the project.")
 _DUPLICATE_ONBOARDING = ErrorDef(code="DUPLICATE_ACTIVE_ONBOARDING", status=http_status.HTTP_409_CONFLICT, message="This client already has an active onboarding for this project.")
@@ -27,7 +28,7 @@ _INVITATION_LOCKED = ErrorDef(code="INVITATION_LOCKED", status=http_status.HTTP_
 _NOT_A_DRAFT = ErrorDef(code="INVITATION_NOT_A_DRAFT", status=http_status.HTTP_400_BAD_REQUEST, message="Only draft invitations can be deleted directly — revoke a sent invitation instead.")
 
 
-async def _validate_and_load(tenant: TenantContext, payload: ClientInvitationCreate):
+async def _validate_and_load(tenant: TenantContext, payload: ClientInvitationCreate) -> tuple:
     project_repo = ProjectRepository(tenant.db, tenant.organization_id)
     project = await project_repo.get_by_id(payload.project_id)
     if project is None:
@@ -41,13 +42,27 @@ async def _validate_and_load(tenant: TenantContext, payload: ClientInvitationCre
         if pm_membership is None or not pm_membership.is_active:
             raise AppException(_INVALID_PM)
 
-    if payload.onboarding_template_id is not None:
-        template_repo = OnboardingTemplateRepository(tenant.db, tenant.organization_id)
-        template = await template_repo.get_by_id(payload.onboarding_template_id)
+    # If the caller didn't explicitly pick a template, fall back to the org's
+    # single active default template (see OnboardingTemplateRepository) —
+    # every org has exactly one once it's configured. A real, non-empty
+    # template is mandatory: an invitation that can't ultimately produce a
+    # real onboarding checklist is rejected up front rather than accepted
+    # and left to fail (or silently create a blank onboarding) later at
+    # accept-invitation time.
+    template_id = payload.onboarding_template_id
+    template_repo = OnboardingTemplateRepository(tenant.db, tenant.organization_id)
+    if template_id is not None:
+        template = await template_repo.get_by_id(template_id)
         if template is None:
             raise AppException(_TEMPLATE_NOT_FOUND)
+    else:
+        template = await template_repo.get_default()
+        template_id = template.id if template else None
 
-    return project_repo, project
+    if template is None or not template.steps:
+        raise AppException(_TEMPLATE_REQUIRED)
+
+    return project_repo, project, template_id
 
 
 @router.post("", response_model=ClientInvitationRead, status_code=http_status.HTTP_201_CREATED)
@@ -55,7 +70,7 @@ async def invite_client(
     payload: ClientInvitationCreate,
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    project_repo, project = await _validate_and_load(tenant, payload)
+    project_repo, project, template_id = await _validate_and_load(tenant, payload)
 
     email = str(payload.email).lower().strip()
     user_repo = UserRepository(tenant.db)
@@ -85,7 +100,8 @@ async def invite_client(
         company_name=payload.company_name,
         phone_number=payload.phone_number,
         project_manager_id=payload.project_manager_id,
-        onboarding_template_id=payload.onboarding_template_id,
+        onboarding_template_id=template_id,
+        due_date=payload.due_date,
         message=payload.message,
         expires_in_days=payload.expires_in_days,
         save_as_draft=payload.save_as_draft,

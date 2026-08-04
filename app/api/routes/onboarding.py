@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.database import get_db
 from app.core.org_roles import CLIENT, PROJECT_MANAGER
+from app.core.project_permissions import require_can_invite_to_project
 from app.core.tenant import TenantContext, get_tenant_context, require_org_admin
 from app.repositories.onboarding_repository import ClientOnboardingRepository, OnboardingTemplateRepository
 from app.repositories.organization_repository import OrganizationRepository
@@ -78,7 +79,10 @@ _CLIENT_ALLOWED_STEP_STATUSES = {"in_progress"}
 # ── Templates ────────────────────────────────────────────────────────────────
 
 @router.get("/onboarding/templates", response_model=list[OnboardingTemplateRead])
-async def list_templates(tenant: TenantContext = Depends(require_org_admin), db: AsyncSession = Depends(get_db)):
+async def list_templates(tenant: TenantContext = Depends(get_tenant_context), db: AsyncSession = Depends(get_db)):
+    # Readable by any org member (not just admins) — a Project Manager
+    # starting a client onboarding needs to see and preselect the default
+    # template too. Only creating/editing/deleting templates stays admin-only.
     repo = OnboardingTemplateRepository(db, tenant.organization_id)
     return await repo.list_all()
 
@@ -94,7 +98,7 @@ async def create_template(
 
 
 @router.get("/onboarding/templates/{template_id}", response_model=OnboardingTemplateRead)
-async def get_template(template_id: int, tenant: TenantContext = Depends(require_org_admin), db: AsyncSession = Depends(get_db)):
+async def get_template(template_id: int, tenant: TenantContext = Depends(get_tenant_context), db: AsyncSession = Depends(get_db)):
     repo = OnboardingTemplateRepository(db, tenant.organization_id)
     template = await repo.get_by_id(template_id)
     if template is None:
@@ -151,9 +155,20 @@ async def list_client_onboardings(tenant: TenantContext = Depends(get_tenant_con
 @router.post("/client-onboardings", response_model=ClientOnboardingRead, status_code=http_status.HTTP_201_CREATED)
 async def create_client_onboarding(
     payload: ClientOnboardingCreate,
-    tenant: TenantContext = Depends(require_org_admin),
+    tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db),
 ):
+    project_repo = ProjectRepository(db, tenant.organization_id)
+    project = await project_repo.get_by_id(payload.project_id)
+    if project is None:
+        raise AppException(_INVALID_PROJECT)
+
+    # Same authorization as inviting a new client (Owner/Admin/Team Manager
+    # anywhere, a Project Manager only for a project they're assigned to) —
+    # this is the "existing client" branch of the same unified "Start Client
+    # Onboarding" action, so both branches share one permission model.
+    await require_can_invite_to_project(tenant, project_repo, payload.project_id)
+
     user_repo = UserRepository(db)
     client_user = await user_repo.get_by_id(payload.client_user_id)
     if client_user is None:
@@ -164,25 +179,31 @@ async def create_client_onboarding(
     if client_membership is None or not client_membership.is_active:
         raise AppException(_INVALID_CLIENT)
 
-    project_repo = ProjectRepository(db, tenant.organization_id)
-    project = await project_repo.get_by_id(payload.project_id)
-    if project is None:
-        raise AppException(_INVALID_PROJECT)
-
     await _validate_project_manager(org_repo, tenant, payload.project_manager_id)
     _validate_due_date(payload.due_date)
 
+    template_repo = OnboardingTemplateRepository(db, tenant.organization_id)
+    # No explicit template picked → fall back to the org's single default
+    # template, same as the client-invitation path.
     template = None
     if payload.template_id is not None:
-        template_repo = OnboardingTemplateRepository(db, tenant.organization_id)
         template = await template_repo.get_by_id(payload.template_id)
         if template is None:
             raise AppException(_TEMPLATE_NOT_FOUND)
+    else:
+        template = await template_repo.get_default()
 
     repo = ClientOnboardingRepository(db, tenant.organization_id)
     existing = await repo.get_active_for_client_project(payload.client_user_id, payload.project_id)
     if existing is not None:
         raise AppException(_DUPLICATE_ONBOARDING, details={"onboarding_id": existing.id})
+
+    # Give the client access to this project the same way accepting an
+    # invitation does — without this, the onboarding record is created but
+    # the client's own project list/detail view (scoped to ProjectMembership)
+    # never surfaces it, and the checklist never renders on their side.
+    # Idempotent: no-ops if they're already a member.
+    await project_repo.add_member(payload.project_id, payload.client_user_id)
 
     return await repo.create(payload, created_by_id=tenant.user.id, template=template)
 

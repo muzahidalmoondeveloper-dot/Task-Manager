@@ -1,6 +1,6 @@
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
@@ -231,6 +231,7 @@ class ClientInvitationCreate(BaseModel):
     phone_number: str | None = Field(default=None, max_length=50)
     project_manager_id: int | None = None
     onboarding_template_id: int | None = None
+    due_date: date | None = None
     message: str | None = None
     expires_in_days: int = Field(default=3, ge=1, le=30)
     save_as_draft: bool = False
@@ -251,6 +252,7 @@ class ClientInvitationRead(BaseModel):
     project_manager: _RefUser | None = None
     onboarding_template: _RefTemplate | None = None
     onboarding_id: int | None = None
+    due_date: date | None = None
     invited_by: _RefUser
     expires_at: datetime
     accepted_at: datetime | None = None

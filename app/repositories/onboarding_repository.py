@@ -42,6 +42,16 @@ _STEP_NOT_READY = ErrorDef(
     status=http_status.HTTP_400_BAD_REQUEST,
     message="This step is missing required information and cannot be submitted yet.",
 )
+_DEFAULT_TEMPLATE_PROTECTED = ErrorDef(
+    code="DEFAULT_TEMPLATE_PROTECTED",
+    status=http_status.HTTP_400_BAD_REQUEST,
+    message="This is the default onboarding template. Set another template as default first.",
+)
+_TEMPLATE_REQUIRED = ErrorDef(
+    code="ONBOARDING_TEMPLATE_REQUIRED",
+    status=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+    message="Create or configure an onboarding template first.",
+)
 
 
 def _build_template_step(step: OnboardingTemplateStepCreate) -> OnboardingTemplateStep:
@@ -79,22 +89,60 @@ class OnboardingTemplateRepository(TenantRepository):
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_default(self) -> OnboardingTemplate | None:
+        stmt = select(OnboardingTemplate).where(
+            OnboardingTemplate.organization_id == self.org_id,
+            OnboardingTemplate.is_default.is_(True),
+        )
+        result = await self.db.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def _unset_other_defaults(self, keep_id: int | None) -> None:
+        stmt = select(OnboardingTemplate).where(
+            OnboardingTemplate.organization_id == self.org_id,
+            OnboardingTemplate.is_default.is_(True),
+        )
+        if keep_id is not None:
+            stmt = stmt.where(OnboardingTemplate.id != keep_id)
+        result = await self.db.execute(stmt)
+        for other in result.scalars().all():
+            other.is_default = False
+
     async def create(self, payload: OnboardingTemplateCreate, created_by_id: int) -> OnboardingTemplate:
+        # Every org must have exactly one active default template — the very
+        # first template created for an org is always the default, regardless
+        # of what the payload asked for, so the invariant holds from the start.
+        existing = await self.list_all()
+        is_default = payload.is_default or not existing
+
         template = OnboardingTemplate(
             organization_id=self.org_id,
             name=payload.name,
             description=payload.description,
-            is_default=payload.is_default,
+            is_default=is_default,
             created_by_id=created_by_id,
         )
         template.steps = [_build_template_step(step) for step in sorted(payload.steps, key=lambda s: s.display_order)]
         self.db.add(template)
+        await self.db.flush()
+        if is_default:
+            await self._unset_other_defaults(keep_id=template.id)
         await self.db.commit()
         await self.db.refresh(template)
         return template
 
     async def update(self, template: OnboardingTemplate, payload: OnboardingTemplateUpdate) -> OnboardingTemplate:
         data = payload.model_dump(exclude_unset=True, exclude={"steps"})
+
+        # Exactly one default template per org, always: promoting this one
+        # unsets every other default; un-defaulting or deactivating THE
+        # current default without first promoting another is rejected so the
+        # org is never left with zero (or more than one) default template.
+        if data.get("is_default") is True:
+            await self._unset_other_defaults(keep_id=template.id)
+        elif template.is_default and (data.get("is_default") is False or data.get("is_active") is False):
+            raise AppException(_DEFAULT_TEMPLATE_PROTECTED)
+
         for key, value in data.items():
             setattr(template, key, value)
 
@@ -106,6 +154,8 @@ class OnboardingTemplateRepository(TenantRepository):
         return template
 
     async def delete(self, template: OnboardingTemplate) -> None:
+        if template.is_default:
+            raise AppException(_DEFAULT_TEMPLATE_PROTECTED)
         await self.db.delete(template)
         await self.db.commit()
 
@@ -280,12 +330,23 @@ class ClientOnboardingRepository(TenantRepository):
         created_by_id: int,
         template: OnboardingTemplate | None,
     ) -> ClientOnboarding:
+        # A real, non-empty template is mandatory — no blank onboarding
+        # records. Callers resolve the selected template or the org's
+        # default before getting here; this is the single choke point that
+        # enforces it no matter which route (direct create or
+        # accept-invitation) called in.
+        if template is None or not template.steps:
+            raise AppException(_TEMPLATE_REQUIRED)
+
         onboarding = ClientOnboarding(
             organization_id=self.org_id,
             client_user_id=payload.client_user_id,
             project_id=payload.project_id,
             project_manager_id=payload.project_manager_id,
-            template_id=payload.template_id,
+            # Use the resolved template's own id (not payload.template_id)
+            # so the FK is correct even when no template was explicitly
+            # chosen and the caller resolved the org's default template.
+            template_id=template.id,
             due_date=payload.due_date,
             created_by_id=created_by_id,
             status="draft",
@@ -293,36 +354,35 @@ class ClientOnboardingRepository(TenantRepository):
         # Steps (and their fields/document requirements) are copied from the
         # template at creation time — later template edits never
         # retroactively change an in-flight onboarding record.
-        if template is not None:
-            client_steps = []
-            for step in template.steps:
-                client_step = ClientOnboardingStep(
-                    template_step_id=step.id,
-                    title=step.title,
-                    description=step.description,
-                    step_type=step.step_type,
-                    is_required=step.is_required,
-                    display_order=step.display_order,
-                    requires_approval=step.requires_approval,
+        client_steps = []
+        for step in template.steps:
+            client_step = ClientOnboardingStep(
+                template_step_id=step.id,
+                title=step.title,
+                description=step.description,
+                step_type=step.step_type,
+                is_required=step.is_required,
+                display_order=step.display_order,
+                requires_approval=step.requires_approval,
+            )
+            client_step.form_fields = [
+                ClientOnboardingFormField(
+                    template_field_id=f.id, label=f.label, field_key=f.field_key,
+                    field_type=f.field_type, placeholder=f.placeholder, help_text=f.help_text,
+                    is_required=f.is_required, display_order=f.display_order, options_json=f.options_json,
                 )
-                client_step.form_fields = [
-                    ClientOnboardingFormField(
-                        template_field_id=f.id, label=f.label, field_key=f.field_key,
-                        field_type=f.field_type, placeholder=f.placeholder, help_text=f.help_text,
-                        is_required=f.is_required, display_order=f.display_order, options_json=f.options_json,
-                    )
-                    for f in step.form_fields
-                ]
-                client_step.document_requirements = [
-                    ClientOnboardingDocumentRequirement(
-                        template_requirement_id=d.id, name=d.name, description=d.description,
-                        is_required=d.is_required, display_order=d.display_order,
-                        allowed_file_types=d.allowed_file_types, max_file_size_mb=d.max_file_size_mb,
-                    )
-                    for d in step.document_requirements
-                ]
-                client_steps.append(client_step)
-            onboarding.steps = client_steps
+                for f in step.form_fields
+            ]
+            client_step.document_requirements = [
+                ClientOnboardingDocumentRequirement(
+                    template_requirement_id=d.id, name=d.name, description=d.description,
+                    is_required=d.is_required, display_order=d.display_order,
+                    allowed_file_types=d.allowed_file_types, max_file_size_mb=d.max_file_size_mb,
+                )
+                for d in step.document_requirements
+            ]
+            client_steps.append(client_step)
+        onboarding.steps = client_steps
         _recompute_progress(onboarding)
         _sync_onboarding_status(onboarding)
         self.db.add(onboarding)

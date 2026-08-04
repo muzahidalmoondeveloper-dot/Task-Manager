@@ -72,5 +72,9 @@ async def update_topic(llm, session_id: int, message: str, reply: str) -> None:
             existing.summary = data.get("summary", existing.summary)
             existing.open_items = data.get("open_items", existing.open_items) or []
             await db.commit()
+            logger.info(
+                "Topic updated: session=%s action=%s title=%r summary=%r open_items=%s",
+                session_id, data.get("action"), existing.title, existing.summary, existing.open_items,
+            )
     except Exception:
         logger.info("Topic update skipped (non-critical) for session=%s", session_id, exc_info=True)
