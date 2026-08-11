@@ -182,6 +182,13 @@ async def create_client_onboarding(
     await _validate_project_manager(org_repo, tenant, payload.project_manager_id)
     _validate_due_date(payload.due_date)
 
+    # No PM explicitly picked → use whoever's already assigned to this
+    # project (ProjectMembership) rather than asking the caller to re-pick
+    # one the project already has.
+    project_manager_id = payload.project_manager_id
+    if project_manager_id is None:
+        project_manager_id = await project_repo.get_assigned_project_manager_id(payload.project_id)
+
     template_repo = OnboardingTemplateRepository(db, tenant.organization_id)
     # No explicit template picked → fall back to the org's single default
     # template, same as the client-invitation path.
@@ -204,6 +211,9 @@ async def create_client_onboarding(
     # never surfaces it, and the checklist never renders on their side.
     # Idempotent: no-ops if they're already a member.
     await project_repo.add_member(payload.project_id, payload.client_user_id)
+
+    if project_manager_id != payload.project_manager_id:
+        payload = payload.model_copy(update={"project_manager_id": project_manager_id})
 
     return await repo.create(payload, created_by_id=tenant.user.id, template=template)
 

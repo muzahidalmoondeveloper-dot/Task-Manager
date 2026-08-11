@@ -1,6 +1,8 @@
 from datetime import datetime, date
 from typing import Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from app.core.meeting_constants import MEETING_PRIORITIES, MEETING_RECURRENCES, MEETING_VISIBILITIES
 
 
 class UserRef(BaseModel):
@@ -15,6 +17,21 @@ class TaskRef(BaseModel):
     name: str
     status: str
     priority: str
+    due_date: Optional[date] = None
+    model_config = {"from_attributes": True}
+
+
+class ProjectRef(BaseModel):
+    id: int
+    name: str
+    model_config = {"from_attributes": True}
+
+
+class IssueRef(BaseModel):
+    id: int
+    title: str
+    status: str
+    priority: int
     model_config = {"from_attributes": True}
 
 
@@ -134,40 +151,126 @@ class MeetingCreateTask(BaseModel):
     agenda_item_id: Optional[int] = None
 
 
+class MeetingLinkTask(BaseModel):
+    """Attach an *existing* task to the meeting — distinct from
+    MeetingCreateTask above, which creates a brand-new one. Backs the
+    Linked Task Integration flow (plan section 7): suggested overdue/
+    high-priority tasks get linked in, not duplicated."""
+    task_id: int
+    agenda_item_id: Optional[int] = None
+
+
 # ─── Meeting ──────────────────────────────────────────────────────────────────
 
 class MeetingCreate(BaseModel):
     title: str
     description: Optional[str] = None
+    objective: Optional[str] = None
     scheduled_at: datetime
     duration_minutes: int = 60
     meeting_type: str = "custom"
+    priority: str = "medium"
+    visibility: str = "team"
+    recurrence: str = "none"
+    location: Optional[str] = None
+    # Meetings are not team-specific — omit for an org-wide meeting (visible
+    # per `visibility` below); set to scope it to one team (shows on that
+    # team's own Meetings tab too, and narrows suggested tasks/issues to it).
+    team_id: Optional[int] = None
+    project_id: Optional[int] = None
     organizer_id: Optional[int] = None
     participant_ids: list[int] = []
+    # Agenda Builder (plan section 3, center panel) — submitted together with
+    # the rest of the meeting at creation time instead of requiring a
+    # separate round-trip per section afterward.
+    agenda_items: list[AgendaItemCreate] = []
+    # Linked Task Integration (plan section 7) — existing tasks (e.g.
+    # suggested overdue/high-priority ones) attached at creation time.
+    linked_task_ids: list[int] = []
+
+    @field_validator("priority")
+    @classmethod
+    def validate_priority(cls, v: str) -> str:
+        if v not in MEETING_PRIORITIES:
+            raise ValueError(f"priority must be one of: {', '.join(sorted(MEETING_PRIORITIES))}")
+        return v
+
+    @field_validator("visibility")
+    @classmethod
+    def validate_visibility(cls, v: str) -> str:
+        if v not in MEETING_VISIBILITIES:
+            raise ValueError(f"visibility must be one of: {', '.join(sorted(MEETING_VISIBILITIES))}")
+        return v
+
+    @field_validator("recurrence")
+    @classmethod
+    def validate_recurrence(cls, v: str) -> str:
+        if v not in MEETING_RECURRENCES:
+            raise ValueError(f"recurrence must be one of: {', '.join(sorted(MEETING_RECURRENCES))}")
+        return v
 
 
 class MeetingUpdate(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
+    objective: Optional[str] = None
     scheduled_at: Optional[datetime] = None
     duration_minutes: Optional[int] = None
     meeting_type: Optional[str] = None
+    priority: Optional[str] = None
+    visibility: Optional[str] = None
+    recurrence: Optional[str] = None
+    location: Optional[str] = None
+    team_id: Optional[int] = None
+    project_id: Optional[int] = None
     organizer_id: Optional[int] = None
     status: Optional[str] = None
     participant_ids: Optional[list[int]] = None
+
+    @field_validator("priority")
+    @classmethod
+    def validate_priority(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in MEETING_PRIORITIES:
+            raise ValueError(f"priority must be one of: {', '.join(sorted(MEETING_PRIORITIES))}")
+        return v
+
+    @field_validator("visibility")
+    @classmethod
+    def validate_visibility(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in MEETING_VISIBILITIES:
+            raise ValueError(f"visibility must be one of: {', '.join(sorted(MEETING_VISIBILITIES))}")
+        return v
+
+    @field_validator("recurrence")
+    @classmethod
+    def validate_recurrence(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in MEETING_RECURRENCES:
+            raise ValueError(f"recurrence must be one of: {', '.join(sorted(MEETING_RECURRENCES))}")
+        return v
 
 
 class MeetingOut(BaseModel):
     id: int
     title: str
     description: Optional[str] = None
+    objective: Optional[str] = None
     scheduled_at: datetime
     duration_minutes: int
     meeting_type: str
     status: str
+    priority: str
+    visibility: str
+    recurrence: str
+    location: Optional[str] = None
     organizer_id: Optional[int] = None
-    team_id: int
+    team_id: Optional[int] = None
+    # Populated by the route (not a model relationship) when listing —
+    # meetings aren't team-specific, so the team name (when there is one)
+    # is useful context in a flat, cross-team list.
+    team_name: Optional[str] = None
+    project_id: Optional[int] = None
     organizer: Optional[UserRef] = None
+    project: Optional[ProjectRef] = None
     checkin_current_participant_id: Optional[int] = None
     current_agenda_item_id: Optional[int] = None
     participants: list[MeetingParticipantOut] = []
@@ -190,3 +293,39 @@ class MeetingSummaryOut(BaseModel):
     decisions: list[DecisionOut]
     action_items: list[MeetingTaskOut]
     notes_count: int
+
+
+# ─── Meeting Templates ("Save Meeting Template") ───────────────────────────────
+
+class TemplateAgendaSection(BaseModel):
+    title: str
+    duration_minutes: Optional[int] = None
+
+
+class MeetingTemplateCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    meeting_type: str = "custom"
+    description: Optional[str] = None
+    default_duration_minutes: int = 60
+    agenda_sections: list[TemplateAgendaSection] = []
+
+
+class MeetingTemplateOut(BaseModel):
+    id: int
+    name: str
+    meeting_type: str
+    description: Optional[str] = None
+    default_duration_minutes: int
+    agenda_sections: list[TemplateAgendaSection]
+    is_builtin: bool
+    created_by: Optional[UserRef] = None
+    created_at: datetime
+    model_config = {"from_attributes": True}
+
+
+# ─── Suggested tasks/issues (plan section 7 — Linked Task Integration) ────────
+
+class SuggestedTasksOut(BaseModel):
+    overdue: list[TaskRef] = []
+    high_priority: list[TaskRef] = []
+    unresolved_issues: list[IssueRef] = []

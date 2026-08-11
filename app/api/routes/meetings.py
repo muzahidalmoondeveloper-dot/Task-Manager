@@ -1,37 +1,276 @@
 import random
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.tenant import TenantContext, get_tenant_context
+from app.models.issue import Issue
 from app.models.meeting import (
     Meeting, MeetingParticipant, MeetingAgendaItem,
-    MeetingNote, MeetingDecision, MeetingTask,
+    MeetingNote, MeetingDecision, MeetingTask, MeetingTemplate,
 )
 from app.models.task import Task
+from app.repositories.team_repository import TeamRepository
 from app.schemas.meeting import (
     MeetingCreate, MeetingUpdate, MeetingOut,
     AgendaItemCreate, AgendaItemUpdate, AgendaItemOut, AgendaReorderItem,
     NoteCreate, NoteUpdate, NoteOut,
     DecisionCreate, DecisionOut,
-    MeetingCreateTask, MeetingTaskOut,
+    MeetingCreateTask, MeetingLinkTask, MeetingTaskOut,
     MeetingSummaryOut,
     MeetingParticipantOut, ParticipantJoinUpdate, ParticipantScoreUpdate, SelectSpeakerRequest,
+    MeetingTemplateCreate, MeetingTemplateOut, SuggestedTasksOut,
 )
 
-router = APIRouter(prefix="/teams/{team_id}/meetings", tags=["meetings"])
+# Meetings are not team-specific — one flat router, `team_id` is an optional
+# field on the meeting (and an optional filter on the list), never part of
+# the URL. (Prior to the Smart Meeting System plan this was nested under
+# /teams/{team_id}/meetings; every meeting had to belong to exactly one
+# team. That nesting is gone — a meeting now optionally belongs to a team.)
+router = APIRouter(prefix="/meetings", tags=["meetings"])
+
+# Saved agenda templates (plan: "Save Meeting Template", meeting-type
+# defaults) — org-wide, not team-scoped.
+template_router = APIRouter(prefix="/meeting-templates", tags=["meetings"])
+
+# The 9 prebuilt meeting types (plan section 5) and their default agendas —
+# static lookups, not AI-generated (AI Agenda Suggestions is explicitly
+# Phase 2 in the plan). "custom" uses the plan's general Recommended Default
+# Agenda (section 14); the rest follow the same shape as the Weekly Team
+# Sync example (section 6).
+BUILTIN_MEETING_TEMPLATES: dict[str, dict] = {
+    "weekly_sync": {
+        "name": "Weekly Team Sync", "default_duration_minutes": 60,
+        "agenda_sections": [
+            {"title": "Wins / Check-in", "duration_minutes": 5},
+            {"title": "KPI Review", "duration_minutes": 10},
+            {"title": "Pending Tasks", "duration_minutes": 15},
+            {"title": "Blockers", "duration_minutes": 15},
+            {"title": "Priority Decisions", "duration_minutes": 10},
+            {"title": "Next Actions", "duration_minutes": 5},
+        ],
+    },
+    "project_review": {
+        "name": "Project Review", "default_duration_minutes": 60,
+        "agenda_sections": [
+            {"title": "Project Status", "duration_minutes": 10},
+            {"title": "Milestones Review", "duration_minutes": 10},
+            {"title": "Risks & Blockers", "duration_minutes": 15},
+            {"title": "Budget & Timeline", "duration_minutes": 10},
+            {"title": "Decisions", "duration_minutes": 10},
+            {"title": "Next Steps", "duration_minutes": 5},
+        ],
+    },
+    "sprint_planning": {
+        "name": "Sprint Planning", "default_duration_minutes": 60,
+        "agenda_sections": [
+            {"title": "Sprint Review", "duration_minutes": 10},
+            {"title": "Backlog Grooming", "duration_minutes": 15},
+            {"title": "Capacity Planning", "duration_minutes": 10},
+            {"title": "Task Assignment", "duration_minutes": 15},
+            {"title": "Sprint Goals", "duration_minutes": 10},
+        ],
+    },
+    "daily_standup": {
+        "name": "Daily Standup", "default_duration_minutes": 15,
+        "agenda_sections": [
+            {"title": "Yesterday's Progress", "duration_minutes": 5},
+            {"title": "Today's Plan", "duration_minutes": 5},
+            {"title": "Blockers", "duration_minutes": 5},
+        ],
+    },
+    "one_on_one": {
+        "name": "1:1 Meeting", "default_duration_minutes": 30,
+        "agenda_sections": [
+            {"title": "Check-in", "duration_minutes": 5},
+            {"title": "Wins & Challenges", "duration_minutes": 10},
+            {"title": "Career / Growth", "duration_minutes": 10},
+            {"title": "Feedback", "duration_minutes": 5},
+        ],
+    },
+    "client_meeting": {
+        "name": "Client Meeting", "default_duration_minutes": 45,
+        "agenda_sections": [
+            {"title": "Welcome & Agenda", "duration_minutes": 5},
+            {"title": "Project Update", "duration_minutes": 15},
+            {"title": "Client Feedback", "duration_minutes": 15},
+            {"title": "Next Steps", "duration_minutes": 10},
+        ],
+    },
+    "retrospective": {
+        "name": "Retrospective", "default_duration_minutes": 45,
+        "agenda_sections": [
+            {"title": "What Went Well", "duration_minutes": 10},
+            {"title": "What Didn't Go Well", "duration_minutes": 10},
+            {"title": "Action Items", "duration_minutes": 15},
+            {"title": "Team Health", "duration_minutes": 10},
+        ],
+    },
+    "leadership_review": {
+        "name": "Leadership Review", "default_duration_minutes": 75,
+        "agenda_sections": [
+            {"title": "Company KPIs", "duration_minutes": 15},
+            {"title": "Department Updates", "duration_minutes": 20},
+            {"title": "Strategic Decisions", "duration_minutes": 15},
+            {"title": "Risks", "duration_minutes": 10},
+            {"title": "Action Items", "duration_minutes": 10},
+        ],
+    },
+    "custom": {
+        "name": "Custom Meeting", "default_duration_minutes": 90,
+        "agenda_sections": [
+            {"title": "Opening / Check-in", "duration_minutes": 5},
+            {"title": "Goal Review", "duration_minutes": 5},
+            {"title": "KPI / Progress Review", "duration_minutes": 10},
+            {"title": "Pending Tasks Review", "duration_minutes": 15},
+            {"title": "Blockers & Risks", "duration_minutes": 15},
+            {"title": "Priority Discussion", "duration_minutes": 20},
+            {"title": "Decisions", "duration_minutes": 10},
+            {"title": "Action Items & Owners", "duration_minutes": 5},
+            {"title": "Wrap-up", "duration_minutes": 5},
+        ],
+    },
+}
 
 
-async def _get_meeting(
-    team_id: int, meeting_id: int, tenant: TenantContext, db: AsyncSession
-) -> Meeting:
+# ─── Meeting Templates ──────────────────────────────────────────────────────
+
+async def _seed_builtin_templates(db: AsyncSession, org_id) -> None:
+    """Bootstrap the 9 prebuilt meeting-type templates the first time an
+    org's template list is fetched — same on-first-read seeding pattern
+    used by OnboardingTemplateRepository's default-template bootstrap.
+    Idempotent: only runs when the org has zero templates."""
+    existing = await db.execute(select(MeetingTemplate.id).where(MeetingTemplate.organization_id == org_id).limit(1))
+    if existing.scalar_one_or_none() is not None:
+        return
+    for meeting_type, spec in BUILTIN_MEETING_TEMPLATES.items():
+        db.add(MeetingTemplate(
+            organization_id=org_id,
+            name=spec["name"],
+            meeting_type=meeting_type,
+            default_duration_minutes=spec["default_duration_minutes"],
+            agenda_sections=spec["agenda_sections"],
+            is_builtin=True,
+        ))
+    await db.commit()
+
+
+@template_router.get("", response_model=list[MeetingTemplateOut])
+async def list_meeting_templates(
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    await _seed_builtin_templates(db, tenant.organization_id)
+    result = await db.execute(
+        select(MeetingTemplate)
+        .where(MeetingTemplate.organization_id == tenant.organization_id)
+        .order_by(MeetingTemplate.is_builtin.desc(), MeetingTemplate.created_at.asc())
+    )
+    return result.scalars().all()
+
+
+@template_router.post("", response_model=MeetingTemplateOut, status_code=status.HTTP_201_CREATED)
+async def create_meeting_template(
+    payload: MeetingTemplateCreate,
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    template = MeetingTemplate(
+        organization_id=tenant.organization_id,
+        name=payload.name,
+        meeting_type=payload.meeting_type,
+        description=payload.description,
+        default_duration_minutes=payload.default_duration_minutes,
+        agenda_sections=[s.model_dump() for s in payload.agenda_sections],
+        is_builtin=False,
+        created_by_id=tenant.user.id,
+    )
+    db.add(template)
+    await db.commit()
+    await db.refresh(template)
+    return template
+
+
+@template_router.delete("/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_meeting_template(
+    template_id: int,
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    result = await db.execute(
+        select(MeetingTemplate).where(
+            MeetingTemplate.id == template_id,
+            MeetingTemplate.organization_id == tenant.organization_id,
+        )
+    )
+    template = result.scalar_one_or_none()
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+    if template.is_builtin:
+        raise HTTPException(status_code=400, detail="Built-in meeting-type templates can't be deleted.")
+    # Creator, or a manager-level role, may remove a saved template.
+    if template.created_by_id != tenant.user.id and not tenant.is_manager_or_above:
+        raise HTTPException(status_code=403, detail="Only the creator or a manager can delete this template.")
+    await db.delete(template)
+    await db.commit()
+
+
+# ─── Suggested tasks/issues (plan section 7 — Linked Task Integration) ────────
+
+@router.get("/suggested-tasks", response_model=SuggestedTasksOut)
+async def suggested_tasks(
+    team_id: int | None = Query(None),
+    project_id: int | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Overdue, high-priority, and unresolved-issue items — narrowed to a
+    team and/or project when given, otherwise across the whole org (a
+    meeting isn't required to belong to a team). Surfaced in the Create
+    Meeting agenda builder so relevant work can be dropped straight into
+    the agenda ("These 5 tasks are overdue. Add them to the agenda?")."""
+    task_q = select(Task).where(
+        Task.organization_id == tenant.organization_id,
+        Task.status != "done",
+    )
+    if team_id is not None:
+        task_q = task_q.where(Task.team_id == team_id)
+    if project_id is not None:
+        task_q = task_q.where(Task.project_id == project_id)
+
+    today = date.today()
+    overdue_q = task_q.where(Task.due_date.is_not(None), Task.due_date < today).order_by(Task.due_date.asc()).limit(10)
+    high_priority_q = task_q.where(Task.priority.in_(["high", "urgent"])).order_by(Task.due_date.asc().nulls_last()).limit(10)
+
+    issue_q = select(Issue).where(
+        Issue.organization_id == tenant.organization_id,
+        Issue.status.in_(["open", "in_progress"]),
+    )
+    if team_id is not None:
+        issue_q = issue_q.where(Issue.team_id == team_id)
+    if project_id is not None:
+        issue_q = issue_q.where(Issue.project_id == project_id)
+    issue_q = issue_q.order_by(Issue.priority.desc()).limit(10)
+
+    overdue = (await db.execute(overdue_q)).scalars().all()
+    high_priority = (await db.execute(high_priority_q)).scalars().all()
+    issues = (await db.execute(issue_q)).scalars().all()
+
+    return SuggestedTasksOut(
+        overdue=overdue,
+        # Avoid double-listing a task that's both overdue and high-priority.
+        high_priority=[t for t in high_priority if t.id not in {o.id for o in overdue}],
+        unresolved_issues=issues,
+    )
+
+
+async def _get_meeting(meeting_id: int, tenant: TenantContext, db: AsyncSession) -> Meeting:
     result = await db.execute(
         select(Meeting).where(
             Meeting.id == meeting_id,
-            Meeting.team_id == team_id,
             Meeting.organization_id == tenant.organization_id,
         )
     )
@@ -41,19 +280,44 @@ async def _get_meeting(
     return meeting
 
 
+async def _team_names(db: AsyncSession, team_ids: set) -> dict:
+    if not team_ids:
+        return {}
+    from app.models.team import Team
+    result = await db.execute(select(Team.id, Team.name).where(Team.id.in_(team_ids)))
+    return {row[0]: row[1] for row in result.all()}
+
+
 # ─── CRUD ─────────────────────────────────────────────────────────────────────
 
 @router.get("", response_model=list[MeetingOut])
 async def list_meetings(
-    team_id: int,
     filter: str = Query(None),
+    team_id: int | None = Query(None, description="Narrow to one team's meetings (used by that team's own Meetings tab)."),
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    q = select(Meeting).where(
-        Meeting.team_id == team_id,
-        Meeting.organization_id == tenant.organization_id,
-    )
+    """Meetings this caller can see. With `team_id`, scoped to that one team
+    (any org member — matches the prior per-team-tab behavior). Without it,
+    org-wide: Owner/Admin/Team Manager see every meeting; everyone else
+    sees org-wide-visible meetings, meetings for teams they belong to, and
+    any meeting they organize or are invited to."""
+    q = select(Meeting).where(Meeting.organization_id == tenant.organization_id)
+
+    if team_id is not None:
+        q = q.where(Meeting.team_id == team_id)
+    elif not tenant.is_manager_or_above:
+        team_repo = TeamRepository(db, tenant.organization_id)
+        my_teams = await team_repo.list_for_member(tenant.user.id)
+        my_team_ids = [t.id for t in my_teams]
+        participant_meeting_ids = select(MeetingParticipant.meeting_id).where(MeetingParticipant.user_id == tenant.user.id)
+        q = q.where(or_(
+            Meeting.visibility == "organization",
+            Meeting.organizer_id == tenant.user.id,
+            Meeting.id.in_(participant_meeting_ids),
+            Meeting.team_id.in_(my_team_ids) if my_team_ids else False,
+        ))
+
     if filter == "ongoing":
         q = q.where(Meeting.status == "ongoing")
     elif filter == "completed":
@@ -62,24 +326,40 @@ async def list_meetings(
         q = q.where(Meeting.status == "scheduled")
     q = q.order_by(Meeting.scheduled_at.desc())
     result = await db.execute(q)
-    return result.scalars().all()
+    meetings = result.scalars().all()
+
+    team_names = await _team_names(db, {m.team_id for m in meetings if m.team_id is not None})
+    return [
+        MeetingOut.model_validate(m).model_copy(update={"team_name": team_names.get(m.team_id)})
+        for m in meetings
+    ]
 
 
 @router.post("", response_model=MeetingOut, status_code=status.HTTP_201_CREATED)
 async def create_meeting(
-    team_id: int,
     payload: MeetingCreate,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    if payload.team_id is not None:
+        team_repo = TeamRepository(db, tenant.organization_id)
+        if await team_repo.get_by_id(payload.team_id) is None:
+            raise HTTPException(status_code=404, detail="Team not found")
+
     meeting = Meeting(
-        team_id=team_id,
+        team_id=payload.team_id,
         organization_id=tenant.organization_id,
         title=payload.title,
         description=payload.description,
+        objective=payload.objective,
         scheduled_at=payload.scheduled_at,
         duration_minutes=payload.duration_minutes,
         meeting_type=payload.meeting_type,
+        priority=payload.priority,
+        visibility=payload.visibility,
+        recurrence=payload.recurrence,
+        location=payload.location,
+        project_id=payload.project_id,
         organizer_id=payload.organizer_id or tenant.user.id,
     )
     db.add(meeting)
@@ -91,6 +371,29 @@ async def create_meeting(
             db.add(MeetingParticipant(meeting_id=meeting.id, user_id=user_id))
             seen.add(user_id)
 
+    # Agenda Builder — sections assembled in the create form are submitted
+    # together with the meeting itself rather than requiring N follow-up
+    # calls to POST /agenda.
+    for i, item in enumerate(payload.agenda_items):
+        db.add(MeetingAgendaItem(
+            meeting_id=meeting.id,
+            title=item.title,
+            duration_minutes=item.duration_minutes,
+            sort_order=item.sort_order or i,
+            presenter_id=item.presenter_id,
+        ))
+
+    # Linked Task Integration — existing tasks the user chose to pull in
+    # (e.g. from the suggested overdue/high-priority list) get a MeetingTask
+    # row each; no duplicate Task rows are created. Re-scoped to this org so
+    # a crafted task_id from elsewhere can't be linked in.
+    if payload.linked_task_ids:
+        valid_ids = (await db.execute(
+            select(Task.id).where(Task.id.in_(payload.linked_task_ids), Task.organization_id == tenant.organization_id)
+        )).scalars().all()
+        for task_id in set(valid_ids):
+            db.add(MeetingTask(meeting_id=meeting.id, task_id=task_id))
+
     await db.commit()
     await db.refresh(meeting)
     return meeting
@@ -98,23 +401,21 @@ async def create_meeting(
 
 @router.get("/{meeting_id}", response_model=MeetingOut)
 async def get_meeting(
-    team_id: int,
     meeting_id: int,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    return await _get_meeting(team_id, meeting_id, tenant, db)
+    return await _get_meeting(meeting_id, tenant, db)
 
 
 @router.patch("/{meeting_id}", response_model=MeetingOut)
 async def update_meeting(
-    team_id: int,
     meeting_id: int,
     payload: MeetingUpdate,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    meeting = await _get_meeting(meeting_id, tenant, db)
 
     for field, value in payload.model_dump(exclude_none=True, exclude={"participant_ids"}).items():
         setattr(meeting, field, value)
@@ -136,7 +437,6 @@ async def update_meeting(
 
 @router.patch("/{meeting_id}/participants/{user_id}", response_model=MeetingParticipantOut)
 async def set_participant_joined(
-    team_id: int,
     meeting_id: int,
     user_id: int,
     payload: ParticipantJoinUpdate,
@@ -146,7 +446,7 @@ async def set_participant_joined(
     """Toggle a participant's attendance for the live meeting. Like the rest
     of this router, host-only enforcement is left to the frontend (`canManage`)
     rather than a server-side role check, matching start/pause/end/agenda/etc."""
-    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    meeting = await _get_meeting(meeting_id, tenant, db)
     result = await db.execute(
         select(MeetingParticipant).where(
             MeetingParticipant.meeting_id == meeting.id,
@@ -165,7 +465,6 @@ async def set_participant_joined(
 
 @router.patch("/{meeting_id}/participants/{user_id}/score", response_model=MeetingParticipantOut)
 async def set_participant_score(
-    team_id: int,
     meeting_id: int,
     user_id: int,
     payload: ParticipantScoreUpdate,
@@ -175,7 +474,7 @@ async def set_participant_score(
     """Wrap-up rating: an attendee submits their own score for the meeting.
     Self-only is enforced by the frontend (only your own row's Score button
     is enabled), matching the router's usual convention."""
-    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    meeting = await _get_meeting(meeting_id, tenant, db)
     result = await db.execute(
         select(MeetingParticipant).where(
             MeetingParticipant.meeting_id == meeting.id,
@@ -216,7 +515,6 @@ async def _checkin_advance(meeting: Meeting, db: AsyncSession, *, skipped: bool)
 
 @router.post("/{meeting_id}/checkin/next", response_model=MeetingOut)
 async def checkin_next_speaker(
-    team_id: int,
     meeting_id: int,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
@@ -225,33 +523,31 @@ async def checkin_next_speaker(
     the next speaker from the eligible pool who haven't gone yet. Called once
     with no current pick to start the roulette, and again each time the host
     clicks the highlighted avatar to advance."""
-    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    meeting = await _get_meeting(meeting_id, tenant, db)
     await _checkin_advance(meeting, db, skipped=False)
     # Re-select rather than db.refresh(): refresh() doesn't reliably cascade
     # eager-reload nested lazy="selectin" attributes (e.g. participants[*].user)
     # after expire_on_commit, which can crash response serialization.
-    return await _get_meeting(team_id, meeting_id, tenant, db)
+    return await _get_meeting(meeting_id, tenant, db)
 
 
 @router.post("/{meeting_id}/checkin/skip", response_model=MeetingOut)
 async def checkin_skip_speaker(
-    team_id: int,
     meeting_id: int,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
     """Like checkin/next, but flags the passed-over speaker as `skipped`
     rather than having actually spoken, for a distinct "Skipped" label."""
-    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    meeting = await _get_meeting(meeting_id, tenant, db)
     if not meeting.checkin_current_participant_id:
         raise HTTPException(status_code=400, detail="No current speaker to skip.")
     await _checkin_advance(meeting, db, skipped=True)
-    return await _get_meeting(team_id, meeting_id, tenant, db)
+    return await _get_meeting(meeting_id, tenant, db)
 
 
 @router.post("/{meeting_id}/checkin/select", response_model=MeetingOut)
 async def checkin_select_speaker(
-    team_id: int,
     meeting_id: int,
     payload: SelectSpeakerRequest,
     db: AsyncSession = Depends(get_db),
@@ -260,7 +556,7 @@ async def checkin_select_speaker(
     """Host manually picks a specific eligible participant as the next
     speaker, bypassing the random roulette. Marks the previous current
     speaker as spoken first, same as checkin/next."""
-    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    meeting = await _get_meeting(meeting_id, tenant, db)
 
     if meeting.checkin_current_participant_id:
         current = next((p for p in meeting.participants if p.id == meeting.checkin_current_participant_id), None)
@@ -276,34 +572,32 @@ async def checkin_select_speaker(
 
     meeting.checkin_current_participant_id = target.id
     await db.commit()
-    return await _get_meeting(team_id, meeting_id, tenant, db)
+    return await _get_meeting(meeting_id, tenant, db)
 
 
 @router.post("/{meeting_id}/checkin/reset", response_model=MeetingOut)
 async def checkin_reset(
-    team_id: int,
     meeting_id: int,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
     """Clears the speaking-order state so the check-in can be run again."""
-    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    meeting = await _get_meeting(meeting_id, tenant, db)
     for p in meeting.participants:
         p.spoken_at = None
         p.skipped = False
     meeting.checkin_current_participant_id = None
     await db.commit()
-    return await _get_meeting(team_id, meeting_id, tenant, db)
+    return await _get_meeting(meeting_id, tenant, db)
 
 
 @router.delete("/{meeting_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_meeting(
-    team_id: int,
     meeting_id: int,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    meeting = await _get_meeting(meeting_id, tenant, db)
     await db.delete(meeting)
     await db.commit()
 
@@ -312,16 +606,23 @@ async def delete_meeting(
 
 @router.post("/{meeting_id}/start", response_model=MeetingOut)
 async def start_meeting(
-    team_id: int,
     meeting_id: int,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    meeting = await _get_meeting(meeting_id, tenant, db)
     if meeting.status not in ("scheduled", "paused"):
         raise HTTPException(status_code=400, detail=f"Cannot start a meeting with status '{meeting.status}'")
     if meeting.status == "scheduled" and not any(p.joined_at for p in meeting.participants):
-        raise HTTPException(status_code=400, detail="At least one participant must join before starting the meeting.")
+        # A host should always be able to start solo rather than needing a
+        # separate click to check themself in first — auto-join whoever is
+        # starting it (adding them as a participant if they weren't one).
+        starter = next((p for p in meeting.participants if p.user_id == tenant.user.id), None)
+        if starter is None:
+            starter = MeetingParticipant(meeting_id=meeting.id, user_id=tenant.user.id)
+            db.add(starter)
+            await db.flush()
+        starter.joined_at = datetime.now(timezone.utc)
     meeting.status = "ongoing"
     if not meeting.started_at:
         meeting.started_at = datetime.now(timezone.utc)
@@ -331,17 +632,16 @@ async def start_meeting(
                 meeting.current_agenda_item_id = first_pending.id
     meeting.paused_at = None
     await db.commit()
-    return await _get_meeting(team_id, meeting_id, tenant, db)
+    return await _get_meeting(meeting_id, tenant, db)
 
 
 @router.post("/{meeting_id}/pause", response_model=MeetingOut)
 async def pause_meeting(
-    team_id: int,
     meeting_id: int,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    meeting = await _get_meeting(meeting_id, tenant, db)
     if meeting.status != "ongoing":
         raise HTTPException(status_code=400, detail="Only ongoing meetings can be paused")
     meeting.status = "paused"
@@ -353,12 +653,11 @@ async def pause_meeting(
 
 @router.post("/{meeting_id}/resume", response_model=MeetingOut)
 async def resume_meeting(
-    team_id: int,
     meeting_id: int,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    meeting = await _get_meeting(meeting_id, tenant, db)
     if meeting.status != "paused":
         raise HTTPException(status_code=400, detail="Only paused meetings can be resumed")
     meeting.status = "ongoing"
@@ -370,12 +669,11 @@ async def resume_meeting(
 
 @router.post("/{meeting_id}/end", response_model=MeetingOut)
 async def end_meeting(
-    team_id: int,
     meeting_id: int,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    meeting = await _get_meeting(meeting_id, tenant, db)
     if meeting.status == "completed":
         raise HTTPException(status_code=400, detail="Meeting is already completed")
     meeting.status = "completed"
@@ -389,13 +687,12 @@ async def end_meeting(
 
 @router.post("/{meeting_id}/agenda", response_model=AgendaItemOut, status_code=status.HTTP_201_CREATED)
 async def add_agenda_item(
-    team_id: int,
     meeting_id: int,
     payload: AgendaItemCreate,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    await _get_meeting(team_id, meeting_id, tenant, db)
+    await _get_meeting(meeting_id, tenant, db)
     item = MeetingAgendaItem(meeting_id=meeting_id, **payload.model_dump())
     db.add(item)
     await db.commit()
@@ -405,14 +702,13 @@ async def add_agenda_item(
 
 @router.patch("/{meeting_id}/agenda/{item_id}", response_model=AgendaItemOut)
 async def update_agenda_item(
-    team_id: int,
     meeting_id: int,
     item_id: int,
     payload: AgendaItemUpdate,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    await _get_meeting(team_id, meeting_id, tenant, db)
+    await _get_meeting(meeting_id, tenant, db)
     result = await db.execute(
         select(MeetingAgendaItem).where(
             MeetingAgendaItem.id == item_id,
@@ -431,13 +727,12 @@ async def update_agenda_item(
 
 @router.delete("/{meeting_id}/agenda/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_agenda_item(
-    team_id: int,
     meeting_id: int,
     item_id: int,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    await _get_meeting(team_id, meeting_id, tenant, db)
+    await _get_meeting(meeting_id, tenant, db)
     result = await db.execute(
         select(MeetingAgendaItem).where(
             MeetingAgendaItem.id == item_id,
@@ -453,13 +748,12 @@ async def delete_agenda_item(
 
 @router.post("/{meeting_id}/agenda/reorder", response_model=list[AgendaItemOut])
 async def reorder_agenda(
-    team_id: int,
     meeting_id: int,
     items: list[AgendaReorderItem],
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    meeting = await _get_meeting(meeting_id, tenant, db)
     order_map = {item.id: item.sort_order for item in items}
     for agenda_item in meeting.agenda_items:
         if agenda_item.id in order_map:
@@ -471,14 +765,13 @@ async def reorder_agenda(
 
 @router.post("/{meeting_id}/agenda/next", response_model=MeetingOut)
 async def advance_agenda(
-    team_id: int,
     meeting_id: int,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
     """Marks the current agenda item done (if any) and advances the pointer
     to the next not-done item by sort_order, or null if none remain."""
-    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    meeting = await _get_meeting(meeting_id, tenant, db)
 
     if meeting.current_agenda_item_id:
         current = next((a for a in meeting.agenda_items if a.id == meeting.current_agenda_item_id), None)
@@ -492,20 +785,19 @@ async def advance_agenda(
     meeting.current_agenda_item_id = next_item.id if next_item else None
 
     await db.commit()
-    return await _get_meeting(team_id, meeting_id, tenant, db)
+    return await _get_meeting(meeting_id, tenant, db)
 
 
 # ─── Notes ────────────────────────────────────────────────────────────────────
 
 @router.post("/{meeting_id}/notes", response_model=NoteOut, status_code=status.HTTP_201_CREATED)
 async def add_note(
-    team_id: int,
     meeting_id: int,
     payload: NoteCreate,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    await _get_meeting(team_id, meeting_id, tenant, db)
+    await _get_meeting(meeting_id, tenant, db)
     note = MeetingNote(
         meeting_id=meeting_id,
         content=payload.content,
@@ -519,14 +811,13 @@ async def add_note(
 
 @router.patch("/{meeting_id}/notes/{note_id}", response_model=NoteOut)
 async def update_note(
-    team_id: int,
     meeting_id: int,
     note_id: int,
     payload: NoteUpdate,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    await _get_meeting(team_id, meeting_id, tenant, db)
+    await _get_meeting(meeting_id, tenant, db)
     result = await db.execute(
         select(MeetingNote).where(
             MeetingNote.id == note_id,
@@ -544,13 +835,12 @@ async def update_note(
 
 @router.delete("/{meeting_id}/notes/{note_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_note(
-    team_id: int,
     meeting_id: int,
     note_id: int,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    await _get_meeting(team_id, meeting_id, tenant, db)
+    await _get_meeting(meeting_id, tenant, db)
     result = await db.execute(
         select(MeetingNote).where(
             MeetingNote.id == note_id,
@@ -568,13 +858,12 @@ async def delete_note(
 
 @router.post("/{meeting_id}/decisions", response_model=DecisionOut, status_code=status.HTTP_201_CREATED)
 async def add_decision(
-    team_id: int,
     meeting_id: int,
     payload: DecisionCreate,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    await _get_meeting(team_id, meeting_id, tenant, db)
+    await _get_meeting(meeting_id, tenant, db)
     decision = MeetingDecision(
         meeting_id=meeting_id,
         content=payload.content,
@@ -588,13 +877,12 @@ async def add_decision(
 
 @router.delete("/{meeting_id}/decisions/{decision_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_decision(
-    team_id: int,
     meeting_id: int,
     decision_id: int,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    await _get_meeting(team_id, meeting_id, tenant, db)
+    await _get_meeting(meeting_id, tenant, db)
     result = await db.execute(
         select(MeetingDecision).where(
             MeetingDecision.id == decision_id,
@@ -612,14 +900,13 @@ async def delete_decision(
 
 @router.post("/{meeting_id}/tasks", response_model=MeetingTaskOut, status_code=status.HTTP_201_CREATED)
 async def create_meeting_task(
-    team_id: int,
     meeting_id: int,
     payload: MeetingCreateTask,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
     from datetime import date as dt_date
-    await _get_meeting(team_id, meeting_id, tenant, db)
+    meeting = await _get_meeting(meeting_id, tenant, db)
 
     due_date = None
     if payload.due_date:
@@ -633,7 +920,7 @@ async def create_meeting_task(
         assignee_id=payload.assignee_id,
         due_date=due_date,
         priority=payload.priority,
-        team_id=team_id,
+        team_id=meeting.team_id,
         organization_id=tenant.organization_id,
         created_by_id=tenant.user.id,
         status="todo",
@@ -652,16 +939,46 @@ async def create_meeting_task(
     return meeting_task
 
 
+@router.post("/{meeting_id}/tasks/link", response_model=MeetingTaskOut, status_code=status.HTTP_201_CREATED)
+async def link_meeting_task(
+    meeting_id: int,
+    payload: MeetingLinkTask,
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Attach an *existing* task (e.g. a suggested overdue/high-priority
+    one) to the meeting — the create-new-task counterpart above stays
+    unchanged. 404s if the task isn't in this org, so a meeting can't be
+    made to point at another tenant's data."""
+    await _get_meeting(meeting_id, tenant, db)
+
+    task_result = await db.execute(
+        select(Task.id).where(Task.id == payload.task_id, Task.organization_id == tenant.organization_id)
+    )
+    if task_result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    existing = await db.execute(
+        select(MeetingTask).where(MeetingTask.meeting_id == meeting_id, MeetingTask.task_id == payload.task_id)
+    )
+    meeting_task = existing.scalar_one_or_none()
+    if meeting_task is None:
+        meeting_task = MeetingTask(meeting_id=meeting_id, task_id=payload.task_id, agenda_item_id=payload.agenda_item_id)
+        db.add(meeting_task)
+        await db.commit()
+        await db.refresh(meeting_task)
+    return meeting_task
+
+
 # ─── Summary ──────────────────────────────────────────────────────────────────
 
 @router.get("/{meeting_id}/summary", response_model=MeetingSummaryOut)
 async def get_meeting_summary(
-    team_id: int,
     meeting_id: int,
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    meeting = await _get_meeting(team_id, meeting_id, tenant, db)
+    meeting = await _get_meeting(meeting_id, tenant, db)
     return MeetingSummaryOut(
         total_duration_minutes=meeting.duration_minutes,
         completed_agenda=[a for a in meeting.agenda_items if a.status == "done"],

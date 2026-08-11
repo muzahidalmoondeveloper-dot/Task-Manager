@@ -52,6 +52,7 @@ import app.models.onboarding  # noqa: F401  — register OnboardingTemplate, Onb
 import app.models.copilot  # noqa: F401  — register AIChangeSet, AIOperation, AITopic, AIToolExecution
 from contextlib import asynccontextmanager
 import logging
+from app.core.log_context import ChatContextFilter
 from app.services.automation_scheduler import start_scheduler, stop_scheduler
 from seed_admin import seed_admin
 
@@ -234,6 +235,32 @@ async def lifespan(app: FastAPI):
         await conn.execute(text(
             "ALTER TABLE meeting_participants ADD COLUMN IF NOT EXISTS scored_at TIMESTAMPTZ"
         ))
+        # Smart Meeting System (plan: 3-zone create-meeting form) — new
+        # Meeting fields; meeting_templates is a brand-new table so it needs
+        # no ALTER, just Base.metadata.create_all() picking up the model.
+        await conn.execute(text(
+            "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS objective TEXT"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS priority VARCHAR(20) NOT NULL DEFAULT 'medium'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS visibility VARCHAR(20) NOT NULL DEFAULT 'team'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS recurrence VARCHAR(20) NOT NULL DEFAULT 'none'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS location VARCHAR(1000)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS project_id INTEGER "
+            "REFERENCES projects(id) ON DELETE SET NULL"
+        ))
+        # Meetings are no longer team-specific — team_id is now optional.
+        await conn.execute(text(
+            "ALTER TABLE meetings ALTER COLUMN team_id DROP NOT NULL"
+        ))
         await conn.execute(text(
             "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS billing_interval VARCHAR(20) NOT NULL DEFAULT 'monthly'"
         ))
@@ -315,10 +342,18 @@ async def lifespan(app: FastAPI):
     await engine.dispose()
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
+_log_handler = logging.StreamHandler()
+_log_handler.addFilter(ChatContextFilter())
+_log_handler.setFormatter(logging.Formatter(
+    # trace/session/user/org are chat-turn correlation ids — "-" outside a
+    # chat request (see app/core/log_context.py). Concurrent chat turns
+    # interleave in the terminal; grepping one trace_id isolates one turn's
+    # full flow (intent detection -> routing -> tool calls -> reply) instead
+    # of guessing which INFO lines belong together.
+    "%(asctime)s | %(levelname)-8s | %(name)s | trace=%(trace_id)s session=%(chat_session_id)s "
+    "user=%(chat_user_id)s org=%(chat_org_id)s | %(message)s"
+))
+logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -353,6 +388,7 @@ app.include_router(rocks.router, prefix=settings.API_PREFIX)
 app.include_router(kpi.router, prefix=settings.API_PREFIX)
 app.include_router(issues.router, prefix=settings.API_PREFIX)
 app.include_router(meetings.router, prefix=settings.API_PREFIX)
+app.include_router(meetings.template_router, prefix=settings.API_PREFIX)
 app.include_router(organizations.router, prefix=settings.API_PREFIX)
 app.include_router(risks.router, prefix=settings.API_PREFIX)
 app.include_router(reports.router, prefix=settings.API_PREFIX)

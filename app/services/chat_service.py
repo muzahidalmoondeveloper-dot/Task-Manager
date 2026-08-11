@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
 
 from app.core.database import AsyncSessionLocal
+from app.core.log_context import set_chat_context
 from app.models.issue import Issue
 from app.models.kpi import KPI, KPIEntry
 from app.models.meeting import Meeting
@@ -281,7 +282,16 @@ def _parse_json_safe(text: str) -> dict:
             cleaned = cleaned[len(prefix):].strip()
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3].strip()
-    return json.loads(cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Used by ~15 call sites across every handler — logging the raw
+        # malformed text once, here, means whichever handler's outer
+        # try/except catches this always shows *what the LLM actually
+        # returned*, not just "JSONDecodeError: Expecting value: line 1
+        # column 1" with no way to tell what broke.
+        logger.warning("LLM returned invalid JSON, raw output=%r", text[:1000])
+        raise
 
 
 class ChatService:
@@ -322,13 +332,18 @@ class ChatService:
         # safe because a fresh ChatService instance is created per HTTP
         # request (see app/api/routes/chat.py), so this never leaks across turns.
         self._trace_id = str(uuid.uuid4())
-        logger.info(
-            "Chat turn started: trace_id=%s user=%s session=%s query=%r",
-            self._trace_id, user.id, session_id, message,
-        )
+        # Every log line for the rest of this turn — in this file and in
+        # app.services.copilot.* — is auto-tagged with these ids by
+        # ChatContextFilter (see app/core/log_context.py), including the
+        # fire-and-forget asyncio.create_task(...) work below that keeps
+        # running after the response is sent. No other call site needs to
+        # change for this to take effect.
+        set_chat_context(trace_id=self._trace_id, user_id=user.id, org_id=self._org_id)
+        logger.info("Chat turn started: query=%r (session=%s)", message, session_id)
 
         # 1. Get or create session
         session = await self._get_or_create_session(user, session_id, message)
+        set_chat_context(session_id=session.id)
 
         # 2. Build stored message (with file badge when applicable)
         stored_user_message = _build_stored_message(message, file_context)
@@ -408,7 +423,7 @@ class ChatService:
             else "\n\n".join(f"**{i}.** {r}" for i, r in enumerate(step_replies, 1))
         )
 
-        logger.info("Chat turn reply: trace_id=%s session=%s reply=%r", self._trace_id, session.id, reply)
+        logger.info("Chat turn reply: %r", reply)
 
         # 8. Persist assistant reply
         assistant_msg = await self._chat_repo.add_message(session.id, "assistant", reply)
@@ -469,8 +484,13 @@ class ChatService:
             )
         try:
             return await self._route(intent, user, effective_message, history_text, org_role, session_id)
-        except Exception as exc:
-            logger.exception("Error handling intent %s: %s", intent, exc)
+        except Exception:
+            # logger.exception() already includes the full traceback — that
+            # plus the trace_id/session context stamped on every line (see
+            # log_context.py) and the intent/query below is normally enough
+            # to jump straight to the failing handler and the input that
+            # broke it, without needing to reproduce the bug interactively.
+            logger.exception("Error handling intent=%s for query=%r", intent, step_message)
             return "I ran into an issue processing that. Could you try rephrasing?", []
 
     # ─── Session management ───────────────────────────────────────────────────
@@ -507,7 +527,10 @@ class ChatService:
                 if session is not None:
                     await chat_repo.update_session_title(session, title)
         except Exception:
-            pass  # non-critical
+            # Non-critical (the session just keeps its default title) but
+            # not silent — was a bare `pass` that hid real LLM/DB failures
+            # here from the terminal entirely.
+            logger.warning("Auto-title generation failed for session=%s", session_id, exc_info=True)
 
     # ─── Intent detection ─────────────────────────────────────────────────────
 
@@ -526,8 +549,11 @@ class ChatService:
             except (TypeError, ValueError):
                 confidence = 1.0
             return data.get("intent", INTENT_GENERAL), confidence
-        except Exception as exc:
-            logger.warning("Intent detection failed: %s", exc)
+        except Exception:
+            # exc_info=True — without a traceback here, "intent detection
+            # failed" tells you nothing about *why* (bad LLM JSON vs.
+            # provider timeout vs. a real code bug) when scanning logs.
+            logger.warning("Intent detection failed for query=%r — defaulting to general", message, exc_info=True)
             return INTENT_GENERAL, 0.0
 
     # Ambiguity Engine (spec Section 15, bounded) — below this confidence, a
@@ -594,6 +620,7 @@ class ChatService:
         raw_tasks: list[dict] = data.get("tasks", [])
 
         if not raw_tasks:
+            logger.info("create_task: LLM extracted no tasks from raw output=%r", result.text[:500])
             return "I couldn't extract any tasks from that. Could you be more specific about what needs to be done?", []
 
         created = []
@@ -629,6 +656,7 @@ class ChatService:
             )
 
         if not created:
+            logger.info("create_task: every extracted task lacked a usable name, raw_tasks=%r", raw_tasks)
             return "I understood you want to create tasks but couldn't parse the details. Could you provide more specific task names?", []
 
         names = ", ".join(f'"{t.name}"' for t in created)
@@ -727,6 +755,7 @@ class ChatService:
                 update_payload["assignee_id"] = resolution.entity.id
 
         if not update_payload:
+            logger.info("update_task: no usable fields in updates=%r (ref=%r, raw=%r)", updates_raw, ref, data)
             return "I understood you want to update a task but couldn't determine what to change. Could you be more specific?", []
 
         # ── Bulk update — always previewed and confirmed (risk R4), never
@@ -792,6 +821,7 @@ class ChatService:
             task = resolution.entity
 
         if not task:
+            logger.info("update_task: no task matched reference=%r among %d candidate(s)", ref, len(all_tasks) if not ref.isdigit() else 0)
             return (
                 f'I couldn\'t find a task matching "{ref}". '
                 "Please check the Tasks page or provide the task ID.",
@@ -891,6 +921,7 @@ class ChatService:
             task = resolution.entity
 
         if not task:
+            logger.info("delete_task: no task matched reference=%r", ref)
             return (
                 f'I couldn\'t find a task matching "{ref}". '
                 "Please check the Tasks page or provide the exact task ID.",
@@ -944,6 +975,7 @@ class ChatService:
         data = _parse_json_safe(result.text)
         ref = (data.get("request_reference") or "").strip()
         if not ref:
+            logger.info("convert_request: LLM extracted no request_reference, raw=%r", result.text[:500])
             return "Which request would you like to convert? Please give me its ID or part of its title.", []
 
         pending = await self._query_client_requests(user=user, org_role=org_role)
@@ -961,6 +993,7 @@ class ChatService:
             request = resolution.entity
 
         if request is None:
+            logger.info("convert_request: no pending request matched reference=%r among %d candidate(s)", ref, len(pending))
             return f'I couldn\'t find a pending request matching "{ref}".', []
 
         change_set = await change_sets.build_change_set(
@@ -1127,8 +1160,8 @@ class ChatService:
                 response_format="json",
             )
             params = _parse_json_safe(result.text)
-        except Exception as exc:
-            logger.warning("DB query extraction failed: %s — falling back to general", exc)
+        except Exception:
+            logger.warning("DB query extraction failed for query=%r — falling back to general", message, exc_info=True)
             return await self._handle_general(user, message, history)
 
         sub_intent: str = params.get("sub_intent") or ""
