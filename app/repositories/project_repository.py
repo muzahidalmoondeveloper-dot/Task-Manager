@@ -4,6 +4,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.org_roles import PROJECT_MANAGER
+from app.models.organization import OrganizationMembership
 from app.models.project import Project, ProjectMembership
 from app.repositories.base_tenant_repository import TenantRepository
 from app.schemas.project import ProjectCreate, ProjectUpdate
@@ -89,6 +91,28 @@ class ProjectRepository(TenantRepository):
         )
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
+
+    async def get_assigned_project_manager_id(self, project_id: int) -> int | None:
+        """The Project Manager already assigned to this project via
+        ProjectMembership (functional project_manager role, or anyone
+        additionally granted PM privileges) — same "who counts as the PM"
+        rule as the staff-only `/projects/{id}/members` endpoint. Used so
+        callers that create something *for* a project (e.g. starting a
+        client onboarding) don't need to ask the user to re-pick a PM the
+        project already has. Returns the first match if more than one."""
+        stmt = (
+            select(OrganizationMembership.user_id)
+            .join(ProjectMembership, ProjectMembership.user_id == OrganizationMembership.user_id)
+            .where(
+                ProjectMembership.project_id == project_id,
+                OrganizationMembership.organization_id == self.org_id,
+                (OrganizationMembership.role == PROJECT_MANAGER) | (OrganizationMembership.is_project_manager.is_(True)),
+            )
+            .order_by(ProjectMembership.created_at.asc())
+            .limit(1)
+        )
+        result = await self.db.execute(stmt)
+        return result.scalar_one_or_none()
 
     async def add_member(self, project_id: int, user_id: int) -> ProjectMembership:
         existing = await self.db.execute(

@@ -36,11 +36,17 @@ async def _validate_and_load(tenant: TenantContext, payload: ClientInvitationCre
 
     await require_can_invite_to_project(tenant, project_repo, payload.project_id)
 
-    if payload.project_manager_id is not None:
+    project_manager_id = payload.project_manager_id
+    if project_manager_id is not None:
         org_repo = OrganizationRepository(tenant.db)
-        pm_membership = await org_repo.get_membership(tenant.organization_id, payload.project_manager_id)
+        pm_membership = await org_repo.get_membership(tenant.organization_id, project_manager_id)
         if pm_membership is None or not pm_membership.is_active:
             raise AppException(_INVALID_PM)
+    else:
+        # No PM explicitly picked → use whoever's already assigned to this
+        # project (ProjectMembership) rather than asking the caller to
+        # re-pick one the project already has.
+        project_manager_id = await project_repo.get_assigned_project_manager_id(payload.project_id)
 
     # If the caller didn't explicitly pick a template, fall back to the org's
     # single active default template (see OnboardingTemplateRepository) —
@@ -62,7 +68,7 @@ async def _validate_and_load(tenant: TenantContext, payload: ClientInvitationCre
     if template is None or not template.steps:
         raise AppException(_TEMPLATE_REQUIRED)
 
-    return project_repo, project, template_id
+    return project_repo, project, template_id, project_manager_id
 
 
 @router.post("", response_model=ClientInvitationRead, status_code=http_status.HTTP_201_CREATED)
@@ -70,7 +76,7 @@ async def invite_client(
     payload: ClientInvitationCreate,
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    project_repo, project, template_id = await _validate_and_load(tenant, payload)
+    project_repo, project, template_id, project_manager_id = await _validate_and_load(tenant, payload)
 
     email = str(payload.email).lower().strip()
     user_repo = UserRepository(tenant.db)
@@ -99,7 +105,7 @@ async def invite_client(
         client_name=payload.client_name,
         company_name=payload.company_name,
         phone_number=payload.phone_number,
-        project_manager_id=payload.project_manager_id,
+        project_manager_id=project_manager_id,
         onboarding_template_id=template_id,
         due_date=payload.due_date,
         message=payload.message,
