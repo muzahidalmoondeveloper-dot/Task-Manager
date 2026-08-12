@@ -94,3 +94,41 @@ class UserRepository:
         )
         result = await self.db.execute(stmt)
         return list(result.scalars().unique().all())
+
+    async def list_by_org_all(self, org_id: uuid.UUID) -> list[tuple[User, OrganizationMembership]]:
+        """Org-scoped, but INCLUDING inactive members — unlike list_by_org()
+        (active-only, used for assignee resolution), this is for reporting
+        that needs an accurate active/inactive breakdown for the org
+        (e.g. "how many users do we have" including deactivated ones).
+        Returns (User, OrganizationMembership) pairs — callers that need a
+        role label should read membership.role, not the legacy/global
+        User.role column, which can diverge from a user's actual role
+        within THIS organization (e.g. a user who is "client" here but
+        defaults to "team_member" globally)."""
+        stmt = (
+            select(User, OrganizationMembership)
+            .join(OrganizationMembership, OrganizationMembership.user_id == User.id)
+            .where(OrganizationMembership.organization_id == org_id)
+            .order_by(User.full_name.asc())
+        )
+        result = await self.db.execute(stmt)
+        return list(result.all())
+
+    async def list_by_org_and_roles(self, org_id: uuid.UUID, roles: list[str]) -> list[User]:
+        """Org-scoped counterpart to list_by_roles() — matches on the
+        user's ORGANIZATION-scoped role (OrganizationMembership.role), not
+        the legacy User.role column, since org membership is what actually
+        governs a user's role within a given tenant."""
+        stmt = (
+            select(User)
+            .join(OrganizationMembership, OrganizationMembership.user_id == User.id)
+            .where(
+                OrganizationMembership.organization_id == org_id,
+                OrganizationMembership.role.in_(roles),
+                OrganizationMembership.is_active.is_(True),
+                User.is_active.is_(True),
+            )
+            .order_by(User.full_name.asc())
+        )
+        result = await self.db.execute(stmt)
+        return list(result.scalars().unique().all())

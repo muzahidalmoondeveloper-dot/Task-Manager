@@ -45,6 +45,7 @@ async def rewrite_query(llm, message: str, history: str) -> str:
             system_prompt=_REWRITE_SYSTEM,
             user_prompt=f"Conversation history:\n{history}\n\nFollow-up message: {message}",
             temperature=0.0,
+            capability="query_rewrite",
         )
         rewritten = result.text.strip().strip('"')
         return rewritten if rewritten else message

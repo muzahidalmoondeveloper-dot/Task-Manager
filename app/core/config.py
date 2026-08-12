@@ -78,6 +78,12 @@ class Settings(BaseSettings):
     OLLAMA_API_KEY: str | None = None
     OLLAMA_HOST: str = "https://ollama.com"
     OLLAMA_MODEL: str = "gpt-oss:120b"
+    # Embedding model for Knowledge/RAG semantic search (architecture item 1).
+    # Chat models (e.g. gpt-oss:120b/qwen2:7b) don't serve /api/embed unless
+    # started with --embeddings; a dedicated embedding model avoids that
+    # entirely and is what this deployment actually has pulled and verified
+    # working (`ollama pull nomic-embed-text`).
+    OLLAMA_EMBED_MODEL: str = "nomic-embed-text"
 
     # OpenAI
     OPENAI_API_KEY: str | None = None

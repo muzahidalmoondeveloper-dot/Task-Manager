@@ -329,6 +329,19 @@ async def lifespan(app: FastAPI):
         await conn.execute(text(
             "ALTER TABLE ai_tool_executions ADD COLUMN IF NOT EXISTS trace_id VARCHAR(36)"
         ))
+        await conn.execute(text(
+            "ALTER TABLE ai_tool_executions ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(64)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_ai_tool_executions_idempotency "
+            "ON ai_tool_executions (organization_id, tool_name, idempotency_key)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS timezone VARCHAR(64) NOT NULL DEFAULT 'UTC'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS last_result_set_json JSON"
+        ))
 
     await seed_admin()
 

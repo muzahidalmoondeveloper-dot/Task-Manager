@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, Uuid, func
+from sqlalchemy import JSON, DateTime, ForeignKey, String, Text, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -35,6 +35,17 @@ class ChatSession(Base):
     pending_approval_id: Mapped[int | None] = mapped_column(
         ForeignKey("ai_approval_requests.id", ondelete="SET NULL"), nullable=True,
     )
+
+    # Previous result-set memory (architecture item 8) — the ordered list of
+    # entity ids shown in this session's most recent list-type reply (e.g.
+    # "show me overdue tasks"), so a positional follow-up ("mark the second
+    # one done") can resolve deterministically against exactly what the user
+    # was just shown, instead of falling through to fuzzy name matching or
+    # an ambiguity prompt. Shape: {"entity_type": "task", "ids": [12, 7, 31]}.
+    # Only the single most recent result set is kept (not a history) —
+    # matches how positional references are actually used in conversation
+    # ("the second one" always means the list just shown, never an older one).
+    last_result_set_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

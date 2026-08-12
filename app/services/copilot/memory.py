@@ -7,7 +7,6 @@ answer about system state. A tiny LLM classifier decides whether a message
 contains anything worth remembering; most messages don't, so nothing is
 written for them."""
 
-import json
 import logging
 
 from sqlalchemy import select
@@ -15,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import AsyncSessionLocal
 from app.models.copilot import AISavedMemory
+from app.services.copilot.intent_schemas import MemoryExtraction
 
 logger = logging.getLogger("copilot.memory")
 
@@ -42,17 +42,19 @@ async def maybe_learn_preference(llm, *, org_id, user_id: int, message: str) -> 
     existing topics.update_topic / background_email.py helpers, since it may
     still be running after the HTTP response has been sent."""
     try:
-        result = await llm.generate_text(
+        # generate_structured() — security gap #3 fix, see planner.py's
+        # matching comment.
+        extraction = await llm.generate_structured(
             system_prompt=_MEMORY_EXTRACT_SYSTEM,
             user_prompt=message,
+            schema=MemoryExtraction,
             temperature=0.0,
-            response_format="json",
+            capability="memory_extraction",
         )
-        data = json.loads(result.text.strip().strip("`").removeprefix("json").strip())
-        if not data.get("has_preference"):
+        if not extraction.has_preference:
             return
-        key = (data.get("key") or "").strip()[:100]
-        value = (data.get("value") or "").strip()
+        key = extraction.key.strip()[:100]
+        value = extraction.value.strip()
         if not key or not value:
             return
 

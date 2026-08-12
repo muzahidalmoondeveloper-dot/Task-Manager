@@ -1,9 +1,14 @@
+import logging
+
 import httpx
 
 from app.services.llm.base import LLMProvider, LLMResponse
 
+logger = logging.getLogger("llm.gemini")
+
 
 class GeminiProvider(LLMProvider):
+    PROVIDER_NAME = "gemini"
     BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
     def __init__(self, api_key: str, default_model: str = "gemini-1.5-flash"):
@@ -19,6 +24,7 @@ class GeminiProvider(LLMProvider):
         model=None,
         response_format="text",
         json_schema=None,
+        capability=None,
     ) -> LLMResponse:
         generation_config: dict = {"temperature": temperature}
 
@@ -34,6 +40,14 @@ class GeminiProvider(LLMProvider):
             payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
 
         resolved_model = model or self._default_model
+
+        # Observability only — no secrets (the API key is sent only as a
+        # query param on the actual request below, never logged), no
+        # prompt/response content.
+        logger.info(
+            "LLM call | provider=%s model=%s capability=%s response_format=%s",
+            self.PROVIDER_NAME, resolved_model, capability or "unspecified", response_format,
+        )
 
         async with httpx.AsyncClient(timeout=90.0) as client:
             resp = await client.post(

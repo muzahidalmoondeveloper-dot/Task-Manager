@@ -17,7 +17,7 @@ from app.services.copilot import (
     risk,
 )
 from app.services.copilot.reference_resolver import ResolutionStatus
-from app.services.llm.base import LLMResponse
+from app.services.llm.base import LLMProvider, LLMResponse
 from app.services.llm.gateway import CircuitBreaker, LLMGateway
 
 
@@ -134,7 +134,12 @@ class TestResolveTaskReference:
 
 # ─── query_rewriter.py ────────────────────────────────────────────────────────
 
-class _FakeLLM:
+class _FakeLLM(LLMProvider):
+    # Subclasses the real LLMProvider ABC (see test_chat_service_safety.py's
+    # matching comment) so it gets generate_json()/generate_structured()'s
+    # base-class defaults for free — planner.py now calls generate_structured(),
+    # and a fake that only implements generate_text() would raise
+    # AttributeError instead of exercising the code path this test verifies.
     def __init__(self, reply):
         self.reply = reply
         self.calls = 0
