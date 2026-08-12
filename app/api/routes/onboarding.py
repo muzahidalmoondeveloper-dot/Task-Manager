@@ -61,7 +61,12 @@ def _validate_due_date(due_date) -> None:
 async def _require_onboarding_access(tenant: TenantContext, onboarding) -> None:
     if tenant.is_admin_or_owner:
         return
-    if tenant.org_role == PROJECT_MANAGER and onboarding.project_manager_id == tenant.user.id:
+    # has_project_manager_access (role OR granted flag) — not a literal
+    # org_role comparison, which a user whose base role isn't literally
+    # "project_manager" (e.g. a Team Manager additionally granted the
+    # is_project_manager privilege flag) would never match even when they
+    # are this onboarding's assigned project_manager_id.
+    if tenant.has_project_manager_access and onboarding.project_manager_id == tenant.user.id:
         return
     if tenant.org_role == CLIENT and onboarding.client_user_id == tenant.user.id:
         return
@@ -145,7 +150,7 @@ async def list_client_onboardings(tenant: TenantContext = Depends(get_tenant_con
     repo = ClientOnboardingRepository(db, tenant.organization_id)
     if tenant.is_admin_or_owner:
         return await repo.list_all()
-    if tenant.org_role == PROJECT_MANAGER:
+    if tenant.has_project_manager_access:
         return await repo.list_all(project_manager_id=tenant.user.id)
     if tenant.org_role == CLIENT:
         return await repo.list_all(client_user_id=tenant.user.id)

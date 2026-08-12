@@ -3,7 +3,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.database import get_db
-from app.core.org_roles import ORG_MANAGEMENT_ROLES, PROJECT_MANAGER, TEAM_MEMBER
+from app.core.org_roles import ORG_MANAGEMENT_ROLES, TEAM_MEMBER
+from app.core.team_access import require_team_access
 from app.core.tenant import TenantContext, check_active_billing, get_tenant_context, require_org_admin, require_org_manager
 from app.models.team import Team
 from app.repositories.team_repository import TeamRepository
@@ -16,6 +17,11 @@ router = APIRouter(prefix="/teams", tags=["Teams"])
 _TEAM_NOT_FOUND = ErrorDef(code="TEAM_NOT_FOUND", status=status.HTTP_404_NOT_FOUND, message="Team not found.")
 _INVALID_MANAGER = ErrorDef(code="INVALID_TEAM_MANAGER", status=status.HTTP_400_BAD_REQUEST, message="Selected team manager is not a valid org member.")
 _PLAN_LIMIT_TEAMS = ErrorDef(code="PLAN_LIMIT_EXCEEDED", status=status.HTTP_402_PAYMENT_REQUIRED, message="Your plan's team limit has been reached. Please upgrade.")
+
+# require_team_access() now lives in app.core.team_access — the single
+# shared source every route touching team-scoped data (this file, Rocks,
+# Issues, KPIs, Team News, ...) consults, so the rule can't drift or be
+# forgotten per-route (same pattern as app.core.project_access).
 
 
 def _serialize(team: Team) -> TeamDetailRead:
@@ -36,17 +42,26 @@ def _serialize(team: Team) -> TeamDetailRead:
 
 @router.get("", response_model=list[TeamDetailRead])
 async def list_teams(tenant: TenantContext = Depends(get_tenant_context)):
-    # Project managers are scoped to their assigned project(s) for project
-    # visibility (see projects.py's _PROJECT_SCOPED_ROLES), but per their role
-    # definition they can still view every team read-only — e.g. to assign a
-    # team when creating an issue or task under their project.
+    # Team access is scoped the same way project access is (see
+    # app.core.project_access's rules for the project side of this same
+    # decision): only Owner/Admin see every team. A Project Manager (base
+    # role or granted flag) no longer sees every team read-only — they see
+    # only team(s) they actually manage (team_manager_id) OR have been
+    # separately given membership on (the same "given access to a specific
+    # team" grant _require_team_access() checks below) — same rule a Team
+    # Manager gets, just via whichever of the two mechanisms applies.
     repo = TeamRepository(tenant.db, tenant.organization_id)
-    if tenant.is_admin_or_owner or tenant.org_role == PROJECT_MANAGER:
+    if tenant.is_admin_or_owner:
         teams = await repo.list_all()
     elif tenant.org_role == TEAM_MEMBER:
         teams = await repo.list_for_member(tenant.user.id)
     else:
-        teams = await repo.list_for_manager(tenant.user.id)
+        managed = await repo.list_for_manager(tenant.user.id)
+        member_of = await repo.list_for_member(tenant.user.id)
+        by_id = {t.id: t for t in managed}
+        for t in member_of:
+            by_id.setdefault(t.id, t)
+        teams = list(by_id.values())
     return [_serialize(t) for t in teams]
 
 
@@ -85,6 +100,7 @@ async def get_team(team_id: int, tenant: TenantContext = Depends(get_tenant_cont
     team = await repo.get_by_id(team_id)
     if team is None:
         raise AppException(_TEAM_NOT_FOUND)
+    await require_team_access(tenant, repo, team_id)
     return _serialize(team)
 
 
@@ -99,6 +115,7 @@ async def update_team(
     team = await repo.get_by_id(team_id)
     if team is None:
         raise AppException(_TEAM_NOT_FOUND)
+    await require_team_access(tenant, repo, team_id)
     updated = await repo.update(team, payload)
     return _serialize(updated)
 
@@ -113,5 +130,6 @@ async def delete_team(
     team = await repo.get_by_id(team_id)
     if team is None:
         raise AppException(_TEAM_NOT_FOUND)
+    await require_team_access(tenant, repo, team_id)
     await repo.delete(team)
     return None

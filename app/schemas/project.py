@@ -41,6 +41,8 @@ class ProjectRead(BaseModel):
     created_by_id: int
     created_at: datetime
     updated_at: datetime
+    project_manager_id: int | None = None
+    project_manager_name: str | None = None
 
     model_config = {
         "from_attributes": True,

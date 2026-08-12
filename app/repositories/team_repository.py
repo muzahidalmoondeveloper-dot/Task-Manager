@@ -53,6 +53,21 @@ class TeamRepository(TenantRepository):
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def has_access(self, team_id: int, user_id: int) -> bool:
+        """True if `user_id` is this team's manager OR a TeamMembership
+        member of it — the single access rule app.core.team_access enforces
+        for every team-scoped domain (Rocks, Issues, KPIs, Team News, ...),
+        not just the team itself. A cheap two-column-select check, no
+        relationship eager-loading required."""
+        stmt = select(Team.team_manager_id).where(Team.id == team_id, Team.organization_id == self.org_id)
+        manager_id = (await self.db.execute(stmt)).scalar_one_or_none()
+        if manager_id is None:
+            return False  # team doesn't exist (or isn't in this org) — let the caller's own 404 check handle that
+        if manager_id == user_id:
+            return True
+        member_stmt = select(TeamMembership.id).where(TeamMembership.team_id == team_id, TeamMembership.user_id == user_id)
+        return (await self.db.execute(member_stmt)).scalar_one_or_none() is not None
+
     async def create(self, payload: TeamCreate, created_by_id: int) -> Team:
         team = Team(
             name=payload.name.strip(),

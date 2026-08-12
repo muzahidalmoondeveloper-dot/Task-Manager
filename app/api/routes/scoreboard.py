@@ -52,15 +52,24 @@ async def _require_can_view_scoreboard(tenant: TenantContext, target_user_id: in
     if tenant.is_admin_or_owner:
         return
 
-    if tenant.org_role == "team_manager":
+    # Flag-aware (role OR granted privilege flag), and additive — a hybrid
+    # Project Manager who's ALSO been granted team-manager privileges gets
+    # the union of both checks below, not just one. Previously branched on
+    # `tenant.org_role == "team_manager"` literally, which a user whose
+    # base role is "project_manager" (even with the is_team_manager flag
+    # granted and made an actual team's manager) could never match — they
+    # fell into the project_manager branch instead, which checks a
+    # completely different, project-membership-based criterion and
+    # incorrectly returned 403 for someone who legitimately manages a team
+    # the target user is on.
+    if tenant.is_manager_or_above:
         team_repo = TeamRepository(tenant.db, tenant.organization_id)
         teams = await team_repo.list_for_manager(tenant.user.id)
         for team in teams:
             if any(m.user_id == target_user_id for m in team.memberships):
                 return
-        raise AppException(_FORBIDDEN)
 
-    if tenant.org_role == "project_manager":
+    if tenant.has_project_manager_access:
         task_repo = TaskRepository(tenant.db, tenant.organization_id)
         target_tasks = await task_repo.list_for_assignee(target_user_id)
         project_ids = {t.project_id for t in target_tasks if t.project_id is not None}
@@ -68,7 +77,6 @@ async def _require_can_view_scoreboard(tenant: TenantContext, target_user_id: in
         for project_id in project_ids:
             if await project_repo.is_member(project_id, tenant.user.id):
                 return
-        raise AppException(_FORBIDDEN)
 
     raise AppException(_FORBIDDEN)
 

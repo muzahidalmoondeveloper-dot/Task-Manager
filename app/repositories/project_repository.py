@@ -7,6 +7,7 @@ from sqlalchemy.orm import selectinload
 from app.core.org_roles import PROJECT_MANAGER
 from app.models.organization import OrganizationMembership
 from app.models.project import Project, ProjectMembership
+from app.models.user import User
 from app.repositories.base_tenant_repository import TenantRepository
 from app.schemas.project import ProjectCreate, ProjectUpdate
 
@@ -113,6 +114,38 @@ class ProjectRepository(TenantRepository):
         )
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
+
+    async def get_project_managers(self, project_ids: list[int]) -> dict[int, tuple[int, str | None]]:
+        """Bulk version of get_assigned_project_manager_id() — one query for
+        every project instead of one-per-row, so the Projects list can show
+        "who manages this project" without an N+1 (a project manager or an
+        org owner/admin viewing the list otherwise couldn't tell which
+        project belongs to whom without opening each one individually).
+        Returns {project_id: (user_id, full_name)}; a project with no
+        assigned Project Manager is simply absent from the dict rather than
+        mapped to None, so callers can use plain `dict.get(...)`."""
+        if not project_ids:
+            return {}
+        stmt = (
+            select(ProjectMembership.project_id, OrganizationMembership.user_id, User.full_name, ProjectMembership.created_at)
+            .join(OrganizationMembership, OrganizationMembership.user_id == ProjectMembership.user_id)
+            .join(User, User.id == ProjectMembership.user_id)
+            .where(
+                ProjectMembership.project_id.in_(project_ids),
+                OrganizationMembership.organization_id == self.org_id,
+                (OrganizationMembership.role == PROJECT_MANAGER) | (OrganizationMembership.is_project_manager.is_(True)),
+            )
+            .order_by(ProjectMembership.created_at.asc())
+        )
+        result = await self.db.execute(stmt)
+        managers: dict[int, tuple[int, str | None]] = {}
+        for project_id, user_id, full_name, _created_at in result.all():
+            # Same "a project has exactly one Project Manager" convention as
+            # add_project_member() — first assignment wins if duplicates
+            # ever exist, matching get_assigned_project_manager_id()'s
+            # single-project equivalent (ORDER BY created_at ASC + first-seen).
+            managers.setdefault(project_id, (user_id, full_name))
+        return managers
 
     async def add_member(self, project_id: int, user_id: int) -> ProjectMembership:
         existing = await self.db.execute(

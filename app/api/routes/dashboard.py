@@ -47,7 +47,16 @@ async def get_dashboard_summary(tenant: TenantContext = Depends(get_tenant_conte
 
     if is_team_manager_capable or is_pm_capable:
         managed_teams = await team_repo.list_for_manager(tenant.user.id) if is_team_manager_capable else []
-        managed_projects = await project_repo.list_for_user(tenant.user.id) if is_pm_capable else []
+        # ProjectMembership (not the `has_project_manager_access` role/flag)
+        # is what actually grants project access now (see
+        # app.core.project_access) — a Team Manager assigned as the
+        # ProjectMembership "manager" of a specific project (without ever
+        # being granted the project_manager role/flag) must see that
+        # project here too, so this is queried for anyone in this branch,
+        # not gated behind is_pm_capable. list_for_user() is a no-op
+        # (empty list) for anyone with no project memberships at all, so
+        # this is never a broadening for someone who truly has none.
+        managed_projects = await project_repo.list_for_user(tenant.user.id)
 
         task_by_id = {}
         for t in await task_repo.list_by_team_ids([team.id for team in managed_teams]):
