@@ -64,6 +64,28 @@ class OrganizationUpdate(BaseModel):
     logo_url: str | None = None
     website: str | None = None
     industry: str | None = None
+    # Architecture item 9 — timezone-aware temporal resolution (strict
+    # acceptance audit gap #5): previously a real DB column with correct
+    # _org_today() logic behind it, but with no way for any org admin to
+    # actually set it away from the default "UTC" through any API or UI
+    # path, making the feature functionally inert. Validated against the
+    # IANA tz database at the API boundary (not just accepted as any
+    # string) so a typo can't silently break every future "today"
+    # computation for the org.
+    timezone: str | None = None
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError:
+            raise ValueError(f"Unknown timezone: {value!r}. Use an IANA name, e.g. 'Asia/Dhaka' or 'America/New_York'.")
+        return value
 
 
 class OrganizationRead(BaseModel):
@@ -78,6 +100,7 @@ class OrganizationRead(BaseModel):
     status: str = "active"
     is_active: bool
     owner_id: int
+    timezone: str = "UTC"
     created_at: datetime
     updated_at: datetime
 

@@ -1,9 +1,14 @@
+import logging
+
 import httpx
 
 from app.services.llm.base import LLMProvider, LLMResponse
 
+logger = logging.getLogger("llm.openai")
+
 
 class OpenAIProvider(LLMProvider):
+    PROVIDER_NAME = "openai"
     BASE_URL = "https://api.openai.com/v1"
 
     def __init__(self, api_key: str, default_model: str = "gpt-4o-mini"):
@@ -19,20 +24,29 @@ class OpenAIProvider(LLMProvider):
         model=None,
         response_format="text",
         json_schema=None,
+        capability=None,
     ) -> LLMResponse:
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": user_prompt})
 
+        resolved_model = model or self._default_model
         payload: dict = {
-            "model": model or self._default_model,
+            "model": resolved_model,
             "messages": messages,
             "temperature": temperature,
         }
 
         if response_format == "json":
             payload["response_format"] = {"type": "json_object"}
+
+        # Observability only — no secrets (the API key is only ever sent as
+        # a request header below, never logged), no prompt/response content.
+        logger.info(
+            "LLM call | provider=%s model=%s capability=%s response_format=%s",
+            self.PROVIDER_NAME, resolved_model, capability or "unspecified", response_format,
+        )
 
         async with httpx.AsyncClient(timeout=90.0) as client:
             resp = await client.post(

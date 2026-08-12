@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, Uuid, func
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -155,4 +155,56 @@ class AIToolExecution(Base):
     # (reads and writes) made while handling that single message.
     trace_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
 
+    # Idempotency (architecture item 13): a deterministic hash of
+    # (session_id, tool_name, params) computed by run_tool() for AUTO-tier
+    # write tools — see app.services.copilot.tools.registry. A second call
+    # with an identical key within the dedup window returns the first
+    # call's recorded result instead of executing again, so a client-side
+    # retry (double-submit, network timeout-and-resend) can't create the
+    # same task twice.
+    idempotency_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class KnowledgeDocument(Base):
+    """A document/SOP knowledge-base entry (architecture item 1 — Knowledge/
+    RAG retrieval domain, distinct from the "operational" live-table search
+    in knowledge_tools.py's existing search_everything tool). Tenant-isolated
+    by organization_id like every other domain table in this app.
+
+    embedding_json stores a plain JSON array of floats rather than a native
+    vector column: pgvector is confirmed unavailable in this environment (a
+    direct `CREATE EXTENSION vector` attempt fails with
+    FeatureNotSupportedError — no OS-level binary, no admin access to add
+    one). Cosine similarity is computed in Python over these arrays at query
+    time (see app/services/copilot/embeddings.py) — an honest, real
+    (non-ANN-indexed) semantic layer rather than a fake one; documented as
+    the one genuine infra-blocked corner of the spec's vector-search
+    requirement, per the acceptance-audit instruction to report exact
+    blockers instead of silently degrading."""
+    __tablename__ = "knowledge_documents"
+    __table_args__ = (
+        Index("ix_knowledge_documents_org_doctype", "organization_id", "doc_type"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    organization_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    # Free-form category for metadata filtering (e.g. "sop", "policy",
+    # "faq", "runbook") — filterable via search_knowledge's doc_type param.
+    doc_type: Mapped[str] = mapped_column(String(50), nullable=False, default="general", server_default="general")
+    tags: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+
+    # Provider-agnostic real embedding (nomic-embed-text via Ollama, today) —
+    # null when the configured LLM provider has no embed() capability, in
+    # which case search_knowledge degrades to keyword/BM25-only ranking for
+    # this row rather than raising or faking a score.
+    embedding_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    embedding_model: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

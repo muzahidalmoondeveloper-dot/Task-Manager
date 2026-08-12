@@ -17,6 +17,7 @@ CLIENT_BLOCKED_SUB_INTENTS = {
     "workload_summary", "project_count", "project_list", "project_by_status",
     "rock_list", "rock_by_team", "issue_list", "issue_open",
     "kpi_list", "kpi_progress", "meeting_list", "meeting_upcoming",
+    "my_scoreboard",
     # client_request_list is intentionally NOT blocked — a client asking
     # about the status of requests they submitted is exactly in scope.
 }
@@ -29,6 +30,14 @@ CLIENT_REFUSAL_MESSAGE = (
 # Write tools that are simply never available through chat, for any role —
 # spec Section 23's R6 (role/access change) and R7 (mass delete) rows.
 _ALWAYS_BLOCKED_TOOLS = {"change_user_role", "delete_organization", "bulk_delete_all_tasks"}
+
+# The one, explicit, deliberate exception to "clients have no write tools" —
+# a client submitting a NEW task request for their own project is exactly
+# the client-facing workflow the product already supports through the
+# regular UI form; chat should be able to do the same thing, not less.
+# Everything else stays denied by default — this is a whitelist, not a
+# loosening of the general rule.
+_CLIENT_ALLOWED_WRITE_TOOLS = {"submit_client_request"}
 
 
 def is_client_blocked_sub_intent(sub_intent: str) -> bool:
@@ -44,9 +53,9 @@ def check_tool_policy(*, org_role: str, tool_name: str, is_bulk: bool = False) -
         return DENY
 
     if org_role == CLIENT:
-        # Clients have no write tools available through chat at all today —
-        # every write tool this pass touches (task reassignment/deletion) is
-        # internal staff work.
+        if tool_name in _CLIENT_ALLOWED_WRITE_TOOLS:
+            return ALLOW
+        # Every other write tool remains internal-staff-only.
         return DENY
 
     return ALLOW

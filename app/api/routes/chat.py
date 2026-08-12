@@ -34,7 +34,10 @@ async def send_message(
     if not payload.message or not payload.message.strip():
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="Message cannot be empty.")
     service = ChatService(db, tenant.organization_id)
-    return await service.handle_message(user=tenant.user, message=payload.message.strip(), session_id=payload.session_id, org_role=tenant.org_role)
+    return await service.handle_message(
+        user=tenant.user, message=payload.message.strip(), session_id=payload.session_id,
+        org_role=tenant.org_role, page_context=payload.page_context,
+    )
 
 
 @router.post("/upload", response_model=ChatMessageResponse)
@@ -105,7 +108,7 @@ async def _record_action_exchange(
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Session not found.")
     user_msg = await repo.add_message(session_id, "user", user_label)
     assistant_msg = await repo.add_message(session_id, "assistant", reply)
-    await repo.touch_session(session)
+    await repo.touch_session(session_id)
     return ChatMessageResponse(
         session_id=session_id,
         user_message=user_msg,
@@ -121,7 +124,13 @@ async def confirm_change_set(
     db: AsyncSession = Depends(get_db),
 ):
     enforce_feature(tenant, "has_ai_features")
-    change_set = await change_sets.get_change_set(db, tenant.organization_id, change_set_id)
+    # SELECT ... FOR UPDATE (security gap #2 — "change-set TOCTOU race"): two
+    # concurrent confirm requests (double-click, retry-after-timeout) must
+    # not both observe status="pending" and both apply the change. The
+    # second request blocks on this row lock until the first transaction
+    # commits, then re-reads the now-"executed" status and is correctly
+    # rejected by the check below instead of racing past it.
+    change_set = await change_sets.get_change_set_for_update(db, tenant.organization_id, change_set_id)
     if change_set is None or change_set.created_by_id != tenant.user.id:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Change set not found.")
     if change_set.status != "pending":
@@ -151,7 +160,10 @@ async def cancel_change_set(
     db: AsyncSession = Depends(get_db),
 ):
     enforce_feature(tenant, "has_ai_features")
-    change_set = await change_sets.get_change_set(db, tenant.organization_id, change_set_id)
+    # Same row-lock rationale as confirm_change_set above — a cancel racing
+    # a concurrent confirm must not silently overwrite an already-executed
+    # change set's status back to "cancelled".
+    change_set = await change_sets.get_change_set_for_update(db, tenant.organization_id, change_set_id)
     if change_set is None or change_set.created_by_id != tenant.user.id:
         raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="Change set not found.")
     if change_set.status != "pending":
@@ -211,7 +223,9 @@ async def approve_request(
     if approvals.is_expired(approval):
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="This approval request has expired.")
 
-    change_set = await change_sets.get_change_set(db, tenant.organization_id, approval.change_set_id)
+    # Row-locked for the same reason as confirm_change_set above — an admin
+    # approval executes a change set exactly like a direct confirm does.
+    change_set = await change_sets.get_change_set_for_update(db, tenant.organization_id, approval.change_set_id)
     if change_set is None or change_set.status != "pending":
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="The underlying change is no longer pending.")
 

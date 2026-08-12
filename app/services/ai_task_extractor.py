@@ -1,8 +1,9 @@
-import json
 import logging
 from datetime import date
 
 from pydantic import ValidationError
+
+from app.services.llm.gateway import LLMSchemaError
 
 from app.schemas.task_suggestion import (
     CONFIDENCE_VALUES,
@@ -153,18 +154,27 @@ class AITaskExtractor:
             f"Content:\n{source_text}"
         )
 
-        result = await provider.generate_text(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            temperature=0.1,
-            response_format="json",
-            json_schema=TASK_EXTRACTION_FORMAT,
-        )
+        # generate_json() (architecture item 4/5 — Structured LLM Gateway):
+        # was raw generate_text() + a bespoke _parse_json() with NO repair
+        # retry at all — a single malformed response from the LLM raised
+        # ValueError immediately and failed the whole email/transcript
+        # import. generate_json() gets the same repair-retry/fallback
+        # machinery as every other structured extraction call site in the
+        # app, while json_schema still gets the native-format-hint benefit
+        # (Ollama's `format=`) this call site relied on.
+        try:
+            payload = await provider.generate_json(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.1,
+                json_schema=TASK_EXTRACTION_FORMAT,
+                capability="email_task_extraction",
+            )
+        except LLMSchemaError as exc:
+            logger.warning("Task extraction gave up after retries/fallback: %s", exc)
+            return [], {"should_create_tasks": False, "reason": "AI extraction failed", "source_category": "unknown", "tasks": []}
 
-        logger.info("LLM response text:\n%s", result.text)
-
-        payload = self._parse_json(result.text)
-
+        payload = self._normalize_payload(payload)
         logger.info("Parsed LLM JSON: %s", payload)
 
         if payload.get("should_create_tasks") is False:
@@ -227,25 +237,13 @@ class AITaskExtractor:
 
         return valid_tasks, payload
 
-    def _parse_json(self, content: str) -> dict:
-        cleaned = content.strip()
-
-        if cleaned.startswith("```json"):
-            cleaned = cleaned.removeprefix("```json").strip()
-
-        if cleaned.startswith("```"):
-            cleaned = cleaned.removeprefix("```").strip()
-
-        if cleaned.endswith("```"):
-            cleaned = cleaned.removesuffix("```").strip()
-
-        try:
-            payload = json.loads(cleaned)
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"LLM returned invalid JSON. Raw response: {content}"
-            ) from exc
-
+    def _normalize_payload(self, payload) -> dict:
+        """generate_json() already parsed the raw JSON text (with repair-
+        retry on failure) — this only normalizes the shape, same as the
+        old _parse_json() did after its own (now-replaced) manual
+        json.loads() call: a bare JSON array is treated as a task list, and
+        a missing "tasks" key defaults to empty rather than KeyError-ing
+        every call site below."""
         if isinstance(payload, list):
             payload = {"tasks": payload}
 

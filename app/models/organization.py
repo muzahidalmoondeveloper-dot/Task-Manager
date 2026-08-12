@@ -28,6 +28,15 @@ class Organization(Base):
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="active", index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
+    # IANA timezone name (e.g. "Asia/Dhaka") — architecture item 9,
+    # "timezone-aware temporal resolution". Used by the AI Copilot to
+    # compute "today" for relative-date extraction ("due tomorrow") and
+    # overdue/due-soon comparisons in the organization's own local day
+    # boundary instead of the server process's local clock, which used to
+    # be a silent, unannounced source of off-by-one-day errors near
+    # midnight for any organization not in the same timezone as the server.
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="UTC", server_default="UTC")
+
     # Employee Scoreboard scoring weights — must sum to 1.0, enforced at the
     # API layer (ScoreboardWeightsUpdate), not by a DB constraint.
     scoreboard_completion_weight: Mapped[float] = mapped_column(Float, nullable=False, default=0.35, server_default="0.35")

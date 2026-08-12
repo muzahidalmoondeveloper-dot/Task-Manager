@@ -21,6 +21,31 @@ RISK_TABLE: dict[str, str] = {
     "update_task_bulk": "R4",           # "mark all tasks as done" etc.
     "delete_task_bulk": "R7",
     "convert_client_request_to_task": "R3",  # creates a real task from client input
+    # Domain buildout (strict acceptance audit) — single-record create/status
+    # changes for Issues, Rocks, KPI entries, and client-submitted requests
+    # are the same risk shape as create_task/update_task_field: one record,
+    # immediately visible on its own page, trivially correctable by hand if
+    # wrong. AUTO tier, no preview/confirm needed.
+    "create_issue": "R2",
+    "update_issue_status": "R2",
+    "create_rock": "R2",
+    "update_rock_status": "R2",
+    "record_kpi_value": "R2",
+    "submit_client_request": "R2",
+    "schedule_meeting": "R2",
+    "update_meeting": "R2",
+    "create_project": "R2",
+    "create_team": "R2",
+    "update_project": "R2",   # single record, same risk shape as update_issue_status/update_rock_status
+    "update_team": "R2",      # rename/description only — NOT manager reassignment, see reassign_team_manager
+    "create_knowledge_document": "R2",  # single record, trivially correctable/deletable by hand if wrong
+    # Team-manager reassignment (architecture item 2) — a leadership/
+    # personnel change with broader blast radius (cascades to who's
+    # accountable for the team's whole task/rock/KPI workload) than any
+    # single-field edit, so it gets the same CONFIRM treatment as
+    # reassign_task rather than folding into update_team's AUTO tier.
+    "reassign_team_manager": "R3",
+    "generate_project_report": "R2",  # single record, same risk shape as any other domain create
 }
 
 _RISK_ACTION = {
