@@ -9,6 +9,7 @@ from app.api.routes.teams import _serialize as serialize_team
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.database import get_db
 from app.core.org_roles import CLIENT, PROJECT_MANAGER
+from app.core.project_access import is_project_scoped, require_project_access
 from app.core.tenant import TenantContext, check_active_billing, get_tenant_context, require_org_admin, require_org_manager
 from app.models.issue import Issue
 from app.models.kpi import KPI
@@ -35,35 +36,38 @@ router = APIRouter(prefix="/projects", tags=["Projects"])
 
 _NOT_FOUND = ErrorDef(code="PROJECT_NOT_FOUND", status=http_status.HTTP_404_NOT_FOUND, message="Project not found.")
 _PLAN_LIMIT = ErrorDef(code="PLAN_LIMIT_EXCEEDED", status=http_status.HTTP_402_PAYMENT_REQUIRED, message="Your plan's project limit has been reached.")
-_NOT_ASSIGNED = ErrorDef(code="PROJECT_NOT_ASSIGNED", status=http_status.HTTP_403_FORBIDDEN, message="You are not assigned to this project.")
 _CLIENT_FORBIDDEN = ErrorDef(code="CLIENT_ITEMS_FORBIDDEN", status=http_status.HTTP_403_FORBIDDEN, message="Clients view project progress through Reports, not this endpoint.")
 
 _LOGO_DIR_NAME = "project_logos"
 
-
-_PROJECT_SCOPED_ROLES = {PROJECT_MANAGER, CLIENT}
-
-
-def _is_project_scoped(tenant: TenantContext) -> bool:
-    """Project Managers and Clients only see projects they're assigned to;
-    every other role (including a Project Manager who's also been granted
-    team-manager privileges) keeps today's org-wide project visibility."""
-    if tenant.org_role not in _PROJECT_SCOPED_ROLES:
-        return False
-    return not tenant.is_manager_or_above
+# is_project_scoped()/require_project_access() now live in
+# app.core.project_access — the single shared source every route touching
+# project-scoped data (this file, tasks.py, ...) consults, so the rule
+# can't drift or be forgotten per-route. Kept as module-level aliases here
+# so this file's many existing call sites don't all need renaming.
+_is_project_scoped = is_project_scoped
+_require_project_access = require_project_access
 
 
-async def _require_project_access(tenant: TenantContext, repo: ProjectRepository, project_id: int) -> None:
-    if _is_project_scoped(tenant) and not await repo.is_member(project_id, tenant.user.id):
-        raise AppException(_NOT_ASSIGNED)
+def _serialize_project(project, managers: dict[int, tuple[int, str | None]]) -> ProjectRead:
+    read = ProjectRead.model_validate(project)
+    manager = managers.get(project.id)
+    if manager is not None:
+        read.project_manager_id, read.project_manager_name = manager
+    return read
 
 
 @router.get("", response_model=list[ProjectRead])
 async def list_projects(tenant: TenantContext = Depends(get_tenant_context)):
     repo = ProjectRepository(tenant.db, tenant.organization_id)
-    if _is_project_scoped(tenant):
-        return [ProjectRead.model_validate(p) for p in await repo.list_for_user(tenant.user.id)]
-    return [ProjectRead.model_validate(p) for p in await repo.list_all()]
+    projects = (
+        await repo.list_for_user(tenant.user.id) if _is_project_scoped(tenant) else await repo.list_all()
+    )
+    # One bulk query for every project's assigned manager (see
+    # get_project_managers()'s docstring) instead of N+1 — so the Projects
+    # list can show which Project Manager owns each project at a glance.
+    managers = await repo.get_project_managers([p.id for p in projects])
+    return [_serialize_project(p, managers) for p in projects]
 
 
 @router.post("", response_model=ProjectRead, status_code=http_status.HTTP_201_CREATED)
@@ -91,7 +95,8 @@ async def get_project(project_id: int, tenant: TenantContext = Depends(get_tenan
     if project is None:
         raise AppException(_NOT_FOUND)
     await _require_project_access(tenant, repo, project_id)
-    return ProjectRead.model_validate(project)
+    managers = await repo.get_project_managers([project_id])
+    return _serialize_project(project, managers)
 
 
 @router.patch("/{project_id}", response_model=ProjectRead)
@@ -104,6 +109,7 @@ async def update_project(
     project = await repo.get_by_id(project_id)
     if project is None:
         raise AppException(_NOT_FOUND)
+    await _require_project_access(tenant, repo, project_id)
     updated = await repo.update(project, payload)
     return ProjectRead.model_validate(updated)
 
@@ -118,6 +124,7 @@ async def upload_project_logo(
     project = await repo.get_by_id(project_id)
     if project is None:
         raise AppException(_NOT_FOUND)
+    await _require_project_access(tenant, repo, project_id)
 
     new_url = await logo_upload_service.save_logo(file, _LOGO_DIR_NAME, project_id)
     logo_upload_service.delete_logo_file(project.logo_url, _LOGO_DIR_NAME)
@@ -136,6 +143,7 @@ async def delete_project_logo(
     project = await repo.get_by_id(project_id)
     if project is None:
         raise AppException(_NOT_FOUND)
+    await _require_project_access(tenant, repo, project_id)
 
     logo_upload_service.delete_logo_file(project.logo_url, _LOGO_DIR_NAME)
     project.logo_url = None
@@ -153,6 +161,7 @@ async def delete_project(
     project = await repo.get_by_id(project_id)
     if project is None:
         raise AppException(_NOT_FOUND)
+    await _require_project_access(tenant, repo, project_id)
     await repo.delete(project)
     return None
 

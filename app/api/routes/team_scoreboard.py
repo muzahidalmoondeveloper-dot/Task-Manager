@@ -4,10 +4,9 @@ from fastapi import APIRouter, Depends, Query
 from fastapi import status as http_status
 
 from app.core.auth_errors import AppException, ErrorDef
+from app.core.team_access import require_team_access
 from app.core.tenant import TenantContext, get_tenant_context
 from app.models.team import Team
-from app.repositories.project_repository import ProjectRepository
-from app.repositories.task_repository import TaskRepository
 from app.repositories.team_repository import TeamRepository
 from app.schemas.scoreboard import (
     ScoreboardSummary,
@@ -37,30 +36,26 @@ async def _get_team_or_404(tenant: TenantContext, team_id: int) -> Team:
 
 
 async def _require_can_view_team_scoreboard(tenant: TenantContext, team: Team) -> None:
-    if tenant.is_admin_or_owner:
-        return
+    """Delegates to the shared app.core.team_access rule (Owner/Admin
+    unrestricted; everyone else must be the team's manager or a member of
+    it) instead of the bespoke org_role-string branching this used to do.
 
-    if tenant.org_role == "team_manager":
-        if team.team_manager_id == tenant.user.id:
-            return
+    BUG THAT FIX CLOSED: the old branching checked `tenant.org_role ==
+    "team_manager"` literally — a user whose role is "project_manager" but
+    who was ALSO granted the is_team_manager privilege flag and made this
+    team's manager (team.team_manager_id == them) matched NONE of the
+    branches except the project_manager one, which checks PROJECT
+    membership via the team's tasks — completely unrelated to actually
+    managing this team — and incorrectly returned 403 for someone who
+    manages the team outright. This is the same class of bug already fixed
+    in app.core.team_access itself; this route just hadn't been switched
+    over to it yet.
+    """
+    repo = TeamRepository(tenant.db, tenant.organization_id)
+    try:
+        await require_team_access(tenant, repo, team.id)
+    except AppException:
         raise AppException(_FORBIDDEN)
-
-    if tenant.org_role == "team_member":
-        if any(m.user_id == tenant.user.id for m in team.memberships):
-            return
-        raise AppException(_FORBIDDEN)
-
-    if tenant.org_role == "project_manager":
-        task_repo = TaskRepository(tenant.db, tenant.organization_id)
-        team_tasks = await task_repo.list_by_team(team.id)
-        project_ids = {t.project_id for t in team_tasks if t.project_id is not None}
-        project_repo = ProjectRepository(tenant.db, tenant.organization_id)
-        for project_id in project_ids:
-            if await project_repo.is_member(project_id, tenant.user.id):
-                return
-        raise AppException(_FORBIDDEN)
-
-    raise AppException(_FORBIDDEN)
 
 
 def _team_info(team: Team) -> TeamInfo:

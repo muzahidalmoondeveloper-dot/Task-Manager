@@ -3,8 +3,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.team_access import require_team_access
 from app.core.tenant import TenantContext, get_tenant_context
 from app.models.rock import Milestone, Rock, RockLink
+from app.repositories.team_repository import TeamRepository
 from app.schemas.rock import EntityLinkIn, RockCreate, RockOut, RockUpdate
 
 
@@ -23,6 +25,11 @@ async def list_rocks(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    # Team-scoped (see app.core.team_access): everything filed under a team
+    # — Rocks included — is only visible to that team's manager/members
+    # (or Owner/Admin), not every org member who happens to know the
+    # team_id. Previously had no restriction at all here.
+    await require_team_access(tenant, TeamRepository(db, tenant.organization_id), team_id)
     result = await db.execute(
         select(Rock)
         .where(Rock.team_id == team_id, Rock.organization_id == tenant.organization_id)
@@ -38,6 +45,7 @@ async def create_rock(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    await require_team_access(tenant, TeamRepository(db, tenant.organization_id), team_id)
     milestones_data = payload.milestones or []
     rock_data = payload.model_dump(exclude={"milestones", "links"})
     rock = Rock(team_id=team_id, organization_id=tenant.organization_id, **rock_data)
@@ -59,6 +67,7 @@ async def update_rock(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    await require_team_access(tenant, TeamRepository(db, tenant.organization_id), team_id)
     result = await db.execute(
         select(Rock).where(
             Rock.id == rock_id,
@@ -99,6 +108,7 @@ async def delete_rock(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    await require_team_access(tenant, TeamRepository(db, tenant.organization_id), team_id)
     result = await db.execute(
         select(Rock).where(
             Rock.id == rock_id,

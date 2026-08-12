@@ -5,9 +5,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.team_access import require_team_access
 from app.core.tenant import TenantContext, get_tenant_context
 from app.models.issue import Issue, IssueLink
 from app.repositories.project_repository import ProjectRepository
+from app.repositories.team_repository import TeamRepository
 from app.schemas.issue import EntityLinkIn, IssueCreate, IssueUpdate, IssueOut
 
 _ISSUE_CREATE_FORBIDDEN = HTTPException(
@@ -32,6 +34,7 @@ async def list_issues(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    await require_team_access(tenant, TeamRepository(db, tenant.organization_id), team_id)
     q = select(Issue).where(
         Issue.team_id == team_id,
         Issue.organization_id == tenant.organization_id,
@@ -50,9 +53,19 @@ async def create_issue(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    if not tenant.is_manager_or_above:
-        if not tenant.has_project_manager_access:
-            raise _ISSUE_CREATE_FORBIDDEN
+    # Base permission gate (unchanged) — who may create issues at all.
+    if not tenant.is_manager_or_above and not tenant.has_project_manager_access:
+        raise _ISSUE_CREATE_FORBIDDEN
+
+    # Team scope (see app.core.team_access) — must actually manage/belong
+    # to the team this issue is filed under (Owner/Admin unrestricted).
+    # Previously a Team Manager bypassed this entirely (is_manager_or_above
+    # skipped the whole block) and could create an issue under ANY team.
+    await require_team_access(tenant, TeamRepository(db, tenant.organization_id), team_id)
+
+    # Project scope (existing, Project-Manager-specific): the issue's
+    # linked project, if any, must also be one they're assigned to.
+    if tenant.has_project_manager_access and not tenant.is_manager_or_above:
         project_repo = ProjectRepository(db, tenant.organization_id)
         if payload.project_id is None or not await project_repo.is_member(payload.project_id, tenant.user.id):
             raise _ISSUE_CREATE_FORBIDDEN
@@ -73,6 +86,7 @@ async def update_issue(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    await require_team_access(tenant, TeamRepository(db, tenant.organization_id), team_id)
     result = await db.execute(
         select(Issue).where(
             Issue.id == issue_id,
@@ -108,6 +122,7 @@ async def delete_issue(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    await require_team_access(tenant, TeamRepository(db, tenant.organization_id), team_id)
     result = await db.execute(
         select(Issue).where(
             Issue.id == issue_id,

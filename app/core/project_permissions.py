@@ -1,7 +1,6 @@
 from fastapi import status as http_status
 
 from app.core.auth_errors import AppException, ErrorDef
-from app.core.org_roles import PROJECT_MANAGER
 from app.core.tenant import TenantContext
 from app.repositories.project_repository import ProjectRepository
 
@@ -19,6 +18,6 @@ async def require_can_invite_to_project(
     Manager can only invite clients to a project they're assigned to."""
     if tenant.is_manager_or_above:
         return
-    if tenant.org_role == PROJECT_MANAGER and await project_repo.is_member(project_id, tenant.user.id):
+    if tenant.has_project_manager_access and await project_repo.is_member(project_id, tenant.user.id):
         return
     raise AppException(PROJECT_INVITE_FORBIDDEN)

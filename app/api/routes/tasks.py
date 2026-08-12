@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.database import get_db
 from app.core.org_roles import PROJECT_MANAGER, TEAM_MEMBER
+from app.core.project_access import is_project_scoped, require_project_access
 from app.core.tenant import TenantContext, get_tenant_context, require_org_admin, require_org_manager
 from app.models.notification import Notification
 from app.models.task import Task
@@ -140,10 +141,17 @@ async def create_task(
     team_repo = TeamRepository(db, tenant.organization_id)
     task_repo = TaskRepository(db, tenant.organization_id)
 
-    if not tenant.is_manager_or_above:
-        if tenant.org_role != PROJECT_MANAGER:
-            raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="You are not allowed to create tasks.")
-        if payload.project_id is None or not await project_repo.is_member(payload.project_id, tenant.user.id):
+    if not tenant.is_manager_or_above and tenant.org_role != PROJECT_MANAGER:
+        raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="You are not allowed to create tasks.")
+
+    # Project scope (see app.core.project_access): a Team Manager or
+    # Project Manager without ProjectMembership on the target project may
+    # not create tasks under it — previously only plain PROJECT_MANAGER was
+    # checked here, so a Team Manager (who passes is_manager_or_above and
+    # skipped this block entirely) could create a task under ANY project in
+    # the org, not just one they're assigned to manage.
+    if payload.project_id is not None and is_project_scoped(tenant):
+        if not await project_repo.is_member(payload.project_id, tenant.user.id):
             raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="You can only create tasks under a project you are assigned to.")
 
     if payload.assignee_id is not None:
@@ -181,8 +189,22 @@ async def list_tasks_by_project(
     task_repo = TaskRepository(tenant.db, tenant.organization_id)
     if await project_repo.get_by_id(project_id) is None:
         raise AppException(ErrorDef(code="PROJECT_NOT_FOUND", status=http_status.HTTP_404_NOT_FOUND, message="Project not found."))
+    # A Project Manager (or Client) not assigned to this project gets a
+    # hard 403 here — same rule every other project-scoped route enforces
+    # (see app.core.project_access) — instead of silently falling through
+    # to the "only your own assigned tasks" filter below, which used to let
+    # them successfully call this endpoint for a project they don't manage
+    # at all and get back a (non-error, if they happened to have any tasks
+    # there) response.
+    is_scoped = is_project_scoped(tenant)
+    if is_scoped:
+        await require_project_access(tenant, project_repo, project_id)
+
     tasks = await task_repo.list_by_project(project_id)
-    if tenant.is_admin_or_owner:
+    # Full visibility for admins/owners, and for a Project Manager who IS
+    # assigned here — they manage the whole project, not just their own
+    # tasks within it.
+    if tenant.is_admin_or_owner or is_scoped:
         return [serialize_task(t) for t in tasks]
     return [serialize_task(t) for t in tasks if t.assignee_id == tenant.user.id]
 
@@ -209,9 +231,16 @@ async def list_tasks_by_team(
 @router.get("/{task_id}", response_model=TaskDetailRead)
 async def get_task(task_id: int, tenant: TenantContext = Depends(get_tenant_context)):
     task = await get_task_or_404(tenant, task_id)
-    if not tenant.is_admin_or_owner and task.assignee_id != tenant.user.id:
-        raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="You can only view your own tasks.")
-    return serialize_task(task)
+    if tenant.is_admin_or_owner or task.assignee_id == tenant.user.id:
+        return serialize_task(task)
+    # A Project Manager may view any task in a project they're assigned to
+    # manage, not only tasks personally assigned to them — otherwise they
+    # couldn't see most of the work happening in a project they manage.
+    if task.project_id is not None and tenant.has_project_manager_access:
+        project_repo = ProjectRepository(tenant.db, tenant.organization_id)
+        if await project_repo.is_member(task.project_id, tenant.user.id):
+            return serialize_task(task)
+    raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="You can only view your own tasks.")
 
 
 @router.patch("/{task_id}/status", response_model=TaskDetailRead)

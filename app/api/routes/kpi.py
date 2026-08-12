@@ -4,12 +4,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.team_access import require_team_access
 from app.core.tenant import TenantContext, get_tenant_context, require_org_manager
 from app.models.kpi import KPI, KPIEntry, KPIGroup, KpiLink
 from app.models.organization import OrganizationMembership
 from app.models.project import Project
 from app.models.rock import Rock
 from app.models.team import Team
+from app.repositories.team_repository import TeamRepository
 from app.schemas.kpi import (
     EntityLinkIn,
     KPICreate,
@@ -47,6 +49,15 @@ def _kpi_out(kpi: KPI) -> KPIOut:
     out.statuses = compute_view_statuses(kpi)
     out.derived_entries = compute_derived_entries(kpi)
     return out
+
+
+async def _require_team(db: AsyncSession, tenant: TenantContext, team_id: int) -> None:
+    """Thin wrapper around app.core.team_access.require_team_access — every
+    KPI/KPI-group/entry endpoint below is filed under a team_id path
+    param, so this is called first in each one (previously had no team
+    scoping at all: any org member, on any team, could list/create/edit/
+    delete another team's KPIs and entries)."""
+    await require_team_access(tenant, TeamRepository(db, tenant.organization_id), team_id)
 
 
 async def _get_kpi_or_404(db: AsyncSession, team_id: int, kpi_id: int, org_id) -> KPI:
@@ -151,6 +162,7 @@ async def list_kpi_groups(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    await _require_team(db, tenant, team_id)
     result = await db.execute(
         select(KPIGroup)
         .where(KPIGroup.team_id == team_id, KPIGroup.organization_id == tenant.organization_id)
@@ -167,6 +179,7 @@ async def create_kpi_group(
     tenant: TenantContext = Depends(require_org_manager),
 ):
     await _validate_team(db, team_id, tenant.organization_id)
+    await _require_team(db, tenant, team_id)
 
     async def _existing() -> KPIGroup | None:
         result = await db.execute(
@@ -211,6 +224,7 @@ async def update_kpi_group(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(require_org_manager),
 ):
+    await _require_team(db, tenant, team_id)
     result = await db.execute(
         select(KPIGroup).where(
             KPIGroup.id == group_id,
@@ -241,6 +255,7 @@ async def delete_kpi_group(
 ):
     """Deleting a group never deletes its KPIs — the FK is SET NULL, so member
     KPIs simply become ungrouped."""
+    await _require_team(db, tenant, team_id)
     result = await db.execute(
         select(KPIGroup).where(
             KPIGroup.id == group_id,
@@ -263,6 +278,7 @@ async def list_kpis(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    await _require_team(db, tenant, team_id)
     result = await db.execute(
         select(KPI)
         .where(KPI.team_id == team_id, KPI.organization_id == tenant.organization_id)
@@ -278,6 +294,7 @@ async def reorder_kpis(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(require_org_manager),
 ):
+    await _require_team(db, tenant, team_id)
     for item in payload:
         result = await db.execute(
             select(KPI).where(
@@ -300,6 +317,7 @@ async def create_kpi(
     tenant: TenantContext = Depends(require_org_manager),
 ):
     await _validate_team(db, team_id, tenant.organization_id)
+    await _require_team(db, tenant, team_id)
     await _validate_owner(db, payload.owner_id, tenant.organization_id)
     await _validate_rock(db, payload.rock_id, team_id, tenant.organization_id, is_new_link=True)
     await _validate_project(db, payload.project_id, tenant.organization_id)
@@ -326,6 +344,7 @@ async def update_kpi(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(require_org_manager),
 ):
+    await _require_team(db, tenant, team_id)
     kpi = await _get_kpi_or_404(db, team_id, kpi_id, tenant.organization_id)
     updates = payload.model_dump(exclude_unset=True, exclude={"links"})
 
@@ -346,6 +365,7 @@ async def update_kpi(
     target_team_id = updates.get("team_id", kpi.team_id)
     if "team_id" in updates and updates["team_id"] != kpi.team_id:
         await _validate_team(db, target_team_id, tenant.organization_id)
+        await _require_team(db, tenant, target_team_id)
     if "owner_id" in updates:
         await _validate_owner(db, updates["owner_id"], tenant.organization_id)
     if "project_id" in updates:
@@ -385,6 +405,7 @@ async def delete_kpi(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(require_org_manager),
 ):
+    await _require_team(db, tenant, team_id)
     kpi = await _get_kpi_or_404(db, team_id, kpi_id, tenant.organization_id)
     await db.delete(kpi)
     await db.commit()
@@ -400,6 +421,7 @@ async def upsert_entry(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    await _require_team(db, tenant, team_id)
     kpi = await _get_kpi_or_404(db, team_id, kpi_id, tenant.organization_id)
     try:
         validate_entry_value(kpi.target_type, payload.value)
@@ -460,6 +482,7 @@ async def add_entry_note(
     tenant: TenantContext = Depends(get_tenant_context),
 ):
     from datetime import datetime as dt
+    await _require_team(db, tenant, team_id)
     entry = await _get_entry_or_404(db, kpi_id, entry_id, tenant.organization_id)
     notes = list(entry.notes or [])
     notes.append({
@@ -484,6 +507,7 @@ async def edit_entry_note(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    await _require_team(db, tenant, team_id)
     entry = await _get_entry_or_404(db, kpi_id, entry_id, tenant.organization_id)
     notes = list(entry.notes or [])
     if note_idx < 0 or note_idx >= len(notes):
@@ -504,6 +528,7 @@ async def delete_entry_note(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    await _require_team(db, tenant, team_id)
     entry = await _get_entry_or_404(db, kpi_id, entry_id, tenant.organization_id)
     notes = list(entry.notes or [])
     if note_idx < 0 or note_idx >= len(notes):
@@ -523,6 +548,7 @@ async def delete_entry(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    await _require_team(db, tenant, team_id)
     entry = await _get_entry_or_404(db, kpi_id, entry_id, tenant.organization_id)
     await db.delete(entry)
     await db.commit()

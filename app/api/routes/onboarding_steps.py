@@ -12,7 +12,7 @@ from app.api.routes.onboarding import (
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.database import get_db
 from app.core.onboarding_constants import STEP_STATUSES_CLIENT_EDITABLE
-from app.core.org_roles import CLIENT, PROJECT_MANAGER
+from app.core.org_roles import CLIENT
 from app.core.tenant import TenantContext, get_tenant_context
 from app.repositories.onboarding_repository import ClientOnboardingRepository
 from app.schemas.onboarding import (
@@ -54,7 +54,9 @@ def _require_client_owner(tenant: TenantContext, onboarding) -> None:
 def _require_reviewer(tenant: TenantContext, onboarding) -> None:
     if tenant.is_admin_or_owner:
         return
-    if tenant.org_role == PROJECT_MANAGER and onboarding.project_manager_id == tenant.user.id:
+    # has_project_manager_access (role OR granted flag) — see the matching
+    # comment in onboarding.py's _require_onboarding_access().
+    if tenant.has_project_manager_access and onboarding.project_manager_id == tenant.user.id:
         return
     raise AppException(_REVIEWER_ONLY)
 

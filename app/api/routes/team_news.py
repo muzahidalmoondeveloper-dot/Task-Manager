@@ -3,6 +3,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.team_access import require_team_access
 from app.core.tenant import TenantContext, get_tenant_context
 from app.models.team_news import TeamNews, TeamNewsLink
 from app.repositories.team_repository import TeamRepository
@@ -12,10 +13,13 @@ router = APIRouter(prefix="/teams/{team_id}/news", tags=["team-news"])
 
 
 async def _validate_team(db: AsyncSession, tenant: TenantContext, team_id: int) -> None:
-    """Raise 404 if team_id doesn't belong to the caller's org."""
-    team = await TeamRepository(db, tenant.organization_id).get_by_id(team_id)
+    """Raise 404 if team_id doesn't belong to the caller's org, then 403 if
+    the caller isn't assigned to it (see app.core.team_access)."""
+    repo = TeamRepository(db, tenant.organization_id)
+    team = await repo.get_by_id(team_id)
     if team is None:
         raise HTTPException(status_code=404, detail="Team not found")
+    await require_team_access(tenant, repo, team_id)
 
 
 def _apply_links(news: TeamNews, links: list[NewsLinkIn]) -> None:
@@ -31,6 +35,7 @@ async def list_news(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    await require_team_access(tenant, TeamRepository(db, tenant.organization_id), team_id)
     result = await db.execute(
         select(TeamNews)
         .where(
@@ -68,6 +73,7 @@ async def update_news(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    await require_team_access(tenant, TeamRepository(db, tenant.organization_id), team_id)
     result = await db.execute(
         select(TeamNews).where(
             TeamNews.id == news_id,
@@ -106,6 +112,7 @@ async def delete_news(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    await require_team_access(tenant, TeamRepository(db, tenant.organization_id), team_id)
     result = await db.execute(
         select(TeamNews).where(
             TeamNews.id == news_id,

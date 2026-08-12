@@ -37,7 +37,7 @@ _ALREADY_REVIEWED = ErrorDef(code="TASK_REQUEST_ALREADY_REVIEWED", status=http_s
 async def _require_is_staff(tenant: TenantContext, project_repo: ProjectRepository, project_id: int) -> None:
     if tenant.is_manager_or_above:
         return
-    if tenant.org_role == PROJECT_MANAGER and await project_repo.is_member(project_id, tenant.user.id):
+    if tenant.has_project_manager_access and await project_repo.is_member(project_id, tenant.user.id):
         return
     raise AppException(_STAFF_ONLY)
 
