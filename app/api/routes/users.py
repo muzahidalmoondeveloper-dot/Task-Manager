@@ -5,13 +5,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth_errors import AppException, AuthError, ErrorDef
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
-from app.core.org_roles import OWNER, TEAM_MANAGER
+from app.core.org_roles import CLIENT, OWNER, TEAM_MANAGER
 from app.core.security import hash_password, validate_password_strength, verify_password
 from app.core.tenant import TenantContext, get_tenant_context, require_org_admin, require_org_owner
 from app.models.user import User
 from app.repositories.organization_repository import OrganizationRepository
+from app.repositories.task_request_repository import TaskRequestRepository
 from app.repositories.team_repository import TeamRepository
 from app.repositories.user_repository import UserRepository
+from app.schemas.task_request import ClientTaskRequestOut
 from app.schemas.user import ChangePasswordRequest, SelfProfileUpdate, UserCreate, UserRead, UserUpdate
 
 router = APIRouter(prefix="/users", tags=["Users"])
@@ -21,6 +23,7 @@ _EMAIL_EXISTS = ErrorDef(code="EMAIL_EXISTS", status=http_status.HTTP_409_CONFLI
 _CANNOT_DELETE_SELF = ErrorDef(code="CANNOT_DELETE_SELF", status=http_status.HTTP_400_BAD_REQUEST, message="You cannot delete your own account.")
 _CANNOT_CHANGE_OWNER_ROLE = ErrorDef(code="CANNOT_CHANGE_OWNER_ROLE", status=http_status.HTTP_400_BAD_REQUEST, message="The organization owner's role cannot be changed. Transfer ownership first.")
 _INVALID_CURRENT_PASSWORD = ErrorDef(code="INVALID_CURRENT_PASSWORD", status=http_status.HTTP_400_BAD_REQUEST, message="Current password is incorrect.")
+_NOT_A_CLIENT = ErrorDef(code="USER_NOT_A_CLIENT", status=http_status.HTTP_400_BAD_REQUEST, message="This user is not a client.")
 
 
 def _still_manages_teams_error(team_names: list[str]) -> ErrorDef:
@@ -90,6 +93,32 @@ async def list_users(
             "is_project_manager": membership.is_project_manager,
         })
         for membership, user in members
+    ]
+
+
+@router.get("/{user_id}/task-requests", response_model=list[ClientTaskRequestOut])
+async def list_client_task_requests(
+    user_id: int,
+    tenant: TenantContext = Depends(require_org_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """A client's task requests across every project they belong to — the
+    "normal list" shown in place of a scoreboard on the Users page, since
+    clients (unlike staff) don't have one."""
+    org_repo = OrganizationRepository(db)
+    membership = await org_repo.get_membership(tenant.organization_id, user_id)
+    if membership is None:
+        raise AppException(_USER_NOT_FOUND)
+    if membership.role != CLIENT:
+        raise AppException(_NOT_A_CLIENT)
+
+    repo = TaskRequestRepository(db, tenant.organization_id)
+    requests = await repo.list_for_client(user_id)
+    return [
+        ClientTaskRequestOut.model_validate(r).model_copy(
+            update={"project_name": r.project.name if r.project else None}
+        )
+        for r in requests
     ]
 
 

@@ -21,6 +21,13 @@ class TaskRequestRepository(TenantRepository):
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
 
+    async def list_for_client(self, client_user_id: int) -> list[TaskRequest]:
+        """Every task request a given client has submitted, across all of
+        their projects — used by the Users page's client detail view."""
+        stmt = self._base_stmt().where(TaskRequest.submitted_by_id == client_user_id).order_by(TaskRequest.created_at.desc())
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+
     async def get_by_id(self, request_id: int) -> TaskRequest | None:
         stmt = self._base_stmt().where(TaskRequest.id == request_id).execution_options(populate_existing=True)
         result = await self.db.execute(stmt)

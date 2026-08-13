@@ -43,3 +43,11 @@ class TaskRequestOut(BaseModel):
     reviewed_by: UserRead | None = None
 
     model_config = {"from_attributes": True}
+
+
+class ClientTaskRequestOut(TaskRequestOut):
+    """TaskRequestOut plus the project name — used by the Users page's
+    client detail view, which lists a client's requests across every
+    project they belong to (the plain project_id alone isn't enough there
+    since there's no single project context on screen)."""
+    project_name: str | None = None
