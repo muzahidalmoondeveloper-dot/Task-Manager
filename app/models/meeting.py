@@ -59,6 +59,24 @@ class Meeting(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
+    # Live recording/transcription/AI-task-extraction — the audio itself is
+    # never stored server-side (captured + transcribed entirely client-side,
+    # provider-agnostic per the app's "no hardcoded transcription vendor"
+    # decision); only the resulting text lands here. `is_recording` is purely
+    # an informational flag (drives the UI badge across participants via the
+    # normal meeting sync poll) — actual capture start/stop happens in the
+    # browser regardless of whether this flag round-trips in time.
+    is_recording: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    transcript_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Set once AI task extraction has run against the current transcript —
+    # guards against re-extracting (and duplicating) tasks if recording is
+    # stopped/started more than once in the same meeting.
+    transcript_analyzed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Set once the scheduled-start reminder notification has been sent to
+    # every assigned attendee — guards the reminder scheduler job against
+    # re-notifying on every subsequent tick once it's fired for a meeting.
+    reminder_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     organizer = relationship("User", foreign_keys=[organizer_id], lazy="selectin")
     project = relationship("Project", foreign_keys=[project_id], lazy="selectin")
     participants: Mapped[list["MeetingParticipant"]] = relationship(

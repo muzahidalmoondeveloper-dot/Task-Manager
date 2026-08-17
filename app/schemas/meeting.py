@@ -281,9 +281,36 @@ class MeetingOut(BaseModel):
     started_at: Optional[datetime] = None
     paused_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
+    is_recording: bool = False
+    transcript_text: Optional[str] = None
+    transcript_analyzed_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
     model_config = {"from_attributes": True}
+
+
+# ─── Recording / Transcript / AI task extraction ───────────────────────────────
+
+class TranscriptSubmit(BaseModel):
+    """The client-side (browser) speech-to-text result, sent once recording
+    stops. Always the full transcript accumulated so far (not just the
+    latest delta) — the extraction endpoint re-analyzes the whole thing and
+    relies on title-based de-duplication against already-created meeting
+    to-dos, so re-submitting an extended transcript after a second
+    record/stop cycle in the same meeting is safe."""
+    text: str = Field(min_length=1)
+
+
+class ExtractedTaskSummary(BaseModel):
+    title: str
+    assignee_id: Optional[int] = None
+    assignee_name: Optional[str] = None
+    due_date: Optional[date] = None
+
+
+class TranscriptAnalyzeResult(BaseModel):
+    meeting: MeetingOut
+    tasks_created: list[ExtractedTaskSummary]
 
 
 class MeetingSummaryOut(BaseModel):
@@ -329,3 +356,26 @@ class SuggestedTasksOut(BaseModel):
     overdue: list[TaskRef] = []
     high_priority: list[TaskRef] = []
     unresolved_issues: list[IssueRef] = []
+
+
+# ─── Live reactions (ephemeral — Redis-backed, never persisted to Postgres) ───
+
+REACTION_EMOJIS = {"👍", "👏", "❤️", "😊"}
+
+
+class MeetingReactionCreate(BaseModel):
+    emoji: str
+
+    @field_validator("emoji")
+    @classmethod
+    def validate_emoji(cls, v: str) -> str:
+        if v not in REACTION_EMOJIS:
+            raise ValueError(f"emoji must be one of: {', '.join(sorted(REACTION_EMOJIS))}")
+        return v
+
+
+class MeetingReactionOut(BaseModel):
+    id: int
+    emoji: str
+    user_id: int
+    ts: float

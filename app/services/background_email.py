@@ -265,3 +265,27 @@ async def bg_send_task_request_reviewed(
             )
     except Exception:
         logger.exception("bg_send_task_request_reviewed FAILED | request_id=%s", task_request_id)
+
+
+# ─── 9. Meeting summary (Conclude section "Send email summary") ─────────────
+
+async def bg_send_meeting_summary(meeting_id: int, recipient_id: int) -> None:
+    logger.info(
+        "bg_send_meeting_summary START | meeting_id=%s | recipient_id=%s",
+        meeting_id, recipient_id,
+    )
+    try:
+        async with AsyncSessionLocal() as db:
+            from app.models.meeting import Meeting  # local import: avoids a module-load cycle with meetings.py
+            result = await db.execute(select(Meeting).where(Meeting.id == meeting_id))
+            meeting = result.scalar_one_or_none()
+            recipient = await UserRepository(db).get_by_id(recipient_id)
+            if not (meeting and recipient):
+                logger.warning(
+                    "bg_send_meeting_summary: missing data | meeting=%s recipient=%s",
+                    meeting_id, recipient_id,
+                )
+                return
+            await email_service.send_meeting_summary(db, meeting=meeting, recipient=recipient)
+    except Exception:
+        logger.exception("bg_send_meeting_summary FAILED | meeting_id=%s", meeting_id)

@@ -29,6 +29,12 @@ class Notification(Base):
         index=True,
     )
 
+    meeting_id: Mapped[int | None] = mapped_column(
+        ForeignKey("meetings.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
 
@@ -49,3 +55,4 @@ class Notification(Base):
 
     user = relationship("User", foreign_keys=[user_id])
     task = relationship("Task", foreign_keys=[task_id])
+    meeting = relationship("Meeting", foreign_keys=[meeting_id])

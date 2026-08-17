@@ -1126,5 +1126,92 @@ class EmailService:
         except Exception as exc:
             logger.exception("send_due_date_reminder failed | task=%s: %s", task.id, exc)
 
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def send_meeting_summary(
+        self,
+        db: AsyncSession,
+        *,
+        meeting,
+        recipient,
+    ) -> None:
+        """"Send email summary" from the Conclude section of a Level 10-style
+        live meeting — one email per participant, deduped per meeting per
+        day (a meeting only concludes once, but this guards a double-click
+        of the same "End Meeting" action from sending twice)."""
+        today = date.today().isoformat()
+        dedup_key = f"meeting_summary:{meeting.id}:{recipient.email}:{today}"
+
+        try:
+            if await self._is_duplicate(db, dedup_key):
+                logger.info(
+                    "send_meeting_summary SKIP (duplicate) | meeting_id=%s | to=%s",
+                    meeting.id, recipient.email,
+                )
+                return
+
+            decisions = [d.content for d in meeting.decisions]
+            action_items = [mt.task.name if mt.task else f"Task #{mt.task_id}" for mt in meeting.meeting_tasks]
+
+            decisions_html = (
+                "<ul style='margin:0;padding-left:18px;'>" + "".join(f"<li style='margin:4px 0;'>{d}</li>" for d in decisions) + "</ul>"
+                if decisions else "<p style='margin:0;color:#94a3b8;'>No decisions recorded.</p>"
+            )
+            actions_html = (
+                "<ul style='margin:0;padding-left:18px;'>" + "".join(f"<li style='margin:4px 0;'>{a}</li>" for a in action_items) + "</ul>"
+                if action_items else "<p style='margin:0;color:#94a3b8;'>No action items recorded.</p>"
+            )
+            accent_block = (
+                f'<table cellpadding="0" cellspacing="0" border="0" style="width:100%;margin:20px 0;">'
+                f'<tr><td style="padding:14px 18px;background:#f0fdfa;border-left:4px solid #14b8a6;border-radius:0 8px 8px 0;">'
+                f'<p style="margin:0 0 6px;font-size:13px;font-weight:700;color:#0f766e;">Decisions</p>{decisions_html}'
+                f'</td></tr></table>'
+                f'<table cellpadding="0" cellspacing="0" border="0" style="width:100%;">'
+                f'<tr><td style="padding:14px 18px;background:#fffbeb;border-left:4px solid #f59e0b;border-radius:0 8px 8px 0;">'
+                f'<p style="margin:0 0 6px;font-size:13px;font-weight:700;color:#b45309;">Action Items</p>{actions_html}'
+                f'</td></tr></table>'
+            )
+
+            subject = f"Meeting Summary: {meeting.title}"
+            html = self._build_html(
+                subject=subject,
+                headline="Meeting wrapped up",
+                body_paragraphs=[
+                    f"Hi {recipient.full_name},",
+                    f"Here's a recap of <strong>{meeting.title}</strong>, held {_fmt_date(meeting.scheduled_at.date())}.",
+                ],
+                details=[
+                    ("Duration", f"{meeting.duration_minutes} min"),
+                    ("Attendees", str(len(meeting.participants))),
+                ],
+                cta_url=f"{settings.FRONTEND_BASE_URL}/meetings",
+                cta_label="View Meetings",
+                accent_block=accent_block,
+            )
+
+            success, err = self._send_smtp(
+                to_email=recipient.email,
+                subject=subject,
+                html_body=html,
+                event_type="meeting_summary",
+            )
+            await self._log(
+                db,
+                task_id=None,
+                recipient_user_id=recipient.id,
+                recipient_email=recipient.email,
+                event_type="meeting_summary",
+                dedup_key=dedup_key,
+                success=success,
+                error_message=err,
+            )
+            logger.info(
+                "send_meeting_summary DONE | meeting_id=%s | recipient_id=%s | to=%s | success=%s",
+                meeting.id, recipient.id, recipient.email, success,
+            )
+
+        except Exception as exc:
+            logger.exception("send_meeting_summary FAILED | meeting_id=%s: %s", meeting.id, exc)
+
 
 email_service = EmailService()
