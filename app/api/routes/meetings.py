@@ -1,13 +1,17 @@
 import random
 from datetime import date, datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import or_, select
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.meeting_reactions import list_reactions_since, push_reaction
+from app.core.redis_client import get_redis
 from app.core.tenant import TenantContext, get_tenant_context
 from app.models.issue import Issue
+from app.models.notification import Notification
+from app.services.background_email import bg_send_meeting_summary
 from app.models.meeting import (
     Meeting, MeetingParticipant, MeetingAgendaItem,
     MeetingNote, MeetingDecision, MeetingTask, MeetingTemplate,
@@ -23,6 +27,8 @@ from app.schemas.meeting import (
     MeetingSummaryOut,
     MeetingParticipantOut, ParticipantJoinUpdate, ParticipantScoreUpdate, SelectSpeakerRequest,
     MeetingTemplateCreate, MeetingTemplateOut, SuggestedTasksOut,
+    MeetingReactionCreate, MeetingReactionOut,
+    TranscriptSubmit, TranscriptAnalyzeResult, ExtractedTaskSummary,
 )
 
 # Meetings are not team-specific — one flat router, `team_id` is an optional
@@ -267,6 +273,53 @@ async def suggested_tasks(
     )
 
 
+async def _title_exists(db: AsyncSession, org_id, title: str, *, exclude_meeting_id: int | None = None) -> bool:
+    """Case-insensitive org-wide title collision check, backing both the
+    live inline validation on Create Meeting and the create-time guard
+    below. `exclude_meeting_id` lets a rename (PATCH) check against every
+    *other* meeting without tripping on itself."""
+    q = select(Meeting.id).where(
+        Meeting.organization_id == org_id,
+        func.lower(Meeting.title) == title.strip().lower(),
+    )
+    if exclude_meeting_id is not None:
+        q = q.where(Meeting.id != exclude_meeting_id)
+    result = await db.execute(q.limit(1))
+    return result.scalar_one_or_none() is not None
+
+
+@router.get("/check-title")
+async def check_meeting_title(
+    title: str = Query(..., min_length=1),
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Backs the inline "This Meeting Name exists in your organization"
+    validation on the Create Meeting page — checked as the user types,
+    ahead of the same check enforced again (authoritatively) at submit."""
+    return {"exists": await _title_exists(db, tenant.organization_id, title)}
+
+
+# Meetings aren't visible org-wide by default any more — a caller can only
+# see/act on a meeting they organize, are an explicitly-added attendee of,
+# or (for managers/PMs, who can also create meetings) any meeting at all.
+# This is the single source of truth both list_meetings and _get_meeting
+# below consult, so "which meetings can I see" and "can I open this one
+# directly by id" never drift apart.
+def _can_manage_all_meetings(tenant: TenantContext) -> bool:
+    return tenant.is_manager_or_above or tenant.has_project_manager_access
+
+
+async def _is_meeting_participant(db: AsyncSession, meeting_id: int, user_id: int) -> bool:
+    result = await db.execute(
+        select(MeetingParticipant.id).where(
+            MeetingParticipant.meeting_id == meeting_id,
+            MeetingParticipant.user_id == user_id,
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
 async def _get_meeting(meeting_id: int, tenant: TenantContext, db: AsyncSession) -> Meeting:
     result = await db.execute(
         select(Meeting).where(
@@ -277,6 +330,15 @@ async def _get_meeting(meeting_id: int, tenant: TenantContext, db: AsyncSession)
     meeting = result.scalar_one_or_none()
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
+
+    if not _can_manage_all_meetings(tenant):
+        is_organizer = meeting.organizer_id == tenant.user.id
+        if not is_organizer and not await _is_meeting_participant(db, meeting.id, tenant.user.id):
+            # Same 404 as "doesn't exist" (not 403) — a plain team member
+            # has no business learning that a meeting they weren't invited
+            # to even exists, matching this app's usual not-found convention.
+            raise HTTPException(status_code=404, detail="Meeting not found")
+
     return meeting
 
 
@@ -288,6 +350,41 @@ async def _team_names(db: AsyncSession, team_ids: set) -> dict:
     return {row[0]: row[1] for row in result.all()}
 
 
+# ─── Meeting-related notifications ─────────────────────────────────────────────
+# Three distinct triggers per the access/notifications spec: (1) added as an
+# attendee, (2) the scheduled start time arrives (see the scheduler job,
+# app.services.automation_scheduler.run_meeting_start_reminders), and
+# (3) someone actually starts the meeting. All three write plain
+# Notification rows (no meeting_id != None the frontend can special-case
+# for a "go to this meeting" click, same pattern as task_id/project_id).
+
+def _notify_added_as_attendee(db: AsyncSession, meeting: Meeting, user_ids: set[int], *, actor_id: int) -> None:
+    when = meeting.scheduled_at.strftime("%b %d, %Y at %I:%M %p UTC")
+    for user_id in user_ids:
+        if user_id is None or user_id == actor_id:
+            continue  # the person doing the inviting doesn't need to be told
+        db.add(Notification(
+            user_id=user_id,
+            meeting_id=meeting.id,
+            title="Added to a meeting",
+            message=f'You were added to "{meeting.title}", scheduled for {when}.',
+            type="meeting_invite",
+        ))
+
+
+def _notify_meeting_started(db: AsyncSession, meeting: Meeting, *, actor_id: int) -> None:
+    for participant in meeting.participants:
+        if participant.user_id is None or participant.user_id == actor_id:
+            continue  # the person who started it doesn't need to be told
+        db.add(Notification(
+            user_id=participant.user_id,
+            meeting_id=meeting.id,
+            title="Meeting started",
+            message=f'"{meeting.title}" has started.',
+            type="meeting_started",
+        ))
+
+
 # ─── CRUD ─────────────────────────────────────────────────────────────────────
 
 @router.get("", response_model=list[MeetingOut])
@@ -297,26 +394,25 @@ async def list_meetings(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    """Meetings this caller can see. With `team_id`, scoped to that one team
-    (any org member — matches the prior per-team-tab behavior). Without it,
-    org-wide: Owner/Admin/Team Manager see every meeting; everyone else
-    sees org-wide-visible meetings, meetings for teams they belong to, and
-    any meeting they organize or are invited to."""
+    """Meetings this caller can see. Owner/Admin/Team Manager/Project
+    Manager (anyone who can also create meetings) see every meeting in the
+    org. Everyone else — plain team members and clients — only see meetings
+    they organize or have been explicitly added to as an attendee; there is
+    no more org-wide-visibility or same-team broadening for them, since
+    access is meant to be scoped to exactly the meetings someone was
+    assigned to, not their team membership. `team_id` further narrows
+    within whichever of those sets the caller can already see."""
     q = select(Meeting).where(Meeting.organization_id == tenant.organization_id)
+
+    if not _can_manage_all_meetings(tenant):
+        participant_meeting_ids = select(MeetingParticipant.meeting_id).where(MeetingParticipant.user_id == tenant.user.id)
+        q = q.where(or_(
+            Meeting.organizer_id == tenant.user.id,
+            Meeting.id.in_(participant_meeting_ids),
+        ))
 
     if team_id is not None:
         q = q.where(Meeting.team_id == team_id)
-    elif not tenant.is_manager_or_above:
-        team_repo = TeamRepository(db, tenant.organization_id)
-        my_teams = await team_repo.list_for_member(tenant.user.id)
-        my_team_ids = [t.id for t in my_teams]
-        participant_meeting_ids = select(MeetingParticipant.meeting_id).where(MeetingParticipant.user_id == tenant.user.id)
-        q = q.where(or_(
-            Meeting.visibility == "organization",
-            Meeting.organizer_id == tenant.user.id,
-            Meeting.id.in_(participant_meeting_ids),
-            Meeting.team_id.in_(my_team_ids) if my_team_ids else False,
-        ))
 
     if filter == "ongoing":
         q = q.where(Meeting.status == "ongoing")
@@ -341,10 +437,22 @@ async def create_meeting(
     db: AsyncSession = Depends(get_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    # Owner/Admin, Team Manager, or Project Manager (role OR granted flag,
+    # same flag-aware idiom used everywhere else in this app) — plain team
+    # members and clients can join/view a meeting but not create one.
+    if not (tenant.is_manager_or_above or tenant.has_project_manager_access):
+        raise HTTPException(status_code=403, detail="You don't have permission to create meetings.")
+
     if payload.team_id is not None:
         team_repo = TeamRepository(db, tenant.organization_id)
         if await team_repo.get_by_id(payload.team_id) is None:
             raise HTTPException(status_code=404, detail="Team not found")
+
+    # Authoritative re-check (the Create Meeting page also checks live via
+    # GET /meetings/check-title as the user types) — this is the one that
+    # actually blocks a race between two people typing the same name at once.
+    if await _title_exists(db, tenant.organization_id, payload.title):
+        raise HTTPException(status_code=409, detail="This Meeting Name exists in your organization. Please select a different name.")
 
     meeting = Meeting(
         team_id=payload.team_id,
@@ -370,6 +478,8 @@ async def create_meeting(
         if user_id not in seen:
             db.add(MeetingParticipant(meeting_id=meeting.id, user_id=user_id))
             seen.add(user_id)
+
+    _notify_added_as_attendee(db, meeting, seen, actor_id=tenant.user.id)
 
     # Agenda Builder — sections assembled in the create form are submitted
     # together with the meeting itself rather than requiring N follow-up
@@ -416,6 +526,7 @@ async def update_meeting(
     tenant: TenantContext = Depends(get_tenant_context),
 ):
     meeting = await _get_meeting(meeting_id, tenant, db)
+    previously_participating = {p.user_id for p in meeting.participants if p.user_id is not None}
 
     for field, value in payload.model_dump(exclude_none=True, exclude={"participant_ids"}).items():
         setattr(meeting, field, value)
@@ -429,6 +540,12 @@ async def update_meeting(
             if user_id not in seen:
                 db.add(MeetingParticipant(meeting_id=meeting.id, user_id=user_id))
                 seen.add(user_id)
+
+        # Only whoever is newly added gets the "added to a meeting"
+        # notification — re-saving the same attendee list (or a self-join
+        # that folds the caller into an unrelated update) never re-notifies
+        # anyone already on it.
+        _notify_added_as_attendee(db, meeting, seen - previously_participating, actor_id=tenant.user.id)
 
     await db.commit()
     await db.refresh(meeting)
@@ -624,12 +741,18 @@ async def start_meeting(
             await db.flush()
         starter.joined_at = datetime.now(timezone.utc)
     meeting.status = "ongoing"
-    if not meeting.started_at:
+    is_first_start = meeting.started_at is None
+    if is_first_start:
         meeting.started_at = datetime.now(timezone.utc)
         if meeting.current_agenda_item_id is None and meeting.agenda_items:
             first_pending = next((a for a in meeting.agenda_items if a.status != "done"), None)
             if first_pending:
                 meeting.current_agenda_item_id = first_pending.id
+        # Only the genuine first start notifies — resuming from a pause
+        # goes through this same route but `started_at` is already set by
+        # then, so attendees aren't re-notified every time the meeting is
+        # paused and resumed.
+        _notify_meeting_started(db, meeting, actor_id=tenant.user.id)
     meeting.paused_at = None
     await db.commit()
     return await _get_meeting(meeting_id, tenant, db)
@@ -681,6 +804,24 @@ async def end_meeting(
     await db.commit()
     await db.refresh(meeting)
     return meeting
+
+
+@router.post("/{meeting_id}/send-summary", status_code=status.HTTP_202_ACCEPTED)
+async def send_meeting_summary(
+    meeting_id: int,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """"Send email summary" — Conclude section, End Meeting. Emails every
+    participant with an email address (recorded decisions + action items);
+    fire-and-forget, same pattern as every other transactional email in
+    this app (see app.services.background_email)."""
+    meeting = await _get_meeting(meeting_id, tenant, db)
+    recipient_ids = {p.user_id for p in meeting.participants if p.user_id}
+    for recipient_id in recipient_ids:
+        background_tasks.add_task(bg_send_meeting_summary, meeting_id, recipient_id)
+    return {"queued": len(recipient_ids)}
 
 
 # ─── Agenda ───────────────────────────────────────────────────────────────────
@@ -786,6 +927,56 @@ async def advance_agenda(
 
     await db.commit()
     return await _get_meeting(meeting_id, tenant, db)
+
+
+@router.post("/{meeting_id}/agenda/{item_id}/select", response_model=MeetingOut)
+async def select_agenda_item(
+    meeting_id: int,
+    item_id: int,
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Jump the live "current section" pointer directly to `item_id` —
+    clicking an agenda item in the sidebar, as opposed to `.../agenda/next`
+    (the sequential "Next" button), which also marks the outgoing item done.
+    Pure navigation: no status changes, can move forward or back freely."""
+    meeting = await _get_meeting(meeting_id, tenant, db)
+    item = next((a for a in meeting.agenda_items if a.id == item_id), None)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Agenda item not found")
+    meeting.current_agenda_item_id = item.id
+    await db.commit()
+    return await _get_meeting(meeting_id, tenant, db)
+
+
+# ─── Live reactions (ephemeral, Redis-backed — see app.core.meeting_reactions) ─
+
+@router.post("/{meeting_id}/reactions", response_model=MeetingReactionOut, status_code=status.HTTP_201_CREATED)
+async def send_meeting_reaction(
+    meeting_id: int,
+    payload: MeetingReactionCreate,
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    await _get_meeting(meeting_id, tenant, db)
+    redis = await get_redis()
+    entry = await push_reaction(redis, meeting_id, payload.emoji, tenant.user.id)
+    return entry
+
+
+@router.get("/{meeting_id}/reactions", response_model=list[MeetingReactionOut])
+async def list_meeting_reactions(
+    meeting_id: int,
+    since: int = Query(default=0),
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Polled every ~2s by anyone with this meeting's live panel open,
+    alongside the existing GET /meetings/{id} sync poll — `since` is the
+    highest reaction id that caller has already rendered."""
+    await _get_meeting(meeting_id, tenant, db)
+    redis = await get_redis()
+    return await list_reactions_since(redis, meeting_id, since)
 
 
 # ─── Notes ────────────────────────────────────────────────────────────────────
@@ -968,6 +1159,136 @@ async def link_meeting_task(
         await db.commit()
         await db.refresh(meeting_task)
     return meeting_task
+
+
+# ─── Recording / Transcript / AI Task Extraction ───────────────────────────────
+# Audio capture + speech-to-text happen entirely client-side (the browser's
+# own speech recognition produces the text) — deliberately not routed
+# through any specific transcription vendor, so this backend never stores
+# or processes audio. The backend's job starts once there's text: store it,
+# then hand it to the *existing*, already provider-agnostic AITaskExtractor
+# (the same engine that already powers email/meeting-transcript task
+# suggestions elsewhere in this app via `get_llm_provider()`) to pull out
+# clear action items and create them as real meeting to-dos, reusing the
+# exact same Task + MeetingTask creation path as create_meeting_task above.
+
+@router.post("/{meeting_id}/recording/start", response_model=MeetingOut)
+async def start_recording(
+    meeting_id: int,
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Purely an informational flag — it just lets every participant's
+    meeting sync poll show a "Recording" badge. The actual audio capture is
+    started/stopped in the browser regardless of this call's outcome."""
+    meeting = await _get_meeting(meeting_id, tenant, db)
+    meeting.is_recording = True
+    await db.commit()
+    await db.refresh(meeting)
+    return meeting
+
+
+@router.post("/{meeting_id}/recording/cancel", response_model=MeetingOut)
+async def cancel_recording(
+    meeting_id: int,
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Discards an in-progress recording — unlike .../stop, no transcript is
+    submitted and no AI extraction runs. The client-side transcript text is
+    simply thrown away; this call only clears the "Recording" badge."""
+    meeting = await _get_meeting(meeting_id, tenant, db)
+    meeting.is_recording = False
+    await db.commit()
+    await db.refresh(meeting)
+    return meeting
+
+
+async def _extract_and_create_tasks(
+    meeting: Meeting, tenant: TenantContext, db: AsyncSession,
+) -> list[ExtractedTaskSummary]:
+    from app.services.ai_task_extractor import AITaskExtractor
+    from app.services.automation_tasks import resolve_user_id
+    from app.repositories.user_repository import UserRepository
+
+    if not meeting.transcript_text or not meeting.transcript_text.strip():
+        return []
+
+    users = await UserRepository(db).list_all()
+    known_users = [{"name": u.full_name, "email": u.email} for u in users]
+
+    extractor = AITaskExtractor()
+    extracted_tasks, _ = await extractor.extract_tasks(
+        source_type="meeting_transcript",
+        source_title=meeting.title,
+        source_text=meeting.transcript_text,
+        known_users=known_users,
+    )
+
+    # Title-based de-dup against to-dos this meeting already has — guards
+    # against re-creating the same action items if recording is stopped
+    # and restarted more than once in the same meeting (the client always
+    # resubmits the *full* accumulated transcript, not just the new part).
+    existing_names = {mt.task.name.strip().lower() for mt in meeting.meeting_tasks if mt.task}
+
+    summaries: list[ExtractedTaskSummary] = []
+    for extracted in extracted_tasks:
+        title_key = extracted.title.strip().lower()
+        if not title_key or title_key in existing_names:
+            continue
+
+        assignee_id = resolve_user_id(
+            users, extracted.suggested_assignee_name, extracted.suggested_assignee_email,
+        )
+        assignee = next((u for u in users if u.id == assignee_id), None) if assignee_id else None
+
+        task = Task(
+            name=extracted.title,
+            assignee_id=assignee_id,
+            due_date=extracted.suggested_due_date,
+            priority="medium",
+            team_id=meeting.team_id,
+            organization_id=tenant.organization_id,
+            created_by_id=tenant.user.id,
+            status="todo",
+        )
+        db.add(task)
+        await db.flush()
+        db.add(MeetingTask(meeting_id=meeting.id, task_id=task.id))
+
+        existing_names.add(title_key)
+        summaries.append(ExtractedTaskSummary(
+            title=extracted.title,
+            assignee_id=assignee_id,
+            assignee_name=assignee.full_name if assignee else None,
+            due_date=extracted.suggested_due_date,
+        ))
+
+    return summaries
+
+
+@router.post("/{meeting_id}/recording/stop", response_model=TranscriptAnalyzeResult)
+async def stop_recording(
+    meeting_id: int,
+    payload: TranscriptSubmit,
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Stop + transcript + AI analysis + to-do creation as one call — the
+    user's action is a single "Stop Recording" click, not a multi-step
+    review-then-confirm flow, per the request that detected tasks are
+    created automatically."""
+    meeting = await _get_meeting(meeting_id, tenant, db)
+    meeting.is_recording = False
+    meeting.transcript_text = payload.text
+    await db.flush()
+
+    tasks_created = await _extract_and_create_tasks(meeting, tenant, db)
+
+    meeting.transcript_analyzed_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(meeting)
+    return TranscriptAnalyzeResult(meeting=meeting, tasks_created=tasks_created)
 
 
 # ─── Summary ──────────────────────────────────────────────────────────────────

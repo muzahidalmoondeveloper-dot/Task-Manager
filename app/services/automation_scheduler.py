@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.core.database import AsyncSessionLocal
+from app.models.meeting import Meeting
 from app.models.notification import Notification
 from app.models.task import Task
 from app.models.team import Team
@@ -242,6 +243,56 @@ async def run_daily_copilot_brief() -> None:
     logger.info("Scheduler: daily copilot brief END")
 
 
+# ─── Job: meeting start reminders ────────────────────────────────────────────
+
+async def run_meeting_start_reminders() -> None:
+    """In-app reminder for every assigned attendee once a scheduled
+    meeting's start time arrives. Runs every minute; `Meeting.reminder_sent_at`
+    guards against re-notifying on every subsequent tick once a meeting's
+    reminder has fired, and the 10-minute lookback window means a brief
+    scheduler restart around the exact minute doesn't silently skip one."""
+    now = datetime.now(timezone.utc)
+    lookback = now - timedelta(minutes=10)
+
+    logger.info("Scheduler: meeting start reminders START")
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(Meeting)
+                .where(Meeting.status == "scheduled")
+                .where(Meeting.scheduled_at <= now)
+                .where(Meeting.scheduled_at >= lookback)
+                .where(Meeting.reminder_sent_at.is_(None))
+                .options(selectinload(Meeting.participants))
+            )
+            meetings = list(result.scalars().all())
+            logger.info("Scheduler: meetings due for a start reminder: %s", len(meetings))
+
+            for meeting in meetings:
+                recipient_ids = {p.user_id for p in meeting.participants if p.user_id is not None}
+                for user_id in recipient_ids:
+                    db.add(
+                        Notification(
+                            user_id=user_id,
+                            meeting_id=meeting.id,
+                            title="Meeting starting now",
+                            message=f'"{meeting.title}" is scheduled to start now.',
+                            type="meeting_reminder",
+                        )
+                    )
+                meeting.reminder_sent_at = now
+                logger.info(
+                    "Scheduler: queued meeting_reminder | meeting_id=%s recipients=%s",
+                    meeting.id, len(recipient_ids),
+                )
+
+            await db.commit()
+    except Exception:
+        logger.exception("Scheduler: meeting start reminders FAILED")
+
+    logger.info("Scheduler: meeting start reminders END")
+
+
 # ─── Scheduler setup ──────────────────────────────────────────────────────────
 
 def start_scheduler() -> None:
@@ -291,6 +342,18 @@ def start_scheduler() -> None:
         hour=7,
         minute=0,
         id="daily_copilot_brief",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Meeting start reminders — every minute, so "when the scheduled time
+    # arrives" is tight enough to feel immediate.
+    scheduler.add_job(
+        run_meeting_start_reminders,
+        trigger="interval",
+        minutes=1,
+        id="meeting_start_reminders",
         replace_existing=True,
         max_instances=1,
         coalesce=True,

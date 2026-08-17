@@ -261,6 +261,29 @@ async def lifespan(app: FastAPI):
         await conn.execute(text(
             "ALTER TABLE meetings ALTER COLUMN team_id DROP NOT NULL"
         ))
+        # Live recording -> transcript -> AI task extraction. No audio is
+        # ever stored server-side — only the transcript text the browser
+        # produces, plus a flag for the "Recording" badge and a timestamp
+        # guarding against re-extracting (and duplicating) tasks.
+        await conn.execute(text(
+            "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS is_recording BOOLEAN NOT NULL DEFAULT false"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS transcript_text TEXT"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS transcript_analyzed_at TIMESTAMPTZ"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meetings ADD COLUMN IF NOT EXISTS reminder_sent_at TIMESTAMPTZ"
+        ))
+        # Notifications can now point at a meeting (attendee-added / meeting-
+        # started / meeting-start-reminder), alongside the existing task_id
+        # and project_id links.
+        await conn.execute(text(
+            "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS meeting_id INTEGER "
+            "REFERENCES meetings(id) ON DELETE CASCADE"
+        ))
         await conn.execute(text(
             "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS billing_interval VARCHAR(20) NOT NULL DEFAULT 'monthly'"
         ))

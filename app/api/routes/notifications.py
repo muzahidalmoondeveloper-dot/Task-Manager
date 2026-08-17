@@ -18,6 +18,7 @@ class NotificationRead(BaseModel):
     id: int
     task_id: int | None
     project_id: int | None
+    meeting_id: int | None = None
     title: str
     message: str
     type: str
