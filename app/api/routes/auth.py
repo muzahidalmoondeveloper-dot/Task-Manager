@@ -11,7 +11,7 @@ from app.core.access_token_bearer import AccessTokenBearer
 from app.core.auth_errors import AppException, AuthError, ErrorDef, TokenError
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
-from app.core.rate_limiter import RateLimiter, get_rate_limiter
+from app.core.rate_limiter import RateLimiter, format_retry_after, get_rate_limiter
 from app.core.redis_client import get_redis
 from app.core.org_roles import TEAM_MEMBER
 from app.core.security import (
@@ -53,6 +53,17 @@ from app.services.auth_security_service import AuthSecurityService, get_client_i
 from fastapi import status as http_status
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
+
+
+async def _rate_limited_error(rate_limiter: RateLimiter, scope: str, request: Request) -> AppException:
+    """Builds the 429 for a tripped rate limit with an actual "try again in
+    X" time whenever the block's remaining TTL is available, instead of the
+    generic "later" — call right after is_rate_limited(scope, request)
+    returns True, with the same scope/request."""
+    retry_after = await rate_limiter.get_retry_after_seconds(scope, request)
+    if retry_after is not None:
+        return AuthError.rate_limited(f"Too many attempts. Please try again in {format_retry_after(retry_after)}.")
+    return AuthError.rate_limited()
 
 
 _INVITATION_EXPIRED = ErrorDef(
@@ -226,7 +237,7 @@ async def register(
     redis: Redis = Depends(get_redis),
 ):
     if await rate_limiter.is_rate_limited("register", request):
-        raise AuthError.rate_limited()
+        raise await _rate_limited_error(rate_limiter, "register", request)
 
     pwd_check = validate_password_strength(payload.password)
     if not pwd_check["valid"]:
@@ -287,7 +298,7 @@ async def verify_register_otp(
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
 ):
     if await rate_limiter.is_rate_limited("verify_otp", request):
-        raise AuthError.rate_limited()
+        raise await _rate_limited_error(rate_limiter, "verify_otp", request)
 
     ip_address = get_client_ip(request)
     security_service = AuthSecurityService(db)
@@ -326,7 +337,7 @@ async def login(
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
 ):
     if await rate_limiter.is_rate_limited("login", request):
-        raise AuthError.rate_limited()
+        raise await _rate_limited_error(rate_limiter, "login", request)
 
     user_repo = UserRepository(db)
     user = await user_repo.get_by_email(payload.email)
@@ -390,7 +401,7 @@ async def verify_login_otp(
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
 ):
     if await rate_limiter.is_rate_limited("verify_otp", request):
-        raise AuthError.rate_limited()
+        raise await _rate_limited_error(rate_limiter, "verify_otp", request)
 
     ip_address = get_client_ip(request)
     security_service = AuthSecurityService(db)
@@ -916,7 +927,7 @@ async def resend_otp(
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
 ):
     if await rate_limiter.is_rate_limited("resend_otp", request):
-        raise AuthError.rate_limited()
+        raise await _rate_limited_error(rate_limiter, "resend_otp", request)
 
     if payload.purpose not in {"register", "login", "reset_password"}:
         raise AuthError.otp_purpose_invalid()
@@ -948,7 +959,7 @@ async def forgot_password(
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
 ):
     if await rate_limiter.is_rate_limited("forgot_password", request):
-        raise AuthError.rate_limited()
+        raise await _rate_limited_error(rate_limiter, "forgot_password", request)
 
     user_repo = UserRepository(db)
     user = await user_repo.get_by_email(str(payload.email))

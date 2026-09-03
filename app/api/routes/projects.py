@@ -9,7 +9,11 @@ from app.api.routes.teams import _serialize as serialize_team
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.database import get_db
 from app.core.org_roles import CLIENT, PROJECT_MANAGER
-from app.core.project_access import is_project_scoped, require_project_access
+from app.core.project_access import (
+    is_project_management_blocked,
+    is_project_scoped,
+    require_project_management_access,
+)
 from app.core.tenant import TenantContext, check_active_billing, get_tenant_context, require_org_admin, require_org_manager
 from app.models.issue import Issue
 from app.models.kpi import KPI
@@ -40,13 +44,19 @@ _CLIENT_FORBIDDEN = ErrorDef(code="CLIENT_ITEMS_FORBIDDEN", status=http_status.H
 
 _LOGO_DIR_NAME = "project_logos"
 
-# is_project_scoped()/require_project_access() now live in
-# app.core.project_access — the single shared source every route touching
+# app.core.project_access is the single shared source every route touching
 # project-scoped data (this file, tasks.py, ...) consults, so the rule
 # can't drift or be forgotten per-route. Kept as module-level aliases here
 # so this file's many existing call sites don't all need renaming.
+#
+# This file specifically uses the *Projects-management-system* variants
+# (require_project_management_access, not the plainer require_project_access
+# tasks.py still uses) — a plain Team Manager must be blocked outright from
+# every route below, never merely membership-scoped, even though a
+# ProjectMembership row may exist for them (see app.core.project_access's
+# module docstring for the full rule).
 _is_project_scoped = is_project_scoped
-_require_project_access = require_project_access
+_require_project_access = require_project_management_access
 
 
 def _serialize_project(project, managers: dict[int, tuple[int, str | None]]) -> ProjectRead:
@@ -60,9 +70,17 @@ def _serialize_project(project, managers: dict[int, tuple[int, str | None]]) -> 
 @router.get("", response_model=list[ProjectRead])
 async def list_projects(tenant: TenantContext = Depends(get_tenant_context)):
     repo = ProjectRepository(tenant.db, tenant.organization_id)
-    projects = (
-        await repo.list_for_user(tenant.user.id) if _is_project_scoped(tenant) else await repo.list_all()
-    )
+    # A plain Team Manager (no Project Manager/Admin capability) sees no
+    # projects here at all — not even ones they hold a ProjectMembership
+    # row on (see app.core.project_access.is_project_management_blocked).
+    # Everyone else keeps the existing rule: membership-scoped for
+    # Project Manager/Client, unrestricted for Owner/Admin/Team Member.
+    if is_project_management_blocked(tenant):
+        projects = []
+    else:
+        projects = (
+            await repo.list_for_user(tenant.user.id) if _is_project_scoped(tenant) else await repo.list_all()
+        )
     # One bulk query for every project's assigned manager (see
     # get_project_managers()'s docstring) instead of N+1 — so the Projects
     # list can show which Project Manager owns each project at a glance.
@@ -73,7 +91,13 @@ async def list_projects(tenant: TenantContext = Depends(get_tenant_context)):
 @router.post("", response_model=ProjectRead, status_code=http_status.HTTP_201_CREATED)
 async def create_project(
     payload: ProjectCreate,
-    tenant: TenantContext = Depends(require_org_manager),
+    # Creating a brand-new Project is organization-wide by nature (there's
+    # no existing project to scope the check against yet) — Owner/Admin
+    # only. Previously require_org_manager (Owner/Admin/Team Manager),
+    # which let a plain Team Manager create arbitrary org-wide projects; a
+    # Team Manager is a team-scoped role and has no project-management
+    # authority by design (see app.core.project_access).
+    tenant: TenantContext = Depends(require_org_admin),
 ):
     check_active_billing(tenant)
     limits = tenant.plan_limits
@@ -289,7 +313,15 @@ async def _pm_user_ids(tenant: TenantContext, user_ids: list[int]) -> set[int]:
 @router.get("/{project_id}/members", response_model=list[ProjectMemberOut])
 async def list_project_members(
     project_id: int,
-    tenant: TenantContext = Depends(require_org_manager),
+    # Backs the staff-only "assign a Project Manager to this project" admin
+    # screen (see docstring below) — an organization-wide project-management
+    # action, not a per-project one, so this had no _require_project_access
+    # scoping to layer on top of a role check in the first place. Owner/
+    # Admin only. Previously require_org_manager (Owner/Admin/Team Manager),
+    # which let a plain Team Manager view/assign/remove the Project Manager
+    # of ANY project in the org — a team-scoped role has no business
+    # reassigning who manages an arbitrary project.
+    tenant: TenantContext = Depends(require_org_admin),
 ):
     """Project Manager assignments only. `ProjectMembership` is also used to
     grant Clients access to a project (see `project_invitations.py`), but
@@ -311,7 +343,7 @@ async def list_project_members(
 async def add_project_member(
     project_id: int,
     payload: ProjectMemberAssign,
-    tenant: TenantContext = Depends(require_org_manager),
+    tenant: TenantContext = Depends(require_org_admin),
 ):
     """A project has exactly one Project Manager — assigning a new one
     replaces whichever Project Manager was previously assigned (Client
@@ -334,7 +366,7 @@ async def add_project_member(
 async def remove_project_member(
     project_id: int,
     user_id: int,
-    tenant: TenantContext = Depends(require_org_manager),
+    tenant: TenantContext = Depends(require_org_admin),
 ):
     repo = ProjectRepository(tenant.db, tenant.organization_id)
     if await repo.get_by_id(project_id) is None:

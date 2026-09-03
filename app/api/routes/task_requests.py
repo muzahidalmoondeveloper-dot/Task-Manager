@@ -35,9 +35,17 @@ _ALREADY_REVIEWED = ErrorDef(code="TASK_REQUEST_ALREADY_REVIEWED", status=http_s
 
 
 async def _require_is_staff(tenant: TenantContext, project_repo: ProjectRepository, project_id: int) -> None:
-    if tenant.is_manager_or_above:
+    """Owner/Admin can review/manage a client task request on any project.
+    A Team Manager or a Project Manager (role or granted flag) may only do
+    so for a project they're explicitly assigned to (ProjectMembership) —
+    matches app.core.project_access's rule that Team Manager has no
+    organization-wide project access. Previously `is_manager_or_above`
+    alone (true for Team Manager) returned early with no project check,
+    letting a plain Team Manager manage client task requests on ANY
+    project in the org."""
+    if tenant.is_admin_or_owner:
         return
-    if tenant.has_project_manager_access and await project_repo.is_member(project_id, tenant.user.id):
+    if (tenant.is_manager_or_above or tenant.has_project_manager_access) and await project_repo.is_member(project_id, tenant.user.id):
         return
     raise AppException(_STAFF_ONLY)
 

@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.database import get_db
 from app.core.org_roles import PROJECT_MANAGER, TEAM_MEMBER
-from app.core.project_access import is_project_scoped, require_project_access
+from app.core.project_access import is_project_scoped, list_project_team_ids, require_project_access
 from app.core.tenant import TenantContext, get_tenant_context, require_org_admin, require_org_manager
 from app.models.notification import Notification
 from app.models.task import Task
@@ -165,6 +165,25 @@ async def create_task(
     if payload.team_id is not None:
         if await team_repo.get_by_id(payload.team_id) is None:
             raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="Selected team is invalid.")
+
+        # A plain Project Manager (not also Owner/Admin/Team Manager) may
+        # only assign a team that's actually associated with the project
+        # they're creating this task under — never an arbitrary org team,
+        # even one that exists and passed the check just above. This is
+        # the write-side enforcement of the same rule the "Assign Team"
+        # dropdown now follows (GET /projects/{id}/items's derived team
+        # list) — the frontend filtering it to the right options is a UX
+        # nicety, not the security boundary; a crafted request must be
+        # rejected the same way. Owners/Admins/Team Managers are unaffected
+        # (unchanged, existing behavior).
+        is_plain_project_manager = tenant.has_project_manager_access and not tenant.is_manager_or_above
+        if is_plain_project_manager and payload.project_id is not None:
+            allowed_team_ids = await list_project_team_ids(db, tenant.organization_id, payload.project_id)
+            if payload.team_id not in allowed_team_ids:
+                raise HTTPException(
+                    status_code=http_status.HTTP_403_FORBIDDEN,
+                    detail="That team is not assignable within this project.",
+                )
 
     task = await task_repo.create(payload, created_by_id=tenant.user.id)
 

@@ -19,13 +19,13 @@ RATE_LIMITS: dict[str, RateLimitConfig] = {
     "register": RateLimitConfig(
         limit=5,
         window_seconds=60,
-        block_seconds=3600,
+        block_seconds=600,
         key_type=RateLimitKey.IP,
     ),
     "login": RateLimitConfig(
         limit=5,
         window_seconds=60,
-        block_seconds=3600,
+        block_seconds=600,
         key_type=RateLimitKey.IP,
     ),
     "resend_otp": RateLimitConfig(
@@ -37,7 +37,7 @@ RATE_LIMITS: dict[str, RateLimitConfig] = {
     "forgot_password": RateLimitConfig(
         limit=5,
         window_seconds=3600,
-        block_seconds=3600,
+        block_seconds=600,
         key_type=RateLimitKey.IP,
     ),
     "verify_otp": RateLimitConfig(
