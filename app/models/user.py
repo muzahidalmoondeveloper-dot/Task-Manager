@@ -37,6 +37,11 @@ class User(Base):
         nullable=False,
     )
 
+    # Servable `/media/...` URL of the user's uploaded avatar (see
+    # app/services/avatar_upload_service.py) — null until the user uploads
+    # one, in which case the frontend falls back to initials.
+    profile_picture_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
     created_teams = relationship(
         "Team",
         foreign_keys="Team.created_by_id",

@@ -9,7 +9,8 @@ from app.api.routes.scoreboard import _require_can_view_scoreboard
 from app.api.routes.team_scoreboard import _get_team_or_404, _require_can_view_team_scoreboard
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.org_roles import CLIENT, TEAM_MEMBER
-from app.core.tenant import TenantContext, get_tenant_context, require_org_manager
+from app.core.project_access import require_project_management_access
+from app.core.tenant import TenantContext, get_tenant_context, require_org_admin, require_org_manager
 from app.models.report import Report, ReportContent
 from app.repositories.project_repository import ProjectRepository
 from app.repositories.report_repository import ReportRepository
@@ -57,6 +58,10 @@ def _is_client_safe(report) -> bool:
 
 
 async def _can_view(tenant: TenantContext, report) -> bool:
+    """Also the write-side gate for update/regenerate/finalize/new-version/
+    delete below — a Team Manager (or anyone else) who can't view a report
+    certainly shouldn't be able to modify it either; this is the single
+    per-report authorization rule for both."""
     if report.report_type == "employee_performance":
         try:
             await _require_can_view_scoreboard(tenant, report.employee_id)
@@ -72,14 +77,39 @@ async def _can_view(tenant: TenantContext, report) -> bool:
         except AppException:
             return False
 
-    if tenant.is_manager_or_above:
+    if tenant.is_admin_or_owner:
         return True
+    # Generic (project) report: explicit Project Manager capability +
+    # ProjectMembership on this specific report's project — same rule
+    # app.core.project_access enforces for the Projects management system.
+    # Previously `is_manager_or_above` alone (true for Team Manager too)
+    # let ANY Team Manager view/manage ANY project's reports, regardless
+    # of whether they had any relationship to that project at all.
+    if tenant.has_project_manager_access:
+        project_repo = ProjectRepository(tenant.db, tenant.organization_id)
+        if await project_repo.is_member(report.project_id, tenant.user.id):
+            return True
     if tenant.org_role == CLIENT:
         if not _is_client_safe(report):
             return False
         project_repo = ProjectRepository(tenant.db, tenant.organization_id)
         return await project_repo.is_member(report.project_id, tenant.user.id)
+    # Last-resort fallback for everyone else (Team Member, Team Manager
+    # without Project Manager/Admin capability, ...): only if the report's
+    # creator explicitly marked it team_visible — an existing, deliberate
+    # per-report visibility flag, unrelated to any role hierarchy, so a
+    # Team Manager gets no more from this branch than a plain Team Member
+    # already does.
     return report.team_visible
+
+
+async def _require_can_view(tenant: TenantContext, report) -> None:
+    """Raise-based wrapper around _can_view() for the write routes below
+    (update/regenerate/finalize/new-version/delete) — previously gated only
+    by require_org_manager (Owner/Admin/Team Manager) with no per-report
+    check at all, letting any Team Manager modify ANY report in the org."""
+    if not await _can_view(tenant, report):
+        raise AppException(ErrorDef(code="REPORT_FORBIDDEN", status=http_status.HTTP_403_FORBIDDEN, message="You do not have access to this report."))
 
 
 @router.get("", response_model=list[ReportListItem])
@@ -101,20 +131,13 @@ async def list_reports(
     if team_id is not None:
         reports = [r for r in reports if r.team_id == team_id]
 
-    if tenant.is_manager_or_above:
-        return reports
-
-    visible = []
-    for r in reports:
-        if r.report_type in _PERFORMANCE_REPORT_TYPES:
-            if await _can_view(tenant, r):
-                visible.append(r)
-        elif tenant.org_role == CLIENT:
-            project_repo = ProjectRepository(tenant.db, tenant.organization_id)
-            if _is_client_safe(r) and await project_repo.is_member(r.project_id, tenant.user.id):
-                visible.append(r)
-        elif r.team_visible:
-            visible.append(r)
+    # Every report is filtered through the same per-report rule _can_view()
+    # already enforces for GET /reports/{id} — including for Owner/Admin,
+    # who simply pass it unconditionally. Previously this short-circuited
+    # on `is_manager_or_above` (true for Team Manager too) and returned the
+    # *entire unfiltered* org-wide report list to any Team Manager, with
+    # none of the per-report project/team/client scoping below ever applied.
+    visible = [r for r in reports if await _can_view(tenant, r)]
     return visible
 
 
@@ -126,6 +149,12 @@ async def create_report(
     project_repo = ProjectRepository(tenant.db, tenant.organization_id)
     if await project_repo.get_by_id(payload.project_id) is None:
         raise AppException(_PROJECT_INVALID)
+    # A generic report is always tied to one project (payload.project_id is
+    # mandatory) — creating one is a project-scoped action, not merely a
+    # "manager tier" one. Same rule as the Projects management system: a
+    # plain Team Manager is blocked outright; a genuine Project Manager
+    # needs ProjectMembership on this exact project; Owner/Admin unrestricted.
+    await require_project_management_access(tenant, project_repo, payload.project_id)
 
     repo = ReportRepository(tenant.db, tenant.organization_id)
     report = await repo.create(payload, created_by_id=tenant.user.id)
@@ -270,13 +299,18 @@ async def list_themes(tenant: TenantContext = Depends(get_tenant_context)):
 
 
 @router.post("/themes", response_model=ReportThemeOut, status_code=http_status.HTTP_201_CREATED)
-async def create_theme(payload: ReportThemeCreate, tenant: TenantContext = Depends(require_org_manager)):
+async def create_theme(payload: ReportThemeCreate, tenant: TenantContext = Depends(require_org_admin)):
+    # Report themes are an organization-wide design setting, shared across
+    # every report in the org — not project- or team-scoped, so this is an
+    # Organization-admin operation (Owner/Admin only), not a Team-Manager-
+    # scoped one. Previously require_org_manager let any Team Manager
+    # create/edit org-wide report themes.
     repo = ReportRepository(tenant.db, tenant.organization_id)
     return await repo.create_theme(payload)
 
 
 @router.patch("/themes/{theme_id}", response_model=ReportThemeOut)
-async def update_theme(theme_id: int, payload: ReportThemeUpdate, tenant: TenantContext = Depends(require_org_manager)):
+async def update_theme(theme_id: int, payload: ReportThemeUpdate, tenant: TenantContext = Depends(require_org_admin)):
     repo = ReportRepository(tenant.db, tenant.organization_id)
     theme = await repo.get_theme(theme_id)
     if theme is None:
@@ -291,7 +325,9 @@ async def list_branding(tenant: TenantContext = Depends(get_tenant_context)):
 
 
 @router.post("/branding", response_model=ClientBrandingOut, status_code=http_status.HTTP_201_CREATED)
-async def upsert_branding(payload: ClientBrandingUpsert, tenant: TenantContext = Depends(require_org_manager)):
+async def upsert_branding(payload: ClientBrandingUpsert, tenant: TenantContext = Depends(require_org_admin)):
+    # Same reasoning as report themes above — client branding is an
+    # organization-wide setting, Owner/Admin only.
     repo = ReportRepository(tenant.db, tenant.organization_id)
     return await repo.upsert_branding(payload)
 
@@ -311,6 +347,7 @@ async def update_report(
     tenant: TenantContext = Depends(require_org_manager),
 ):
     report = await _get_report_or_404(tenant, report_id)
+    await _require_can_view(tenant, report)
     if report.status == "finalized":
         raise AppException(_REPORT_FINALIZED)
 
@@ -334,6 +371,7 @@ async def update_report(
 @router.post("/{report_id}/regenerate", response_model=ReportDetail)
 async def regenerate_report(report_id: int, tenant: TenantContext = Depends(require_org_manager)):
     report = await _get_report_or_404(tenant, report_id)
+    await _require_can_view(tenant, report)
     if report.status == "finalized":
         raise AppException(_REPORT_FINALIZED)
 
@@ -413,6 +451,7 @@ async def download_report(report_id: int, tenant: TenantContext = Depends(get_te
 @router.post("/{report_id}/finalize", response_model=ReportDetail)
 async def finalize_report(report_id: int, tenant: TenantContext = Depends(require_org_manager)):
     report = await _get_report_or_404(tenant, report_id)
+    await _require_can_view(tenant, report)
     if report.status == "finalized":
         raise AppException(ErrorDef(code="REPORT_ALREADY_FINALIZED", status=http_status.HTTP_409_CONFLICT, message="This report is already finalized."))
 
@@ -432,6 +471,7 @@ async def finalize_report(report_id: int, tenant: TenantContext = Depends(requir
 @router.post("/{report_id}/new-version", response_model=ReportDetail, status_code=http_status.HTTP_201_CREATED)
 async def create_new_version(report_id: int, tenant: TenantContext = Depends(require_org_manager)):
     report = await _get_report_or_404(tenant, report_id)
+    await _require_can_view(tenant, report)
     if report.status != "finalized":
         raise AppException(ErrorDef(code="REPORT_NOT_FINALIZED", status=http_status.HTTP_400_BAD_REQUEST, message="Only finalized reports can be turned into a new version."))
 
@@ -458,6 +498,7 @@ async def list_versions(report_id: int, tenant: TenantContext = Depends(get_tena
 @router.delete("/{report_id}", status_code=http_status.HTTP_204_NO_CONTENT)
 async def delete_report(report_id: int, tenant: TenantContext = Depends(require_org_manager)):
     report = await _get_report_or_404(tenant, report_id)
+    await _require_can_view(tenant, report)
     if report.status == "finalized":
         raise AppException(_REPORT_FINALIZED, message="Finalized reports cannot be deleted; archive them instead.")
     repo = ReportRepository(tenant.db, tenant.organization_id)

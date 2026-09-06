@@ -32,6 +32,7 @@ from app.api.routes import billing
 from app.api.routes import onboarding
 from app.api.routes import onboarding_steps
 from app.api.routes import dashboard
+from app.api.routes import activity_logs
 import app.models.issue  # noqa: F401  — register Issue
 import app.models.meeting  # noqa: F401  — register Meeting models
 import app.models.chat  # noqa: F401  — register models for auto table creation
@@ -48,8 +49,10 @@ import app.models.risk  # noqa: F401  — register Risk
 import app.models.report  # noqa: F401  — register Report and all report snapshot/theme/branding tables
 import app.models.note  # noqa: F401  — register Note
 import app.models.task_request  # noqa: F401  — register TaskRequest
+import app.models.task_time_entry  # noqa: F401  — register TaskTimeEntry
 import app.models.onboarding  # noqa: F401  — register OnboardingTemplate, OnboardingTemplateStep, ClientOnboarding, ClientOnboardingStep
 import app.models.copilot  # noqa: F401  — register AIChangeSet, AIOperation, AITopic, AIToolExecution
+import app.models.activity_log  # noqa: F401  — register ActivityLog
 from contextlib import asynccontextmanager
 import logging
 from app.core.log_context import ChatContextFilter
@@ -196,6 +199,9 @@ async def lifespan(app: FastAPI):
         ))
         await conn.execute(text(
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS icon VARCHAR(200)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS description TEXT"
         ))
         await conn.execute(text(
             "ALTER TABLE organizations ADD COLUMN IF NOT EXISTS scoreboard_completion_weight DOUBLE PRECISION NOT NULL DEFAULT 0.35"
@@ -365,6 +371,52 @@ async def lifespan(app: FastAPI):
         await conn.execute(text(
             "ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS last_result_set_json JSON"
         ))
+        await conn.execute(text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_picture_url VARCHAR(500)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE activity_logs ADD COLUMN IF NOT EXISTS actor_label VARCHAR(255)"
+        ))
+        # Best-effort backfill for rows written before this column existed
+        # (see alembic/versions/e5a9c3f7d2b4_add_actor_label_to_activity_logs.py
+        # for the full rationale) — safe to run on every startup since it
+        # only ever touches rows where actor_label is still NULL. NEVER
+        # falls back to email — actor_label is an immutable, long-lived
+        # snapshot and must never persist an email address; a user with no
+        # full_name gets the same generic "Unknown User" label the API
+        # already uses for a nameless live actor.
+        await conn.execute(text(
+            """
+            UPDATE activity_logs
+            SET actor_label = COALESCE(NULLIF(TRIM(users.full_name), ''), 'Unknown User')
+            FROM users
+            WHERE activity_logs.actor_user_id = users.id
+              AND activity_logs.actor_label IS NULL
+            """
+        ))
+        # Corrective, idempotent sanitization: an earlier version of this
+        # backfill (before this privacy fix) used `COALESCE(full_name,
+        # email)`, so rows it already touched may have an email sitting in
+        # actor_label. Re-run on every startup until fully clean — cheap
+        # once converged since the WHERE clause only matches remaining
+        # email-shaped values.
+        await conn.execute(text(
+            """
+            UPDATE activity_logs
+            SET actor_label = COALESCE(NULLIF(TRIM(users.full_name), ''), 'Unknown User')
+            FROM users
+            WHERE activity_logs.actor_user_id = users.id
+              AND activity_logs.actor_label LIKE '%@%'
+            """
+        ))
+        await conn.execute(text(
+            """
+            UPDATE activity_logs
+            SET actor_label = 'Unknown User'
+            WHERE actor_user_id IS NULL
+              AND actor_label LIKE '%@%'
+            """
+        ))
 
     await seed_admin()
 
@@ -439,6 +491,7 @@ app.include_router(billing.router, prefix=settings.API_PREFIX)
 app.include_router(onboarding.router, prefix=settings.API_PREFIX)
 app.include_router(onboarding_steps.router, prefix=settings.API_PREFIX)
 app.include_router(dashboard.router, prefix=settings.API_PREFIX)
+app.include_router(activity_logs.router, prefix=settings.API_PREFIX)
 
 @app.get("/health")
 async def health_check():

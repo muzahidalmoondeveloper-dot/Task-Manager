@@ -14,6 +14,8 @@ class Task(Base):
 
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
 
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     icon: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
     start_date: Mapped[date] = mapped_column(Date, nullable=True, index=True)

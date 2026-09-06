@@ -25,10 +25,25 @@ async def get_redis() -> Redis:
 async def close_redis() -> None:
     global _redis_client, _redis_pool
 
+    # _redis_client/_redis_pool are cached globally, not per event loop. If a
+    # previous caller ran under an asyncio.run() whose loop has since closed
+    # (e.g. a prior test's own event loop) without itself calling
+    # close_redis(), the cached client/pool are still holding connections
+    # bound to that dead loop — attempting to gracefully close them raises
+    # "Event loop is closed" even though our actual goal here (discard the
+    # stale singleton so get_redis() builds a fresh one on this loop) still
+    # succeeds. Swallow that specific teardown failure rather than letting it
+    # mask the caller's real work.
     if _redis_client:
-        await _redis_client.aclose()
+        try:
+            await _redis_client.aclose()
+        except RuntimeError:
+            pass
         _redis_client = None
 
     if _redis_pool:
-        await _redis_pool.disconnect()
+        try:
+            await _redis_pool.disconnect()
+        except RuntimeError:
+            pass
         _redis_pool = None

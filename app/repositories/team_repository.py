@@ -4,8 +4,11 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.org_roles import CLIENT
+from app.models.organization import OrganizationMembership
 from app.models.team import Team, TeamMembership
 from app.models.task import Task
+from app.models.user import User
 from app.repositories.base_tenant_repository import TenantRepository
 from app.schemas.team import TeamCreate, TeamUpdate
 
@@ -53,6 +56,29 @@ class TeamRepository(TenantRepository):
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def is_manager(self, team_id: int, user_id: int) -> bool:
+        """True only if `user_id` is SPECIFICALLY this team's manager —
+        unlike has_access() below, a plain TeamMembership row does not
+        count. Used for the Team Manager Task-scope follow-up: a plain
+        Team Manager gets Task read access via actually managing the
+        team, never merely being a member of it. Same cheap two-column
+        check as has_access(), no eager-loading."""
+        stmt = select(Team.team_manager_id).where(Team.id == team_id, Team.organization_id == self.org_id)
+        manager_id = (await self.db.execute(stmt)).scalar_one_or_none()
+        return manager_id is not None and manager_id == user_id
+
+    async def list_managed_team_ids(self, manager_id: int) -> set[int]:
+        """Every team_id this user manages in this organization — a
+        single, lightweight columns-only query (no eager-loading), used to
+        scope "All Tasks" (and any other org-wide listing) down to a plain
+        Team Manager's own teams instead of returning every task in the
+        organization. Returns an empty set (never None) for a manager of
+        zero teams, so callers can tell "restricted, but to nothing" apart
+        from "not restricted at all" (see app.api.routes.tasks.list_tasks)."""
+        stmt = select(Team.id).where(Team.team_manager_id == manager_id, Team.organization_id == self.org_id)
+        result = await self.db.execute(stmt)
+        return set(result.scalars().all())
+
     async def has_access(self, team_id: int, user_id: int) -> bool:
         """True if `user_id` is this team's manager OR a TeamMembership
         member of it — the single access rule app.core.team_access enforces
@@ -67,6 +93,101 @@ class TeamRepository(TenantRepository):
             return True
         member_stmt = select(TeamMembership.id).where(TeamMembership.team_id == team_id, TeamMembership.user_id == user_id)
         return (await self.db.execute(member_stmt)).scalar_one_or_none() is not None
+
+    async def filter_accessible_team_ids(self, team_ids: list[int], user_id: int) -> set[int]:
+        """Inline-assignee-dropdown bug-fix follow-up: of `team_ids`, which
+        ones `user_id` has team access to (manager OR TeamMembership member
+        — the exact same rule `has_access()`/`require_team_access()` use
+        for a single team, applied in bulk instead of once per id). Two
+        queries at most, regardless of how many team_ids are passed in —
+        never one `has_access()` call per team."""
+        if not team_ids:
+            return set()
+        managed_stmt = select(Team.id).where(
+            Team.id.in_(team_ids), Team.organization_id == self.org_id, Team.team_manager_id == user_id,
+        )
+        managed_ids = set((await self.db.execute(managed_stmt)).scalars().all())
+        remaining_ids = [tid for tid in team_ids if tid not in managed_ids]
+        member_ids: set[int] = set()
+        if remaining_ids:
+            member_stmt = select(TeamMembership.team_id).where(
+                TeamMembership.team_id.in_(remaining_ids), TeamMembership.user_id == user_id,
+            )
+            member_ids = set((await self.db.execute(member_stmt)).scalars().all())
+        return managed_ids | member_ids
+
+    async def filter_existing_team_ids(self, team_ids: list[int]) -> set[int]:
+        """Org-scoped existence check only — no per-user access
+        restriction — used for the Owner/Admin path of the bulk
+        assignable-users lookup, where every team in the org is already
+        authorized (mirrors Admin/Owner being unrestricted everywhere else
+        team access is checked)."""
+        if not team_ids:
+            return set()
+        stmt = select(Team.id).where(Team.id.in_(team_ids), Team.organization_id == self.org_id)
+        return set((await self.db.execute(stmt)).scalars().all())
+
+    async def list_assignable_members_bulk(self, team_ids: list[int]) -> dict[int, list[User]]:
+        """Bulk equivalent of list_assignable_members() below, for however
+        many distinct teams a Task list's currently-visible rows belong to
+        — ONE query, regardless of how many team_ids are passed in (never
+        one `list_assignable_members()` call per team, and never one per
+        Task row — see the inline-assignee-dropdown bug-fix follow-up).
+        Same eligibility rule: ACTIVE members of each team, Client always
+        excluded via the authoritative OrganizationMembership.role (never
+        the legacy User.role column)."""
+        if not team_ids:
+            return {}
+        stmt = (
+            select(TeamMembership.team_id, User)
+            .join(User, User.id == TeamMembership.user_id)
+            .join(OrganizationMembership, OrganizationMembership.user_id == User.id)
+            .where(
+                TeamMembership.team_id.in_(team_ids),
+                OrganizationMembership.organization_id == self.org_id,
+                OrganizationMembership.role != CLIENT,
+                OrganizationMembership.is_active.is_(True),
+                User.is_active.is_(True),
+            )
+            .order_by(User.full_name.asc())
+        )
+        result = await self.db.execute(stmt)
+        members_by_team: dict[int, list[User]] = {}
+        for team_id, user in result.all():
+            members_by_team.setdefault(team_id, []).append(user)
+        return members_by_team
+
+    async def list_assignable_members(self, team_id: int) -> list[User]:
+        """Task Assignee bug-fix follow-up: the eligible-assignee set for a
+        Team Task — ACTIVE members of THIS exact team, excluding Client
+        (Rule A/B). Deliberately joins OrganizationMembership (the
+        authoritative, organization-scoped role — see app.core.org_roles's
+        module docstring) rather than filtering on the legacy, possibly
+        stale `User.role` column that `TeamDetailRead.members` currently
+        exposes; that column is a display default only and cannot be
+        trusted to reflect a member's real per-org role (e.g. a Client
+        invited into this organization may still carry a leftover
+        `User.role` of "team_member" from account creation).
+
+        The team's manager is already guaranteed to also hold a
+        TeamMembership row (see create()/update() below, which always add
+        team_manager_id to the membership set), so this single join
+        covers the manager too — no separate UNION needed."""
+        stmt = (
+            select(User)
+            .join(TeamMembership, TeamMembership.user_id == User.id)
+            .join(OrganizationMembership, OrganizationMembership.user_id == User.id)
+            .where(
+                TeamMembership.team_id == team_id,
+                OrganizationMembership.organization_id == self.org_id,
+                OrganizationMembership.role != CLIENT,
+                OrganizationMembership.is_active.is_(True),
+                User.is_active.is_(True),
+            )
+            .order_by(User.full_name.asc())
+        )
+        result = await self.db.execute(stmt)
+        return list(result.scalars().unique().all())
 
     async def create(self, payload: TeamCreate, created_by_id: int) -> Team:
         team = Team(

@@ -717,6 +717,7 @@ async def analyze_yesterday_sources_for_user(
             await task_repo.create(
                 TaskCreate(
                     name=extracted_task.title,
+                    description=extracted_task.description,
                     start_date=extracted_task.suggested_start_date,
                     due_date=extracted_task.suggested_due_date,
                     assignee_id=assignee_id,

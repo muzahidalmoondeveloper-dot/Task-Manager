@@ -1,26 +1,38 @@
 """Team Manager project-scope access control regression test.
 
-REQUIREMENT (stated directly, superseding the earlier "team-manager
-privileges unlock everything" exception documented — and now removed —
-from app.core.project_access):
-- A Team Manager cannot view or access any project by default.
-- If a Team Manager is given access to a specific project by assigning
-  them as that project's Project Manager (a normal ProjectMembership row,
-  the same mechanism used to assign any Project Manager), they can
-  view/access exactly that project — nothing broader.
-- A Project Manager can only view/access the project(s) specifically
-  assigned to them (unchanged; see test_project_manager_scoped_access.py).
+REQUIREMENT (current model — see app.core.project_access's module
+docstring for the full rule):
+- A plain Team Manager (no explicit Project Manager capability, no Admin)
+  cannot view or access ANY project, by default or otherwise — NOT even a
+  project they hold a `ProjectMembership` row on. ProjectMembership alone
+  is never sufficient authorization for a Team Manager; project access
+  must come from explicit Project Manager capability (role or granted
+  `is_project_manager` flag) or Admin.
+- A user who is BOTH a Project Manager (explicit capability) AND has been
+  additionally granted Team Manager privileges keeps normal Project
+  Manager behavior for projects: `ProjectMembership` grants them access to
+  exactly the project(s) they're assigned to — because they're a genuine
+  Project Manager, not because of the Team Manager flag.
+- A plain Project Manager (no Team Manager involved) behaves exactly the
+  same either way (unchanged; see test_project_manager_scoped_access.py).
 
-BUG BEING GUARDED AGAINST: a user whose org role was `project_manager` but
-who was ALSO granted the `is_team_manager` privilege flag saw ALL projects
-in the org (reported live: the sidebar's Projects section listed every
-project instead of only the one they were assigned to) — because the old
-rule treated any team-manager privilege (base role OR granted flag) as an
-automatic broadening to org-wide project visibility. This test proves both
-a plain Team Manager (base role) and a Team-Manager-privileged Project
-Manager (the exact reported combination) are now scoped correctly, and
-that assigning either of them to a specific project via ProjectMembership
-grants access to exactly that project.
+BUG HISTORY:
+1. Originally, any team-manager privilege (base role OR granted flag) was
+   treated as an automatic broadening to org-wide project visibility —
+   reported live as a Team-Manager-privileged Project Manager seeing every
+   project in the org.
+2. That was fixed by making Team Manager "no project access by default,
+   unless given a ProjectMembership row" — but that still let a *plain*
+   Team Manager (no Project Manager capability at all) gain scoped project
+   access merely by holding a ProjectMembership row, which is the bug this
+   test now guards against: ProjectMembership must never substitute for
+   explicit Project Manager capability. Only a user who is *also* a
+   genuine Project Manager gets project access from that membership.
+
+This test proves: a plain Team Manager stays locked out of Projects even
+after being given a ProjectMembership row on a project, while a hybrid
+Project-Manager-who's-also-a-Team-Manager keeps working exactly like any
+other Project Manager once assigned.
 
 Runs against the real database connection the app uses (AsyncSessionLocal).
 Every row this test creates is deleted before it returns.
@@ -58,7 +70,8 @@ async def _scenario():
 
         owner_membership = OrganizationMembership(organization_id=org.id, user_id=owner.id, role="owner")
         tm_membership = OrganizationMembership(organization_id=org.id, user_id=plain_tm.id, role=TEAM_MANAGER)
-        # The exact reported combination: role=project_manager AND the
+        # The exact previously-reported combination: role=project_manager
+        # (real, explicit Project Manager capability) AND the
         # is_team_manager privilege flag additionally granted.
         hybrid_membership = OrganizationMembership(organization_id=org.id, user_id=hybrid.id, role=PROJECT_MANAGER, is_team_manager=True)
         db.add_all([owner_membership, tm_membership, hybrid_membership])
@@ -75,12 +88,10 @@ async def _scenario():
         hybrid_tenant = TenantContext(organization_id=org.id, organization=org, membership=hybrid_membership, user=hybrid, db=db)
 
         try:
-            # ── Rule 1: neither Team Manager sees ANY project by default. ──
+            # ── Rule 1: neither sees ANY project by default (no
+            #    ProjectMembership yet for either). ──
             assert await list_projects(tenant=tm_tenant) == [], "a plain Team Manager must see no projects by default"
-            assert await list_projects(tenant=hybrid_tenant) == [], (
-                "a Project Manager additionally granted team-manager privileges must NOT get org-wide "
-                "project visibility from that flag anymore (this is the exact bug reported live)"
-            )
+            assert await list_projects(tenant=hybrid_tenant) == [], "a Project Manager (even team-manager-privileged) with no ProjectMembership yet sees nothing"
 
             for tenant in (tm_tenant, hybrid_tenant):
                 try:
@@ -89,26 +100,39 @@ async def _scenario():
                 except AppException as exc:
                     assert exc.code == "PROJECT_NOT_ASSIGNED"
 
-            # ── Rule 2: assigning either of them as Project A's manager
-            #    (plain ProjectMembership — no role/flag change) grants
-            #    access to exactly that project. ──
+            # ── Rule 2: give BOTH of them a ProjectMembership row on
+            #    project A (plain assignment — no role/flag change). ──
             db.add(ProjectMembership(project_id=project_a.id, user_id=plain_tm.id))
             db.add(ProjectMembership(project_id=project_a.id, user_id=hybrid.id))
             await db.commit()
 
-            for tenant in (tm_tenant, hybrid_tenant):
-                visible = await list_projects(tenant=tenant)
-                assert {p.id for p in visible} == {project_a.id}, (
-                    "after being assigned to project A, exactly project A must be visible — never project B, never org-wide"
-                )
-                fetched = await get_project(project_a.id, tenant=tenant)
-                assert fetched.id == project_a.id
+            # The PLAIN Team Manager stays locked out — ProjectMembership
+            # alone is never sufficient without explicit Project Manager
+            # capability. This is the exact behavior this test now guards.
+            assert await list_projects(tenant=tm_tenant) == [], (
+                "a plain Team Manager must NOT gain project access merely from holding a ProjectMembership row"
+            )
+            try:
+                await get_project(project_a.id, tenant=tm_tenant)
+                raise AssertionError("a plain Team Manager must still be forbidden from a project even with a ProjectMembership row on it")
+            except AppException as exc:
+                assert exc.code == "PROJECT_NOT_ASSIGNED"
 
-                try:
-                    await get_project(project_b.id, tenant=tenant)
-                    raise AssertionError("project B must still be forbidden — assignment to A must not broaden to org-wide")
-                except AppException as exc:
-                    assert exc.code == "PROJECT_NOT_ASSIGNED"
+            # The HYBRID user (genuine Project Manager, additionally
+            # team-manager-privileged) gets access from their real PM
+            # capability — unchanged, exactly like any other PM.
+            visible_to_hybrid = await list_projects(tenant=hybrid_tenant)
+            assert {p.id for p in visible_to_hybrid} == {project_a.id}, (
+                "a genuine Project Manager (even if also team-manager-privileged) must see exactly the project they're assigned to"
+            )
+            fetched = await get_project(project_a.id, tenant=hybrid_tenant)
+            assert fetched.id == project_a.id
+
+            try:
+                await get_project(project_b.id, tenant=hybrid_tenant)
+                raise AssertionError("project B must still be forbidden — assignment to A must not broaden to org-wide, even for the hybrid user")
+            except AppException as exc:
+                assert exc.code == "PROJECT_NOT_ASSIGNED"
 
             # ── Owner is always unrestricted. ──
             owner_tenant = TenantContext(organization_id=org.id, organization=org, membership=owner_membership, user=owner, db=db)

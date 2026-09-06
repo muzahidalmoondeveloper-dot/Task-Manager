@@ -138,9 +138,14 @@ async def list_client_invitations(
     org_repo = OrganizationRepository(tenant.db)
     invitations = await org_repo.list_client_invitations(tenant.organization_id)
 
-    if not tenant.is_manager_or_above:
-        # A Project Manager only sees invitations for projects they're
-        # assigned to (or that they personally sent).
+    # Owner/Admin see every invitation org-wide. Everyone else — including
+    # a Team Manager, who has no organization-wide project access by design
+    # (see app.core.project_access) — only sees invitations for projects
+    # they're explicitly assigned to (or that they personally sent).
+    # Previously gated on `is_manager_or_above` alone, which is also true
+    # for a plain Team Manager and skipped this scoping entirely, exposing
+    # every project's client invitations org-wide to them.
+    if not tenant.is_admin_or_owner:
         project_repo = ProjectRepository(tenant.db, tenant.organization_id)
         visible = []
         for inv in invitations:

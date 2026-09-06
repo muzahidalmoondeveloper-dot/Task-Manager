@@ -1,7 +1,7 @@
 import uuid
 from datetime import date
 
-from sqlalchemy import select
+from sqlalchemy import false, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -34,7 +34,19 @@ class TaskRepository(TenantRepository):
         due_date_from: date | None = None,
         due_date_to: date | None = None,
         overdue: bool = False,
+        scope_team_ids: set[int] | None = None,
+        scope_project_ids: set[int] | None = None,
     ) -> list[Task]:
+        """`scope_team_ids`/`scope_project_ids` are the Team Manager
+        Task-scope follow-up's org-wide-listing guard: `None` (the
+        default, used for Owner/Admin) means unrestricted — every other
+        filter below still applies, but no team/project boundary is
+        added. Passing either as a set (even an empty one, for a manager
+        of zero teams) means the caller is scope-restricted: only tasks
+        whose team_id is in scope_team_ids OR whose project_id is in
+        scope_project_ids are returned, and a scoped caller who matches
+        neither set at all sees nothing — never silently falls back to
+        the full organization."""
         stmt = self._base_stmt()
         if status:
             stmt = stmt.where(Task.status == status)
@@ -55,6 +67,13 @@ class TaskRepository(TenantRepository):
             stmt = stmt.where(Task.due_date < today).where(
                 Task.status.notin_(["done", "pending_review"])
             )
+        if scope_team_ids is not None or scope_project_ids is not None:
+            conditions = []
+            if scope_team_ids:
+                conditions.append(Task.team_id.in_(scope_team_ids))
+            if scope_project_ids:
+                conditions.append(Task.project_id.in_(scope_project_ids))
+            stmt = stmt.where(or_(*conditions) if conditions else false())
         stmt = stmt.order_by(Task.due_date.asc(), Task.created_at.desc())
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
@@ -133,6 +152,27 @@ class TaskRepository(TenantRepository):
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
 
+    async def list_scope_by_ids(self, task_ids: list[int]) -> list[tuple[int, int | None, int | None, int | None]]:
+        """Just enough of each requested task — (id, assignee_id,
+        project_id, team_id) — to answer "can this caller see it", for the
+        bulk Working Time endpoint (see app/api/routes/tasks.py's
+        `get_task_time_summaries`). Deliberately not `_base_stmt()`: no
+        eager-loaded assignee/project/team relationships are needed for an
+        authorization check, so this stays a single cheap columns-only
+        query regardless of how many task_ids are requested — org-scoped,
+        never trusting organization_id from the request. `team_id` was
+        added by the Team Manager Task-scope follow-up so that endpoint
+        can apply the same "manages this task's team" rule
+        can_access_task() uses, in bulk."""
+        if not task_ids:
+            return []
+        stmt = select(Task.id, Task.assignee_id, Task.project_id, Task.team_id).where(
+            Task.organization_id == self.org_id,
+            Task.id.in_(task_ids),
+        )
+        result = await self.db.execute(stmt)
+        return [tuple(row) for row in result.all()]
+
     async def get_by_id(self, task_id: int) -> Task | None:
         stmt = self._base_stmt().where(Task.id == task_id)
         result = await self.db.execute(stmt)
@@ -141,6 +181,7 @@ class TaskRepository(TenantRepository):
     async def create(self, payload: TaskCreate, created_by_id: int) -> Task:
         task = Task(
             name=payload.name.strip(),
+            description=payload.description,
             icon=payload.icon,
             start_date=payload.start_date,
             due_date=payload.due_date,

@@ -11,8 +11,22 @@ TASK_STATUSES = {"todo", "in_progress", "pending_review", "done"}
 TASK_PRIORITIES = {"low", "medium", "high"}
 
 
+_DESCRIPTION_MAX_LENGTH = 5000
+
+
+def _normalize_description(value: str | None) -> str | None:
+    """Trims whitespace and normalizes a blank/whitespace-only submission to
+    `None` — same "empty means absent" convention as other optional text
+    fields in this app (e.g. SelfProfileUpdate's full_name)."""
+    if value is None:
+        return None
+    trimmed = value.strip()
+    return trimmed or None
+
+
 class TaskCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=_DESCRIPTION_MAX_LENGTH)
     icon: str | None = None
     start_date: date | None = None
     due_date: date | None = None
@@ -21,6 +35,11 @@ class TaskCreate(BaseModel):
     team_id: int | None = None
     status: str = "todo"
     priority: str = "medium"
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, value: str | None) -> str | None:
+        return _normalize_description(value)
 
     @field_validator("status")
     @classmethod
@@ -45,6 +64,7 @@ class TaskCreate(BaseModel):
 
 class TaskUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=_DESCRIPTION_MAX_LENGTH)
     icon: str | None = None
     start_date: date | None = None
     due_date: date | None = None
@@ -53,6 +73,11 @@ class TaskUpdate(BaseModel):
     team_id: int | None = None
     status: str | None = None
     priority: str | None = None
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, value: str | None) -> str | None:
+        return _normalize_description(value)
 
     @field_validator("status")
     @classmethod
@@ -89,6 +114,7 @@ class TaskStatusUpdate(BaseModel):
 class TaskRead(BaseModel):
     id: int
     name: str
+    description: str | None = None
     icon: str | None = None
     start_date: date | None = None
     due_date: date | None = None

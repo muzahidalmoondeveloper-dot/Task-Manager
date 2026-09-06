@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Resolve the .env file path relative to this file (backend/app/core/config.py)
@@ -12,6 +13,13 @@ _ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
 class Settings(BaseSettings):
     APP_NAME: str = "Automated Task Manager"
     API_PREFIX: str = "/api"
+
+    # development | test | production — gates the media-storage safety
+    # check below (Settings.__post_init_check) and nothing else today.
+    # Defaults to "development" so existing dev/CI environments (which
+    # never set this) keep working unchanged; production deployments must
+    # set it explicitly to get the durable-storage guard.
+    ENVIRONMENT: str = "development"
 
     DATABASE_URL: str
 
@@ -111,8 +119,35 @@ class Settings(BaseSettings):
     CELERY_RESULT_BACKEND: str | None = None
 
     # ── Media / report storage ──────────────────────────────────────────────
+    # Local filesystem root — always used by MEDIA_STORAGE_BACKEND=local
+    # (dev/test default), and still used for generated report PDFs
+    # regardless of backend (a separate, regenerate-on-demand concern this
+    # task deliberately does not migrate — see MEDIA_STORAGE.md).
     MEDIA_ROOT: str = "media"
     PDF_OUTPUT_DIR: str = "media/reports/pdfs"
+
+    # Selects the MediaStorage adapter (app/services/storage/factory.py)
+    # used for user avatars and organization/project logos.
+    #   local — writes under MEDIA_ROOT, served by the app's own /media
+    #           mount. Fine for dev/test; NOT durable across container
+    #           restarts/redeploys/multiple instances in production.
+    #   s3    — durable, S3-compatible object storage (AWS S3 or any
+    #           S3-compatible provider via AWS_S3_ENDPOINT_URL).
+    MEDIA_STORAGE_BACKEND: str = "local"
+
+    # S3-compatible backend settings (only read when MEDIA_STORAGE_BACKEND=s3).
+    # Credentials are NOT settings fields on purpose — boto3's own default
+    # credential chain (env vars, shared config/profile, EC2/ECS/EKS
+    # instance role, workload identity) supplies them, so nothing secret
+    # ever passes through this Settings object or gets logged with it.
+    MEDIA_BUCKET: str | None = None
+    AWS_REGION: str | None = None
+    # Set for a non-AWS S3-compatible provider (R2/Spaces/MinIO/B2/...) or a
+    # local S3-compatible test double; leave unset for real AWS S3.
+    AWS_S3_ENDPOINT_URL: str | None = None
+    # Optional CDN/custom-domain override for public URLs (e.g. a
+    # CloudFront distribution or R2 custom domain in front of the bucket).
+    MEDIA_PUBLIC_BASE_URL: str | None = None
 
     # ── Stripe billing ───────────────────────────────────────────────────────
     STRIPE_SECRET_KEY: str | None = None
@@ -133,6 +168,27 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=True,
     )
+
+    @model_validator(mode="after")
+    def _guard_production_media_storage(self) -> "Settings":
+        """Production must never silently run on ephemeral local disk — a
+        restart/redeploy/scale-out event would then lose or fragment
+        uploaded avatars and logos across instances. Fail fast at startup
+        (Settings() is constructed once, eagerly, at import time — see
+        get_settings() below) rather than only failing on first upload."""
+        if self.ENVIRONMENT == "production" and self.MEDIA_STORAGE_BACKEND == "local":
+            raise ValueError(
+                "MEDIA_STORAGE_BACKEND=local is not allowed when ENVIRONMENT=production "
+                "(local disk is not durable across restarts/redeploys/multiple instances). "
+                "Set MEDIA_STORAGE_BACKEND=s3 and configure MEDIA_BUCKET/AWS_REGION, "
+                "or explicitly set ENVIRONMENT=development if this deployment truly has a "
+                "verified persistent volume backing MEDIA_ROOT."
+            )
+        if self.MEDIA_STORAGE_BACKEND == "s3" and not self.MEDIA_BUCKET:
+            raise ValueError("MEDIA_STORAGE_BACKEND=s3 requires MEDIA_BUCKET to be set.")
+        if self.MEDIA_STORAGE_BACKEND not in ("local", "s3"):
+            raise ValueError(f"Unknown MEDIA_STORAGE_BACKEND: {self.MEDIA_STORAGE_BACKEND!r} (expected 'local' or 's3').")
+        return self
 
     @property
     def cors_origin_list(self) -> list[str]:

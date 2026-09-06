@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.activity_actions import ENTITY_TEAM, TEAM_CREATED, TEAM_DELETED, TEAM_UPDATED
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.database import get_db
 from app.core.org_roles import ORG_MANAGEMENT_ROLES, TEAM_MEMBER
@@ -9,8 +10,17 @@ from app.core.tenant import TenantContext, check_active_billing, get_tenant_cont
 from app.models.team import Team
 from app.repositories.team_repository import TeamRepository
 from app.repositories.user_repository import UserRepository
-from app.schemas.team import TeamCreate, TeamDetailRead, TeamRead, TeamUpdate
+from app.schemas.team import (
+    TeamAssignableMember,
+    TeamAssignableUsersBulkRequest,
+    TeamAssignableUsersBulkResponse,
+    TeamCreate,
+    TeamDetailRead,
+    TeamRead,
+    TeamUpdate,
+)
 from app.schemas.user import UserRead
+from app.services import activity_service
 
 router = APIRouter(prefix="/teams", tags=["Teams"])
 
@@ -91,6 +101,10 @@ async def create_team(
 
     repo = TeamRepository(db, tenant.organization_id)
     team = await repo.create(payload, created_by_id=tenant.user.id)
+    await activity_service.record(
+        db, organization_id=tenant.organization_id, actor=tenant.user,
+        action=TEAM_CREATED, entity_type=ENTITY_TEAM, entity_id=team.id, entity_label=team.name,
+    )
     return _serialize(team)
 
 
@@ -102,6 +116,73 @@ async def get_team(team_id: int, tenant: TenantContext = Depends(get_tenant_cont
         raise AppException(_TEAM_NOT_FOUND)
     await require_team_access(tenant, repo, team_id)
     return _serialize(team)
+
+
+@router.get("/{team_id}/assignable-users", response_model=list[TeamAssignableMember])
+async def list_team_assignable_users(team_id: int, tenant: TenantContext = Depends(get_tenant_context)):
+    """The eligible Task-assignee set for this exact team (Task Assignee
+    bug-fix follow-up) — ACTIVE members only, Client always excluded
+    (Rule A/B), never a member of a different team, never the full
+    organization. This is the data source Team-scoped Task/To-Do
+    Assignee dropdowns must use instead of the org-wide `GET /users`
+    (admin-only — a Team Manager legitimately gets 403 from that one, see
+    require_org_admin) or `GET /teams/{team_id}`'s own `members` field
+    (which reports the legacy, non-authoritative `User.role` column —
+    see list_assignable_members()'s docstring for why that can't be
+    trusted to detect a Client).
+
+    Authorization is the exact same `require_team_access` rule as
+    `GET /teams/{team_id}` itself: Owner/Admin see any team; anyone else
+    (including a Team Manager) only a team they manage or are a member
+    of — a Team Manager never needs, and is never granted, org-wide Users
+    access to get this list for their own managed team."""
+    repo = TeamRepository(tenant.db, tenant.organization_id)
+    team = await repo.get_by_id(team_id)
+    if team is None:
+        raise AppException(_TEAM_NOT_FOUND)
+    await require_team_access(tenant, repo, team_id)
+    members = await repo.list_assignable_members(team_id)
+    return [TeamAssignableMember.model_validate(m) for m in members]
+
+
+@router.post("/assignable-users/bulk", response_model=TeamAssignableUsersBulkResponse)
+async def list_teams_assignable_users_bulk(
+    payload: TeamAssignableUsersBulkRequest,
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Inline-assignee-dropdown bug-fix follow-up: the bulk counterpart to
+    `GET /teams/{team_id}/assignable-users` — resolves eligible-assignee
+    options for however many DISTINCT teams a Task list's currently
+    visible rows belong to in ONE request, so a list of N tasks across M
+    teams costs a small constant number of queries, never N (one per
+    row) or even M (one per unique team) HTTP round-trips.
+
+    Authorization mirrors the single-team endpoint exactly, just computed
+    in bulk: Owner/Admin get every requested team_id that actually exists
+    in their organization; anyone else (including a Team Manager) only
+    the team_ids they manage or are a member of — a Team Manager never
+    needs, and is never granted, org-wide Users access to populate this
+    for their own managed team's tasks. A requested team_id that doesn't
+    exist, belongs to another organization, or isn't one this caller has
+    access to is simply absent from `teams` — never a 403 for the whole
+    batch, and never leaks *why* it's absent."""
+    team_ids = list(dict.fromkeys(payload.team_ids))  # de-dupe, preserve order
+    if not team_ids:
+        return TeamAssignableUsersBulkResponse(teams={})
+
+    repo = TeamRepository(tenant.db, tenant.organization_id)
+    if tenant.is_admin_or_owner:
+        allowed_team_ids = await repo.filter_existing_team_ids(team_ids)
+    else:
+        allowed_team_ids = await repo.filter_accessible_team_ids(team_ids, tenant.user.id)
+
+    members_by_team = await repo.list_assignable_members_bulk(list(allowed_team_ids))
+    return TeamAssignableUsersBulkResponse(
+        teams={
+            str(team_id): [TeamAssignableMember.model_validate(u) for u in members_by_team.get(team_id, [])]
+            for team_id in allowed_team_ids
+        }
+    )
 
 
 @router.patch("/{team_id}", response_model=TeamDetailRead)
@@ -116,7 +197,35 @@ async def update_team(
     if team is None:
         raise AppException(_TEAM_NOT_FOUND)
     await require_team_access(tenant, repo, team_id)
+
+    before_name = team.name
+    old_member_ids = {m.user_id for m in team.memberships}
     updated = await repo.update(team, payload)
+
+    fields_changed = []
+    metadata: dict = {}
+    if updated.name != before_name:
+        fields_changed.append("name")
+    if payload.member_ids is not None:
+        new_member_ids = set(payload.member_ids) | {updated.team_manager_id}
+        added = len(new_member_ids - old_member_ids)
+        removed = len(old_member_ids - new_member_ids)
+        if added or removed:
+            # Consolidated here rather than one team.member_added/removed
+            # row per user — this bulk "replace the whole roster" flow
+            # doesn't have a natural single "who was added" actor-facing
+            # story beyond the count; per-member events would need a
+            # dedicated add/remove endpoint, which doesn't exist in this
+            # app (membership is only ever changed via this bulk payload).
+            metadata["members_added"], metadata["members_removed"] = added, removed
+            fields_changed.append("members")
+    if fields_changed:
+        metadata["fields_changed"] = fields_changed
+        await activity_service.record(
+            db, organization_id=tenant.organization_id, actor=tenant.user,
+            action=TEAM_UPDATED, entity_type=ENTITY_TEAM, entity_id=updated.id, entity_label=updated.name,
+            metadata=metadata,
+        )
     return _serialize(updated)
 
 
@@ -131,5 +240,10 @@ async def delete_team(
     if team is None:
         raise AppException(_TEAM_NOT_FOUND)
     await require_team_access(tenant, repo, team_id)
+    team_id_value, team_name = team.id, team.name
     await repo.delete(team)
+    await activity_service.record(
+        db, organization_id=tenant.organization_id, actor=tenant.user,
+        action=TEAM_DELETED, entity_type=ENTITY_TEAM, entity_id=team_id_value, entity_label=team_name,
+    )
     return None

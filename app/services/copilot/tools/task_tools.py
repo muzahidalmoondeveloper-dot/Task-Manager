@@ -65,6 +65,7 @@ async def _create_task_handler(ctx: ToolContext, params: CreateTaskInput) -> Too
             return ToolResult(False, scope_refusal)
         task = Task(
             name=item.name.strip(),
+            description=item.description.strip() if item.description else None,
             start_date=item.start_date,
             due_date=item.due_date,
             assignee_id=item.assignee_id,

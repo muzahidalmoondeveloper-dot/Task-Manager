@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, UploadFile
 from fastapi import File as FastAPIFile
 from fastapi import status as http_status
@@ -6,10 +8,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.routes.teams import _serialize as serialize_team
+from app.core.activity_actions import (
+    ENTITY_PROJECT,
+    PROJECT_CREATED,
+    PROJECT_DELETED,
+    PROJECT_MANAGER_ASSIGNED,
+    PROJECT_MANAGER_REMOVED,
+    PROJECT_UPDATED,
+)
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.database import get_db
 from app.core.org_roles import CLIENT, PROJECT_MANAGER
-from app.core.project_access import is_project_scoped, require_project_access
+from app.core.project_access import (
+    is_project_management_blocked,
+    is_project_scoped,
+    require_project_management_access,
+)
 from app.core.tenant import TenantContext, check_active_billing, get_tenant_context, require_org_admin, require_org_manager
 from app.models.issue import Issue
 from app.models.kpi import KPI
@@ -18,6 +32,7 @@ from app.models.organization import OrganizationMembership
 from app.models.rock import Rock
 from app.models.task import Task
 from app.repositories.project_repository import ProjectRepository
+from app.repositories.task_time_entry_repository import TaskTimeEntryRepository
 from app.repositories.team_repository import TeamRepository
 from app.schemas.issue import IssueOut
 from app.schemas.kpi import KPIOut
@@ -30,7 +45,8 @@ from app.schemas.project import (
     ProjectUpdate,
 )
 from app.schemas.rock import RockOut
-from app.services import logo_upload_service
+from app.schemas.task_time_entry import ProjectTimeSummary
+from app.services import activity_service, logo_upload_service
 
 router = APIRouter(prefix="/projects", tags=["Projects"])
 
@@ -38,15 +54,21 @@ _NOT_FOUND = ErrorDef(code="PROJECT_NOT_FOUND", status=http_status.HTTP_404_NOT_
 _PLAN_LIMIT = ErrorDef(code="PLAN_LIMIT_EXCEEDED", status=http_status.HTTP_402_PAYMENT_REQUIRED, message="Your plan's project limit has been reached.")
 _CLIENT_FORBIDDEN = ErrorDef(code="CLIENT_ITEMS_FORBIDDEN", status=http_status.HTTP_403_FORBIDDEN, message="Clients view project progress through Reports, not this endpoint.")
 
-_LOGO_DIR_NAME = "project_logos"
+_LOGO_DIR_NAME = "project-logos"
 
-# is_project_scoped()/require_project_access() now live in
-# app.core.project_access — the single shared source every route touching
+# app.core.project_access is the single shared source every route touching
 # project-scoped data (this file, tasks.py, ...) consults, so the rule
 # can't drift or be forgotten per-route. Kept as module-level aliases here
 # so this file's many existing call sites don't all need renaming.
+#
+# This file specifically uses the *Projects-management-system* variants
+# (require_project_management_access, not the plainer require_project_access
+# tasks.py still uses) — a plain Team Manager must be blocked outright from
+# every route below, never merely membership-scoped, even though a
+# ProjectMembership row may exist for them (see app.core.project_access's
+# module docstring for the full rule).
 _is_project_scoped = is_project_scoped
-_require_project_access = require_project_access
+_require_project_access = require_project_management_access
 
 
 def _serialize_project(project, managers: dict[int, tuple[int, str | None]]) -> ProjectRead:
@@ -60,9 +82,17 @@ def _serialize_project(project, managers: dict[int, tuple[int, str | None]]) -> 
 @router.get("", response_model=list[ProjectRead])
 async def list_projects(tenant: TenantContext = Depends(get_tenant_context)):
     repo = ProjectRepository(tenant.db, tenant.organization_id)
-    projects = (
-        await repo.list_for_user(tenant.user.id) if _is_project_scoped(tenant) else await repo.list_all()
-    )
+    # A plain Team Manager (no Project Manager/Admin capability) sees no
+    # projects here at all — not even ones they hold a ProjectMembership
+    # row on (see app.core.project_access.is_project_management_blocked).
+    # Everyone else keeps the existing rule: membership-scoped for
+    # Project Manager/Client, unrestricted for Owner/Admin/Team Member.
+    if is_project_management_blocked(tenant):
+        projects = []
+    else:
+        projects = (
+            await repo.list_for_user(tenant.user.id) if _is_project_scoped(tenant) else await repo.list_all()
+        )
     # One bulk query for every project's assigned manager (see
     # get_project_managers()'s docstring) instead of N+1 — so the Projects
     # list can show which Project Manager owns each project at a glance.
@@ -73,7 +103,13 @@ async def list_projects(tenant: TenantContext = Depends(get_tenant_context)):
 @router.post("", response_model=ProjectRead, status_code=http_status.HTTP_201_CREATED)
 async def create_project(
     payload: ProjectCreate,
-    tenant: TenantContext = Depends(require_org_manager),
+    # Creating a brand-new Project is organization-wide by nature (there's
+    # no existing project to scope the check against yet) — Owner/Admin
+    # only. Previously require_org_manager (Owner/Admin/Team Manager),
+    # which let a plain Team Manager create arbitrary org-wide projects; a
+    # Team Manager is a team-scoped role and has no project-management
+    # authority by design (see app.core.project_access).
+    tenant: TenantContext = Depends(require_org_admin),
 ):
     check_active_billing(tenant)
     limits = tenant.plan_limits
@@ -85,6 +121,10 @@ async def create_project(
 
     repo = ProjectRepository(tenant.db, tenant.organization_id)
     project = await repo.create(payload, created_by_id=tenant.user.id)
+    await activity_service.record(
+        tenant.db, organization_id=tenant.organization_id, actor=tenant.user,
+        action=PROJECT_CREATED, entity_type=ENTITY_PROJECT, entity_id=project.id, entity_label=project.name,
+    )
     return ProjectRead.model_validate(project)
 
 
@@ -110,7 +150,23 @@ async def update_project(
     if project is None:
         raise AppException(_NOT_FOUND)
     await _require_project_access(tenant, repo, project_id)
+    before_name, before_status = project.name, project.status
     updated = await repo.update(project, payload)
+
+    fields_changed = []
+    metadata: dict = {}
+    if updated.name != before_name:
+        fields_changed.append("name")
+    if updated.status != before_status:
+        metadata["status_from"], metadata["status_to"] = before_status, updated.status
+        fields_changed.append("status")
+    if fields_changed:
+        metadata["fields_changed"] = fields_changed
+        await activity_service.record(
+            tenant.db, organization_id=tenant.organization_id, actor=tenant.user,
+            action=PROJECT_UPDATED, entity_type=ENTITY_PROJECT, entity_id=updated.id, entity_label=updated.name,
+            metadata=metadata,
+        )
     return ProjectRead.model_validate(updated)
 
 
@@ -127,9 +183,19 @@ async def upload_project_logo(
     await _require_project_access(tenant, repo, project_id)
 
     new_url = await logo_upload_service.save_logo(file, _LOGO_DIR_NAME, project_id)
-    logo_upload_service.delete_logo_file(project.logo_url, _LOGO_DIR_NAME)
-    project.logo_url = new_url
-    await tenant.db.commit()
+
+    # Save-then-commit-then-delete-old (see the org logo / avatar upload
+    # routes for the same ordering rationale).
+    previous_url = project.logo_url
+    try:
+        project.logo_url = new_url
+        await tenant.db.commit()
+    except Exception:
+        await tenant.db.rollback()
+        await logo_upload_service.delete_logo_file(new_url, _LOGO_DIR_NAME)
+        raise
+
+    await logo_upload_service.delete_logo_file(previous_url, _LOGO_DIR_NAME)
     await tenant.db.refresh(project)
     return ProjectRead.model_validate(project)
 
@@ -145,10 +211,12 @@ async def delete_project_logo(
         raise AppException(_NOT_FOUND)
     await _require_project_access(tenant, repo, project_id)
 
-    logo_upload_service.delete_logo_file(project.logo_url, _LOGO_DIR_NAME)
+    previous_url = project.logo_url
     project.logo_url = None
     await tenant.db.commit()
     await tenant.db.refresh(project)
+
+    await logo_upload_service.delete_logo_file(previous_url, _LOGO_DIR_NAME)
     return ProjectRead.model_validate(project)
 
 
@@ -162,7 +230,12 @@ async def delete_project(
     if project is None:
         raise AppException(_NOT_FOUND)
     await _require_project_access(tenant, repo, project_id)
+    project_id_value, project_name = project.id, project.name
     await repo.delete(project)
+    await activity_service.record(
+        tenant.db, organization_id=tenant.organization_id, actor=tenant.user,
+        action=PROJECT_DELETED, entity_type=ENTITY_PROJECT, entity_id=project_id_value, entity_label=project_name,
+    )
     return None
 
 
@@ -260,6 +333,46 @@ async def get_project_items(
     }
 
 
+@router.get("/{project_id}/working-time", response_model=ProjectTimeSummary)
+async def get_project_working_time(
+    project_id: int,
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Project Working Time (#7B) — a dedicated, lightweight endpoint
+    (rather than folding this into GET /{project_id}/items) so the
+    frontend can refresh just this number after a task timer Start/Stop,
+    or periodically while a timer is running, without re-fetching that
+    endpoint's much heavier rocks/KPIs/issues/objectives/teams payload.
+
+    Uses the exact same authorization as GET /{project_id}/items and every
+    other Project Detail route (`_require_project_access` ==
+    require_project_management_access) — Owner/Admin unrestricted, a
+    genuine Project Manager membership-scoped, a plain Team Manager
+    rejected outright regardless of any ProjectMembership row. Nothing
+    broader is used merely because this is "just a metric."
+    """
+    if tenant.org_role == CLIENT:
+        raise AppException(_CLIENT_FORBIDDEN)
+
+    repo = ProjectRepository(db, tenant.organization_id)
+    project = await repo.get_by_id(project_id)
+    if project is None:
+        raise AppException(_NOT_FOUND)
+    await _require_project_access(tenant, repo, project_id)
+
+    now = datetime.now(timezone.utc)
+    time_repo = TaskTimeEntryRepository(db, tenant.organization_id)
+    working_time_seconds, active_timer_count = await time_repo.get_project_time_summary(project_id, now)
+
+    return ProjectTimeSummary(
+        project_id=project_id,
+        working_time_seconds=working_time_seconds,
+        active_timer_count=active_timer_count,
+        calculated_at=now,
+    )
+
+
 def _serialize_member(membership) -> ProjectMemberOut:
     user = membership.user
     return ProjectMemberOut(
@@ -289,7 +402,15 @@ async def _pm_user_ids(tenant: TenantContext, user_ids: list[int]) -> set[int]:
 @router.get("/{project_id}/members", response_model=list[ProjectMemberOut])
 async def list_project_members(
     project_id: int,
-    tenant: TenantContext = Depends(require_org_manager),
+    # Backs the staff-only "assign a Project Manager to this project" admin
+    # screen (see docstring below) — an organization-wide project-management
+    # action, not a per-project one, so this had no _require_project_access
+    # scoping to layer on top of a role check in the first place. Owner/
+    # Admin only. Previously require_org_manager (Owner/Admin/Team Manager),
+    # which let a plain Team Manager view/assign/remove the Project Manager
+    # of ANY project in the org — a team-scoped role has no business
+    # reassigning who manages an arbitrary project.
+    tenant: TenantContext = Depends(require_org_admin),
 ):
     """Project Manager assignments only. `ProjectMembership` is also used to
     grant Clients access to a project (see `project_invitations.py`), but
@@ -311,7 +432,7 @@ async def list_project_members(
 async def add_project_member(
     project_id: int,
     payload: ProjectMemberAssign,
-    tenant: TenantContext = Depends(require_org_manager),
+    tenant: TenantContext = Depends(require_org_admin),
 ):
     """A project has exactly one Project Manager — assigning a new one
     replaces whichever Project Manager was previously assigned (Client
@@ -327,6 +448,12 @@ async def add_project_member(
         await repo.remove_member(project_id, uid)
 
     membership = await repo.add_member(project_id, payload.user_id)
+    project = await repo.get_by_id(project_id)
+    await activity_service.record(
+        tenant.db, organization_id=tenant.organization_id, actor=tenant.user,
+        action=PROJECT_MANAGER_ASSIGNED, entity_type=ENTITY_PROJECT, entity_id=project_id,
+        entity_label=project.name if project else None, metadata={"user_id": payload.user_id},
+    )
     return _serialize_member(membership)
 
 
@@ -334,10 +461,16 @@ async def add_project_member(
 async def remove_project_member(
     project_id: int,
     user_id: int,
-    tenant: TenantContext = Depends(require_org_manager),
+    tenant: TenantContext = Depends(require_org_admin),
 ):
     repo = ProjectRepository(tenant.db, tenant.organization_id)
-    if await repo.get_by_id(project_id) is None:
+    project = await repo.get_by_id(project_id)
+    if project is None:
         raise AppException(_NOT_FOUND)
     await repo.remove_member(project_id, user_id)
+    await activity_service.record(
+        tenant.db, organization_id=tenant.organization_id, actor=tenant.user,
+        action=PROJECT_MANAGER_REMOVED, entity_type=ENTITY_PROJECT, entity_id=project_id,
+        entity_label=project.name, metadata={"user_id": user_id},
+    )
     return None

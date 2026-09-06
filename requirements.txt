@@ -53,6 +53,14 @@ pypdf==6.14.2
 python-docx==1.2.0
 lxml==6.1.1
 
+# Image processing (avatar upload validation/normalization)
+Pillow==12.3.0
+
+# Durable media storage (S3-compatible object storage backend — see
+# app/services/storage/ and MEDIA_STORAGE.md). Only imported when
+# MEDIA_STORAGE_BACKEND=s3 is selected; local dev/test never needs it.
+boto3==1.43.89
+
 # Scheduling and utilities
 APScheduler==3.10.4
 python-dateutil==2.9.0.post0
