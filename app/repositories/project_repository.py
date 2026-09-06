@@ -83,6 +83,22 @@ class ProjectRepository(TenantRepository):
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none() is not None
 
+    async def list_member_project_ids(self, project_ids: list[int], user_id: int) -> set[int]:
+        """Which of these project_ids `user_id` is a ProjectMembership
+        member of — one query, regardless of how many project_ids are
+        passed in. Used by the bulk Working Time endpoint
+        (app/api/routes/tasks.py) to apply the exact same "PM + membership"
+        rule `can_access_task` already uses for a single task, without
+        calling `is_member()` once per candidate project."""
+        if not project_ids:
+            return set()
+        stmt = select(ProjectMembership.project_id).where(
+            ProjectMembership.project_id.in_(project_ids),
+            ProjectMembership.user_id == user_id,
+        )
+        result = await self.db.execute(stmt)
+        return set(result.scalars().all())
+
     async def list_members(self, project_id: int) -> list[ProjectMembership]:
         stmt = (
             select(ProjectMembership)

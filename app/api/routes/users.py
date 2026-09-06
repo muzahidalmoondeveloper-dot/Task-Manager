@@ -1,7 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from fastapi import File as FastAPIFile
 from fastapi import status as http_status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.activity_actions import ENTITY_USER, USER_ROLE_CHANGED, USER_UPDATED
 from app.core.auth_errors import AppException, AuthError, ErrorDef
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
@@ -15,6 +17,7 @@ from app.repositories.team_repository import TeamRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.task_request import ClientTaskRequestOut
 from app.schemas.user import ChangePasswordRequest, SelfProfileUpdate, UserCreate, UserRead, UserUpdate
+from app.services import activity_service, avatar_upload_service, logo_upload_service
 
 router = APIRouter(prefix="/users", tags=["Users"])
 
@@ -74,6 +77,57 @@ async def change_current_user_password(
     current_user.hashed_password = hash_password(payload.new_password)
     await db.commit()
     return {"message": "Password updated successfully."}
+
+
+@router.post("/me/profile-picture", response_model=UserRead)
+async def upload_current_user_profile_picture(
+    file: UploadFile = FastAPIFile(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Self-service avatar upload. The target user comes only from the
+    authenticated token (`get_current_user`) — there is no user_id in the
+    request, so this can never be pointed at another account.
+
+    Order matters here (see avatar_upload_service / logo_upload_service
+    docs for the same pattern used by org/project logos): the new file is
+    validated and written to disk *before* anything is committed, so a
+    bad upload never touches the database, and the old file is only
+    deleted *after* the new reference is safely committed, so a
+    replacement can never leave the user without any avatar file on disk.
+    If the commit itself fails, the newly-written file is removed instead
+    of leaving an orphan.
+    """
+    new_url = await avatar_upload_service.save_avatar(file, current_user.id)
+
+    previous_url = current_user.profile_picture_url
+    try:
+        current_user.profile_picture_url = new_url
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        await logo_upload_service.delete_logo_file(new_url, avatar_upload_service.AVATAR_PREFIX)
+        raise
+
+    await logo_upload_service.delete_logo_file(previous_url, avatar_upload_service.AVATAR_PREFIX)
+    await db.refresh(current_user)
+    return UserRead.model_validate(current_user)
+
+
+@router.delete("/me/profile-picture", response_model=UserRead)
+async def delete_current_user_profile_picture(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Clears the avatar reference and best-effort deletes the owned file.
+    Never touches any other profile field."""
+    previous_url = current_user.profile_picture_url
+    current_user.profile_picture_url = None
+    await db.commit()
+    await db.refresh(current_user)
+
+    await logo_upload_service.delete_logo_file(previous_url, avatar_upload_service.AVATAR_PREFIX)
+    return UserRead.model_validate(current_user)
 
 
 @router.get("", response_model=list[UserRead])
@@ -209,6 +263,24 @@ async def update_user(
     effective_is_org_admin = membership.is_org_admin if membership else False
     effective_is_team_manager = membership.is_team_manager if membership else False
     effective_is_project_manager = membership.is_project_manager if membership else False
+
+    if payload.role is not None and payload.role != current_role:
+        await activity_service.record(
+            db, organization_id=tenant.organization_id, actor=tenant.user,
+            action=USER_ROLE_CHANGED, entity_type=ENTITY_USER, entity_id=user.id, entity_label=user.full_name,
+            metadata={"from_role": current_role, "to_role": payload.role},
+        )
+    other_fields_changed = [
+        field for field in ("full_name", "email", "is_active", "is_org_admin", "is_team_manager", "is_project_manager")
+        if getattr(payload, field, None) is not None
+    ]
+    if other_fields_changed:
+        await activity_service.record(
+            db, organization_id=tenant.organization_id, actor=tenant.user,
+            action=USER_UPDATED, entity_type=ENTITY_USER, entity_id=user.id, entity_label=user.full_name,
+            metadata={"fields_changed": other_fields_changed},
+        )
+
     return UserRead.model_validate(updated).model_copy(update={
         "role": effective_role,
         "is_org_admin": effective_is_org_admin,

@@ -52,7 +52,7 @@ from app.schemas.user import UserRead
 from app.services import logo_upload_service, stripe_service
 from app.services.email_service import EmailService
 
-_LOGO_DIR_NAME = "organization_logos"
+_LOGO_DIR_NAME = "organization-logos"
 
 # How many organizations a single user may own at once — a simple, generous
 # hard cap (plan tiers in this app are per-organization, not per-user, so a
@@ -307,9 +307,22 @@ async def upload_current_org_logo(
 ):
     org = tenant.organization
     new_url = await logo_upload_service.save_logo(file, _LOGO_DIR_NAME, org.id)
-    logo_upload_service.delete_logo_file(org.logo_url, _LOGO_DIR_NAME)
-    org.logo_url = new_url
-    await db.commit()
+
+    # Save-then-commit-then-delete-old — never delete the existing logo
+    # before the replacement is confirmed persisted (see
+    # app/services/storage/base.py and the avatar upload route for the
+    # same ordering). If the commit itself fails, clean up the just-
+    # uploaded object instead of leaving it orphaned.
+    previous_url = org.logo_url
+    try:
+        org.logo_url = new_url
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        await logo_upload_service.delete_logo_file(new_url, _LOGO_DIR_NAME)
+        raise
+
+    await logo_upload_service.delete_logo_file(previous_url, _LOGO_DIR_NAME)
     await db.refresh(org)
     return OrganizationRead.model_validate(org)
 
@@ -320,10 +333,12 @@ async def delete_current_org_logo(
     db: AsyncSession = Depends(get_db),
 ):
     org = tenant.organization
-    logo_upload_service.delete_logo_file(org.logo_url, _LOGO_DIR_NAME)
+    previous_url = org.logo_url
     org.logo_url = None
     await db.commit()
     await db.refresh(org)
+
+    await logo_upload_service.delete_logo_file(previous_url, _LOGO_DIR_NAME)
     return OrganizationRead.model_validate(org)
 
 

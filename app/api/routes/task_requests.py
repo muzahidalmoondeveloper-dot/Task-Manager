@@ -162,6 +162,7 @@ async def convert_task_request(
     task = await task_repo.create(
         TaskCreate(
             name=request.title,
+            description=request.description,
             project_id=project_id,
             team_id=payload.team_id,
             assignee_id=payload.assignee_id,

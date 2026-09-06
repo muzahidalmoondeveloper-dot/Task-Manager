@@ -114,6 +114,7 @@ class UserRead(BaseModel):
     is_team_manager: bool = False
     is_project_manager: bool = False
     is_active: bool
+    profile_picture_url: str | None = None
 
     email_verified_at: datetime | None = None
     last_login_otp_verified_at: datetime | None = None
