@@ -29,6 +29,7 @@ class ActivityActorSummary(BaseModel):
 class ActivityLogRead(BaseModel):
     id: int
     action: str
+    category: str | None = None
     actor: ActivityActorSummary
     entity_type: str | None = None
     entity_id: int | None = None

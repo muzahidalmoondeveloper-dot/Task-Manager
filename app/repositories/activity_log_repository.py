@@ -22,6 +22,7 @@ class ActivityLogRepository(TenantRepository):
         page_size: int = DEFAULT_PAGE_SIZE,
         actor_user_id: int | None = None,
         action: str | None = None,
+        category_prefix: str | None = None,
         entity_type: str | None = None,
         since: datetime | None = None,
         until: datetime | None = None,
@@ -29,7 +30,13 @@ class ActivityLogRepository(TenantRepository):
         """Newest-first, paginated, bounded page size. Returns
         (items, total_count) — `total_count` reflects the filtered set (not
         just the current page) so the frontend can render real pagination
-        rather than guessing from a partial page."""
+        rather than guessing from a partial page.
+
+        `category_prefix` (Task #8B) must already be a resolved, trusted
+        prefix from app.core.activity_actions.CATEGORY_PREFIXES — the
+        route layer is responsible for rejecting anything not on that
+        whitelist before it ever reaches here, so this never runs a LIKE
+        against arbitrary client-supplied text."""
         page = max(page, 1)
         page_size = max(1, min(page_size, MAX_PAGE_SIZE))
 
@@ -38,6 +45,8 @@ class ActivityLogRepository(TenantRepository):
             filters.append(ActivityLog.actor_user_id == actor_user_id)
         if action is not None:
             filters.append(ActivityLog.action == action)
+        if category_prefix is not None:
+            filters.append(ActivityLog.action.startswith(category_prefix))
         if entity_type is not None:
             filters.append(ActivityLog.entity_type == entity_type)
         if since is not None:

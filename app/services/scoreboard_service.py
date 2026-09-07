@@ -724,6 +724,23 @@ async def build_team_scoreboard(
         db, org_id, period, prev_anchor_start, prev_anchor_end, weights=weights, team_id=team.id, project_id=project_id,
     )
 
+    # Role-consistency fix (organization-role bug): `role` must reflect
+    # each member's OrganizationMembership.role in THIS org, never the
+    # legacy, non-org-specific `membership.user.role` (that `membership`
+    # is a *team* membership — `.user.role` is just `User.role`, which can
+    # be stale relative to the user's actual org role). Batched in one
+    # query keyed by (org_id, user_id) — never one lookup per member row.
+    member_user_ids = [m.user_id for m in team.memberships]
+    org_role_by_user_id: dict[int, str] = {}
+    if member_user_ids:
+        org_role_rows = await db.execute(
+            select(OrganizationMembership.user_id, OrganizationMembership.role).where(
+                OrganizationMembership.organization_id == org_id,
+                OrganizationMembership.user_id.in_(member_user_ids),
+            )
+        )
+        org_role_by_user_id = dict(org_role_rows.all())
+
     member_rows: list[TeamMemberScoreboardRow] = []
     for membership in team.memberships:
         member_tasks = await fetch_eligible_tasks(
@@ -733,7 +750,11 @@ async def build_team_scoreboard(
         member_rows.append(TeamMemberScoreboardRow(
             user_id=membership.user_id,
             full_name=membership.user.full_name,
-            role=membership.user.role,
+            # Safe non-fabricated fallback (never the legacy User.role) for
+            # the edge case of a team-membership row surviving after its
+            # org membership was removed/deactivated — should not happen
+            # in normal operation, but must never silently invent a role.
+            role=org_role_by_user_id.get(membership.user_id, "unknown"),
             result=member_result,
         ))
 
@@ -825,7 +846,13 @@ async def build_organization_scoreboard(
         rows.append(OrgScoreboardRow(
             user_id=user_id,
             full_name=user.full_name,
-            role=user.role,
+            # Role-consistency fix: every candidate here was already
+            # filtered above to OrganizationMembership.role == TEAM_MEMBER
+            # (this ranking is Team-Member-only by definition — see this
+            # function's docstring), so the org-scoped role is always
+            # TEAM_MEMBER — never the legacy, potentially-stale
+            # `user.role`.
+            role=TEAM_MEMBER,
             manager_id=team.team_manager_id,
             manager_name=team.team_manager.full_name if team.team_manager else None,
             team_id=team.id,

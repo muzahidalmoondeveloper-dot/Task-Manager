@@ -3,6 +3,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.org_roles import CLIENT
 from app.core.security import hash_password
 from app.models.organization import OrganizationMembership
 from app.models.user import User
@@ -113,6 +114,39 @@ class UserRepository:
         )
         result = await self.db.execute(stmt)
         return list(result.all())
+
+    async def list_org_assignable_candidates(self, org_id: uuid.UUID) -> list[tuple[User, str]]:
+        """Automation-assignee-resolution safe candidate set (organization-
+        role-consistency follow-up, cross-tenant automation-assignee fix):
+        active members of THIS organization only, active User accounts
+        only, Client always excluded (Client is never Task-assignable,
+        regardless of legacy User.role) — the exact same base eligibility
+        `app.core.task_assignment.validate_task_assignee` enforces at
+        persistence time, computed as a single JOIN (no N+1).
+
+        Returns (User, org_role) pairs — `org_role` is
+        OrganizationMembership.role for THIS org, never the legacy/global
+        `User.role` column, which can diverge per-organization and must
+        never decide automation fallback eligibility (e.g. "is this
+        candidate an Admin?").
+
+        This is the ONLY user candidate source automation code may use for
+        name/email matching or fallback-assignee selection — never
+        UserRepository.list_all(), which scans every user in the entire
+        database with no organization boundary at all."""
+        stmt = (
+            select(User, OrganizationMembership.role)
+            .join(OrganizationMembership, OrganizationMembership.user_id == User.id)
+            .where(
+                OrganizationMembership.organization_id == org_id,
+                OrganizationMembership.is_active.is_(True),
+                OrganizationMembership.role != CLIENT,
+                User.is_active.is_(True),
+            )
+            .order_by(User.full_name.asc())
+        )
+        result = await self.db.execute(stmt)
+        return [(row[0], row[1]) for row in result.all()]
 
     async def list_by_org_and_roles(self, org_id: uuid.UUID, roles: list[str]) -> list[User]:
         """Org-scoped counterpart to list_by_roles() — matches on the

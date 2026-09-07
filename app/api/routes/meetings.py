@@ -1207,6 +1207,9 @@ async def cancel_recording(
 async def _extract_and_create_tasks(
     meeting: Meeting, tenant: TenantContext, db: AsyncSession,
 ) -> list[ExtractedTaskSummary]:
+    from app.core.auth_errors import AppException
+    from app.core.task_assignment import validate_task_assignee
+    from app.repositories.team_repository import TeamRepository
     from app.services.ai_task_extractor import AITaskExtractor
     from app.services.automation_tasks import resolve_user_id
     from app.repositories.user_repository import UserRepository
@@ -1214,8 +1217,22 @@ async def _extract_and_create_tasks(
     if not meeting.transcript_text or not meeting.transcript_text.strip():
         return []
 
-    users = await UserRepository(db).list_all()
-    known_users = [{"name": u.full_name, "email": u.email} for u in users]
+    # SECURITY: org-scoped candidate set only (cross-tenant automation-
+    # assignee fix) — NEVER UserRepository.list_all(), which scans every
+    # user in the entire database with no organization boundary. Active,
+    # non-Client members of THIS organization only.
+    user_candidates = await UserRepository(db).list_org_assignable_candidates(tenant.organization_id)
+    known_users = [{"name": u.full_name, "email": u.email} for u, _role in user_candidates]
+
+    # Every task this flow creates shares meeting.team_id (there is no
+    # per-task team extraction here, unlike the email/transcript flow) —
+    # if the meeting is team-scoped, the assignee candidate pool is
+    # narrowed to that team's members for the whole meeting (Rule B:
+    # a Team Task's assignee must belong to that exact Team).
+    if meeting.team_id is not None:
+        assignee_pool = await TeamRepository(db, tenant.organization_id).list_assignable_members(meeting.team_id)
+    else:
+        assignee_pool = [u for u, _role in user_candidates]
 
     extractor = AITaskExtractor()
     extracted_tasks, _ = await extractor.extract_tasks(
@@ -1238,9 +1255,25 @@ async def _extract_and_create_tasks(
             continue
 
         assignee_id = resolve_user_id(
-            users, extracted.suggested_assignee_name, extracted.suggested_assignee_email,
+            assignee_pool, extracted.suggested_assignee_name, extracted.suggested_assignee_email,
         )
-        assignee = next((u for u in users if u.id == assignee_id), None) if assignee_id else None
+
+        # Defense-in-depth (PHASE 16): this flow builds `Task` directly
+        # (db.add()), bypassing TaskRepository.create()'s own
+        # validate_task_assignee() call entirely, so it must re-run the
+        # same authoritative check itself before persisting — fails safe
+        # to Unassigned rather than ever letting a resolution defect
+        # persist a cross-tenant/Client/inactive/non-team assignee.
+        if assignee_id is not None:
+            try:
+                await validate_task_assignee(
+                    db, organization_id=tenant.organization_id,
+                    assignee_id=assignee_id, team_id=meeting.team_id,
+                )
+            except AppException:
+                assignee_id = None
+
+        assignee = next((u for u in assignee_pool if u.id == assignee_id), None) if assignee_id else None
 
         task = Task(
             name=extracted.title,

@@ -329,7 +329,7 @@ async def get_project_items(
         "objectives": [ObjectiveRead.model_validate(o) for o in objectives],
         "objective_rocks": [RockOut.model_validate(r) for r in objective_rocks],
         "rock_kpis": [KPIOut.model_validate(k) for k in rock_kpis],
-        "teams": [serialize_team(t) for t in project_teams],
+        "teams": [await serialize_team(db, org_id, t) for t in project_teams],
     }
 
 

@@ -5,6 +5,7 @@ from sqlalchemy import select, update as sql_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.auth_errors import AppException
 from app.models.organization import OrganizationMembership
 from app.models.integration import (
     CalendarEvent,
@@ -185,7 +186,13 @@ def extract_recipients(values: list[dict] | None) -> list[str]:
     return recipients
 
 
-def resolve_user_id(users: list[User], name: str | None, email: str | None) -> int | None:
+def resolve_user_id(candidates: list[User], name: str | None, email: str | None) -> int | None:
+    """Name/email resolution — SECURITY-SENSITIVE: `candidates` is trusted
+    as-is with no further tenant/team filtering here, so every caller MUST
+    already have scoped it (organization-safe candidate set, and further
+    narrowed to Team members for a Team Task) before calling this. Never
+    pass UserRepository.list_all() or any other unscoped/global user list."""
+    users = candidates
     normalized_email = normalize_text(email)
     normalized_name = normalize_text(name)
 
@@ -266,23 +273,72 @@ def resolve_team_from_meeting_title(teams: list[Team], title: str | None) -> int
 
 
 def find_fallback_assignee_id(
-    users: list[User],
+    candidates: list[tuple[User, str]],
     fallback_email: str | None,
     integration_owner_id: int,
-) -> int:
-    # 1. Try the source owner (meeting organizer or email sender)
+    eligible_ids: set[int] | None = None,
+) -> int | None:
+    """Tenant/team-safe fallback-assignee heuristic (cross-tenant
+    automation-assignee security fix).
+
+    `candidates` MUST already be scoped to the current organization's
+    active, non-Client members — see
+    `UserRepository.list_org_assignable_candidates()` — as (User, org_role)
+    pairs, `org_role` being `OrganizationMembership.role` for THIS
+    organization, never the legacy/global `User.role` column (a user who
+    is Admin in another org, or whose stale `User.role` merely SAYS
+    "admin", must never be treated as this org's Admin fallback).
+
+    `eligible_ids`, when given (a Team Task), further restricts every step
+    below to members of that exact team — the same Rule B
+    `app.core.task_assignment.validate_task_assignee` enforces at
+    persistence time. An organization Admin who is not a member of the
+    task's team must NOT become its fallback assignee merely by being
+    Admin (Team eligibility is the boundary, not org-wide privilege).
+
+    Preserves the original 3-step intent exactly — source owner, then
+    first Admin, then the integration owner — just made tenant/team-safe
+    and FAIL-SAFE: if no step finds an eligible candidate, returns None
+    (Unassigned) instead of unconditionally trusting an id that may not
+    actually be eligible (the old code always returned
+    `integration_owner_id` as an unconditional last resort, even if that
+    id somehow wasn't a valid candidate — see PHASE 12).
+
+    Determinism (PHASE 20): "first Admin" is the first Admin encountered
+    in `candidates` — callers pass it pre-sorted by full_name ascending
+    (same ordering `list_org_assignable_candidates()`/
+    `list_assignable_members()` already use), never undefined DB row
+    order.
+    """
+    def is_eligible(user_id: int) -> bool:
+        return eligible_ids is None or user_id in eligible_ids
+
+    candidate_ids = {u.id for u, _role in candidates}
+
+    # 1. Try the source owner (meeting organizer or email sender) — resolved
+    # only among the already-scoped candidate set, so an email belonging to
+    # someone outside this organization/team can never match here.
     if fallback_email:
-        owner_id = resolve_user_id(users, None, fallback_email)
-        if owner_id is not None:
+        owner_id = resolve_user_id([u for u, _role in candidates], None, fallback_email)
+        if owner_id is not None and is_eligible(owner_id):
             return owner_id
 
-    # 2. Fall back to the first admin user
-    for u in users:
-        if u.role == ADMIN:
+    # 2. Fall back to the first Admin, per THIS organization's authoritative
+    # OrganizationMembership.role.
+    for u, role in candidates:
+        if role == ADMIN and is_eligible(u.id):
             return u.id
 
-    # 3. Last resort: the user who owns the integration
-    return integration_owner_id
+    # 3. Last resort: the user who owns the integration/triggered this sync
+    # — only if they are themselves still an eligible candidate (active,
+    # non-Client member of this org, and of this task's team if scoped).
+    if integration_owner_id in candidate_ids and is_eligible(integration_owner_id):
+        return integration_owner_id
+
+    # 4. No safe fallback within this organization/team scope — leave the
+    # Task unassigned rather than ever reaching outside the scope this
+    # function was given.
+    return None
 
 
 async def resolve_org_id_for_user(db: AsyncSession, user: User):
@@ -598,7 +654,13 @@ async def analyze_yesterday_sources_for_user(
     project_repo = ProjectRepository(db, org_id)
     team_repo = TeamRepository(db, org_id)
 
-    users = await user_repo.list_all()
+    # SECURITY: org-scoped candidate set only (cross-tenant automation-
+    # assignee fix) — NEVER user_repo.list_all(), which scans every user in
+    # the entire database with no organization boundary. Active, non-Client
+    # members of THIS organization only; carries each user's authoritative
+    # OrganizationMembership.role (never the legacy/global User.role) for
+    # the Admin-fallback check below.
+    user_candidates = await user_repo.list_org_assignable_candidates(org_id)
     projects = await project_repo.list_all()
     teams = await team_repo.list_all()
 
@@ -660,9 +722,13 @@ async def analyze_yesterday_sources_for_user(
         nonlocal tasks_created_without_start_date
         nonlocal tasks_created_without_due_date
 
+        # Privacy (PHASE 21) + tenant safety: the AI extractor's
+        # "known users" hint list is built from the org-scoped candidate
+        # set only — never leaks another organization's user names/emails
+        # into this org's extraction prompt.
         known_users_list = [
             {"name": u.full_name, "email": u.email}
-            for u in users
+            for u, _role in user_candidates
         ]
 
         extracted_tasks, raw_payload = await extractor.extract_tasks(
@@ -675,25 +741,11 @@ async def analyze_yesterday_sources_for_user(
         sources_analyzed += 1
 
         for extracted_task in extracted_tasks:
-            assignee_id = resolve_user_id(
-                users,
-                extracted_task.suggested_assignee_name,
-                extracted_task.suggested_assignee_email,
-            )
-
-            if assignee_id is None:
-                assignee_id = find_fallback_assignee_id(
-                    users,
-                    fallback_assignee_email,
-                    user.id,
-                )
-                tasks_created_without_assignee += 1
-
-            project_id = resolve_project_id(
-                projects,
-                extracted_task.suggested_project_name,
-            )
-
+            # Team resolution happens BEFORE assignee resolution (PHASE 13/
+            # 14) — a Team Task's assignee boundary is that exact Team, so
+            # the candidate set for both explicit name/email matching and
+            # fallback selection must already be narrowed to the team
+            # before either runs, never widened back to the whole org.
             team_id = resolve_team_id(
                 teams,
                 extracted_task.suggested_team_name,
@@ -701,6 +753,34 @@ async def analyze_yesterday_sources_for_user(
 
             if team_id is None and source_type == "transcript":
                 team_id = resolve_team_from_meeting_title(teams, source_title)
+
+            if team_id is not None:
+                team_members = await team_repo.list_assignable_members(team_id)
+                assignee_pool = team_members
+                eligible_ids = {u.id for u in team_members}
+            else:
+                assignee_pool = [u for u, _role in user_candidates]
+                eligible_ids = None
+
+            assignee_id = resolve_user_id(
+                assignee_pool,
+                extracted_task.suggested_assignee_name,
+                extracted_task.suggested_assignee_email,
+            )
+
+            if assignee_id is None:
+                assignee_id = find_fallback_assignee_id(
+                    user_candidates,
+                    fallback_assignee_email,
+                    user.id,
+                    eligible_ids=eligible_ids,
+                )
+                tasks_created_without_assignee += 1
+
+            project_id = resolve_project_id(
+                projects,
+                extracted_task.suggested_project_name,
+            )
 
             if project_id is None:
                 tasks_created_without_project += 1
@@ -714,19 +794,45 @@ async def analyze_yesterday_sources_for_user(
             if extracted_task.suggested_due_date is None:
                 tasks_created_without_due_date += 1
 
-            await task_repo.create(
-                TaskCreate(
-                    name=extracted_task.title,
-                    description=extracted_task.description,
-                    start_date=extracted_task.suggested_start_date,
-                    due_date=extracted_task.suggested_due_date,
-                    assignee_id=assignee_id,
-                    project_id=project_id,
-                    team_id=team_id,
-                    status="todo",
-                ),
-                created_by_id=user.id,
-            )
+            try:
+                await task_repo.create(
+                    TaskCreate(
+                        name=extracted_task.title,
+                        description=extracted_task.description,
+                        start_date=extracted_task.suggested_start_date,
+                        due_date=extracted_task.suggested_due_date,
+                        assignee_id=assignee_id,
+                        project_id=project_id,
+                        team_id=team_id,
+                        status="todo",
+                    ),
+                    created_by_id=user.id,
+                )
+            except AppException:
+                # Defense-in-depth (PHASE 16): TaskRepository.create() now
+                # itself enforces validate_task_assignee() before
+                # persisting, so a resolution defect above can never reach
+                # the database with an invalid/cross-tenant/Client/inactive
+                # assignee — it fails safe to Unassigned instead of
+                # crashing the whole batch over one bad candidate.
+                logger.warning(
+                    "Automation-resolved assignee %s failed final validation for org %s — creating task unassigned instead.",
+                    assignee_id, org_id,
+                )
+                await task_repo.create(
+                    TaskCreate(
+                        name=extracted_task.title,
+                        description=extracted_task.description,
+                        start_date=extracted_task.suggested_start_date,
+                        due_date=extracted_task.suggested_due_date,
+                        assignee_id=None,
+                        project_id=project_id,
+                        team_id=team_id,
+                        status="todo",
+                    ),
+                    created_by_id=user.id,
+                )
+                tasks_created_without_assignee += 1
 
             tasks_created += 1
 

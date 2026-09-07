@@ -12,6 +12,7 @@ from app.core.org_roles import CLIENT, TEAM_MEMBER
 from app.core.project_access import require_project_management_access
 from app.core.tenant import TenantContext, get_tenant_context, require_org_admin, require_org_manager
 from app.models.report import Report, ReportContent
+from app.repositories.organization_repository import OrganizationRepository
 from app.repositories.project_repository import ProjectRepository
 from app.repositories.report_repository import ReportRepository
 from app.repositories.user_repository import UserRepository
@@ -169,7 +170,7 @@ async def create_employee_report(
     payload: EmployeeReportCreate,
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    await _require_can_view_scoreboard(tenant, payload.employee_id)
+    membership = await _require_can_view_scoreboard(tenant, payload.employee_id)
 
     employee = await UserRepository(tenant.db).get_by_id(payload.employee_id)
     if employee is None:
@@ -192,6 +193,7 @@ async def create_employee_report(
             period=payload.period, project_id=payload.project_id, team_id=payload.team_id,
             start_date=payload.start_date, end_date=payload.end_date,
             include_task_details=payload.include_task_details,
+            employee_org_role=membership.role,
         )
     except ValueError as exc:
         raise AppException(ErrorDef(code="SCOREBOARD_INVALID_PERIOD", status=http_status.HTTP_400_BAD_REQUEST, message=str(exc)))
@@ -263,11 +265,17 @@ async def _regenerate_performance_pdf(tenant: TenantContext, report) -> tuple[by
 
     if report.report_type == "employee_performance":
         employee = await UserRepository(tenant.db).get_by_id(report.employee_id)
+        # Role-consistency fix: resolve the org-scoped role fresh from
+        # OrganizationMembership (never `employee.role`) — this re-render
+        # path doesn't go through _require_can_view_scoreboard, so it must
+        # look it up itself, same (organization_id, user_id) scoping.
+        membership = await OrganizationRepository(tenant.db).get_membership(tenant.organization_id, report.employee_id)
         pdf_bytes, new_snapshot = await performance_pdf_service.generate_employee_pdf(
             tenant.db, tenant.organization, employee, tenant.user.full_name, report,
             period="custom", project_id=project_id, team_id=snapshot.get("team_id"),
             start_date=report.period_start, end_date=report.period_end,
             include_task_details=include_task_details,
+            employee_org_role=membership.role if membership else "unknown",
         )
         subject_name = employee.full_name
         kind = "employee"

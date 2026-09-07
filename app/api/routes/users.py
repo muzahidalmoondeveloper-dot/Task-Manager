@@ -1,9 +1,20 @@
+import uuid
+
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from fastapi import File as FastAPIFile
 from fastapi import status as http_status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.activity_actions import ENTITY_USER, USER_ROLE_CHANGED, USER_UPDATED
+from app.core.access_token_bearer import AccessTokenBearer
+from app.core.activity_actions import (
+    AUTH_PASSWORD_CHANGED,
+    ENTITY_USER,
+    USER_ACTIVATED,
+    USER_CREATED,
+    USER_DEACTIVATED,
+    USER_ROLE_CHANGED,
+    USER_UPDATED,
+)
 from app.core.auth_errors import AppException, AuthError, ErrorDef
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
@@ -66,6 +77,7 @@ async def change_current_user_password(
     payload: ChangePasswordRequest,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    token_payload: dict = Depends(AccessTokenBearer()),
 ):
     if not verify_password(payload.current_password, current_user.hashed_password):
         raise AppException(_INVALID_CURRENT_PASSWORD)
@@ -76,6 +88,18 @@ async def change_current_user_password(
 
     current_user.hashed_password = hash_password(payload.new_password)
     await db.commit()
+
+    # Task #8B — `get_current_user` alone carries no org context, so
+    # AccessTokenBearer() is added purely to read org_id off the same
+    # token's own claims (same established pattern as auth.py's
+    # logout/get_me). Never log the old/new password or its hash.
+    raw_org_id = token_payload.get("org_id")
+    if raw_org_id:
+        await activity_service.record(
+            db, organization_id=uuid.UUID(str(raw_org_id)), actor=current_user,
+            action=AUTH_PASSWORD_CHANGED,
+        )
+
     return {"message": "Password updated successfully."}
 
 
@@ -198,6 +222,17 @@ async def create_user(
     await db.commit()
     await db.refresh(user)
 
+    # Task #8B — this is a direct admin-created account (no
+    # OrganizationInvitation row, no email sent), distinct from
+    # invite_member()'s user.invited flow — "invitation sent" and "user
+    # created" are deliberately two different events for two different
+    # workflows, never conflated.
+    await activity_service.record(
+        db, organization_id=tenant.organization_id, actor=tenant.user,
+        action=USER_CREATED, entity_type=ENTITY_USER, entity_id=user.id, entity_label=user.full_name,
+        metadata={"role": payload.role},
+    )
+
     return UserRead.model_validate(user).model_copy(update={"role": payload.role})
 
 
@@ -221,6 +256,7 @@ async def update_user(
     membership = await org_repo.get_membership(tenant.organization_id, user_id)
     current_role = membership.role if membership else user.role
     current_is_team_manager = membership.is_team_manager if membership else False
+    current_is_active = user.is_active
 
     if payload.role is not None:
         is_owner_record = user_id == tenant.organization.owner_id
@@ -270,8 +306,20 @@ async def update_user(
             action=USER_ROLE_CHANGED, entity_type=ENTITY_USER, entity_id=user.id, entity_label=user.full_name,
             metadata={"from_role": current_role, "to_role": payload.role},
         )
+
+    # Task #8B — is_active toggles get their own dedicated
+    # user.activated/user.deactivated event instead of being folded into
+    # the generic "fields_changed" list below, since active/inactive is
+    # an important, distinct admin action worth its own audit entry.
+    if payload.is_active is not None and payload.is_active != current_is_active:
+        await activity_service.record(
+            db, organization_id=tenant.organization_id, actor=tenant.user,
+            action=USER_ACTIVATED if payload.is_active else USER_DEACTIVATED,
+            entity_type=ENTITY_USER, entity_id=user.id, entity_label=user.full_name,
+        )
+
     other_fields_changed = [
-        field for field in ("full_name", "email", "is_active", "is_org_admin", "is_team_manager", "is_project_manager")
+        field for field in ("full_name", "email", "is_org_admin", "is_team_manager", "is_project_manager")
         if getattr(payload, field, None) is not None
     ]
     if other_fields_changed:

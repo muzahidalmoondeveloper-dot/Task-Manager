@@ -19,7 +19,13 @@ from app.core.database import get_db
 from app.core.org_roles import PROJECT_MANAGER, TEAM_MEMBER
 from app.core.project_access import is_project_scoped, list_project_team_ids, require_project_access
 from app.core.task_assignment import validate_task_assignee
-from app.core.tenant import TenantContext, get_tenant_context, require_org_admin, require_org_manager
+from app.core.tenant import (
+    TenantContext,
+    get_tenant_context,
+    require_org_admin,
+    require_org_manager,
+    require_org_manager_or_project_manager,
+)
 from app.models.notification import Notification
 from app.models.task import Task
 from app.models.team import Team, TeamMembership
@@ -202,23 +208,30 @@ async def list_tasks(
     due_date_from: date | None = Query(default=None),
     due_date_to: date | None = Query(default=None),
     overdue: bool = Query(default=False),
-    tenant: TenantContext = Depends(require_org_manager),
+    tenant: TenantContext = Depends(require_org_manager_or_project_manager),
 ):
     """"All Tasks" — Owner/Admin see every task in the org, unchanged.
 
-    Team Manager Task-scope follow-up: `require_org_manager` above lets
-    Owner, Admin, AND (base role or granted flag) Team Manager reach this
-    endpoint — a plain Project Manager alone still cannot (matching their
-    existing, unchanged scope: PM task listing is project-scoped via
-    GET /tasks/project/{id}, never this org-wide endpoint). For anyone
-    who is NOT Admin/Owner, this must never silently return every
-    organization task — it's scoped to the team(s) they actually manage
-    (`Team.team_manager_id`, never mere TeamMembership), unioned with any
-    project(s) they're a genuine ProjectMembership member of if they ALSO
-    hold Project Manager capability (the same "each capability
-    contributes its own scope" combined-role model app.core.project_access
-    already documents) — never expanded to the whole organization just
-    because one of their roles happens to be Team Manager.
+    Team Manager Task-scope follow-up + Project Manager "All Tasks"
+    follow-up: `require_org_manager_or_project_manager` above lets Owner,
+    Admin, Team Manager (base role or granted flag), AND Project Manager
+    (base role or granted flag) reach this endpoint. For anyone who is NOT
+    Admin/Owner, this must never silently return every organization task
+    — it's scoped to the team(s) they actually manage (`Team.
+    team_manager_id`, never mere TeamMembership), unioned with any
+    project(s) they're a genuine ProjectMembership member of if they hold
+    Project Manager capability (the same "each capability contributes its
+    own scope" combined-role model app.core.project_access already
+    documents) — never expanded to the whole organization just because
+    one of their roles happens to be Team Manager or Project Manager. A
+    plain Project Manager (no Team Manager capability) simply gets an
+    empty `scope_team_ids` — contributes nothing — and a real
+    `scope_project_ids`, so they see every Task in every project they
+    manage, regardless of assignee, and nothing else. `project_id`/
+    `team_id` query filters below narrow WITHIN this scope (ANDed with
+    it) — they can never be used to reach outside it (e.g. a Project
+    Manager passing an unauthorized project_id gets zero results, never
+    an expanded result set).
     """
     repo = TaskRepository(tenant.db, tenant.organization_id)
 

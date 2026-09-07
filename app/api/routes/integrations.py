@@ -2,11 +2,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.activity_actions import ENTITY_INTEGRATION, INTEGRATION_CONNECTED, INTEGRATION_DISCONNECTED
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.tenant import TenantContext, enforce_feature, get_tenant_context, require_org_admin
+from app.models.user import User
 from app.repositories.integration_repository import IntegrationRepository
 from app.schemas.integration import IntegrationAccountRead
+from app.services import activity_service
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import delete, select
 from app.models.integration import (
@@ -164,6 +167,19 @@ async def google_callback(
         scopes=token_data.get("scope", "").split(" "),
     )
 
+    # Task #8B — user_id/org_id both come from the trusted, server-signed
+    # `state` payload (never from the OAuth provider's own response), so
+    # this is a safely-scoped, genuine connection event. Metadata is
+    # strictly the provider identity — NEVER the access_token,
+    # refresh_token, or scopes, all of which are present a few lines above
+    # in this same function.
+    actor = await db.get(User, state_data["user_id"])
+    await activity_service.record(
+        db, organization_id=org.id, actor=actor, action=INTEGRATION_CONNECTED,
+        entity_type=ENTITY_INTEGRATION, entity_id=None, entity_label="Google Calendar",
+        metadata={"provider": "google"},
+    )
+
     return RedirectResponse(f"{settings.FRONTEND_URL}/integrations?connected=google")
 
 
@@ -213,6 +229,9 @@ async def disconnect_integration_account(
         )
     )
 
+    provider = account.provider
+    account_email = account.account_email
+
     await db.execute(
         delete(IntegrationAccount).where(
             IntegrationAccount.id == account.id
@@ -221,10 +240,20 @@ async def disconnect_integration_account(
 
     await db.commit()
 
+    # Task #8B — provider/email captured above before the row is deleted,
+    # since account.provider isn't safely readable after the delete.
+    # Metadata is provider identity only — never any credential.
+    await activity_service.record(
+        db, organization_id=tenant.organization_id, actor=tenant.user,
+        action=INTEGRATION_DISCONNECTED, entity_type=ENTITY_INTEGRATION, entity_id=None,
+        entity_label=provider.capitalize() if provider else None,
+        metadata={"provider": provider},
+    )
+
     return {
-        "message": f"{account.provider.capitalize()} account disconnected.",
-        "provider": account.provider,
-        "account_email": account.account_email,
+        "message": f"{provider.capitalize()} account disconnected.",
+        "provider": provider,
+        "account_email": account_email,
     }
 
 
@@ -265,6 +294,15 @@ async def microsoft_callback(
         refresh_token=token_data.get("refresh_token"),
         expires_at=calculate_expires_at(token_data.get("expires_in")),
         scopes=token_data.get("scope", "").split(" "),
+    )
+
+    # Task #8B — mirrors google_callback()'s activity logging above: trusted
+    # server-signed state, provider-identity-only metadata, never tokens/scopes.
+    actor2 = await db.get(User, state_data["user_id"])
+    await activity_service.record(
+        db, organization_id=org2.id, actor=actor2, action=INTEGRATION_CONNECTED,
+        entity_type=ENTITY_INTEGRATION, entity_id=None, entity_label="Microsoft 365",
+        metadata={"provider": "microsoft"},
     )
 
     return RedirectResponse(f"{settings.FRONTEND_URL}/integrations?connected=microsoft")
