@@ -1,3 +1,4 @@
+import logging
 import time
 import uuid
 from datetime import datetime, timezone
@@ -8,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.access_token_bearer import AccessTokenBearer
+from app.core.activity_actions import AUTH_LOGIN, AUTH_LOGOUT, AUTH_PASSWORD_RESET_COMPLETED
 from app.core.auth_errors import AppException, AuthError, ErrorDef, TokenError
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
@@ -49,10 +51,12 @@ from app.schemas.auth import (
 )
 from app.schemas.organization import OrgSummary
 from app.schemas.user import UserCreate, UserRead
-from app.services.auth_security_service import AuthSecurityService, get_client_ip
+from app.services import activity_service
+from app.services.auth_security_service import AuthSecurityService, get_client_ip, normalize_email
 from fastapi import status as http_status
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
+logger = logging.getLogger("app.auth")
 
 
 async def _rate_limited_error(rate_limiter: RateLimiter, scope: str, request: Request) -> AppException:
@@ -85,6 +89,17 @@ _INVITATION_REVOKED = ErrorDef(
     code="INVITATION_REVOKED",
     status=http_status.HTTP_400_BAD_REQUEST,
     message="This invitation has been revoked.",
+)
+# Invitation identity-mismatch fix (session/invitation identity conflict):
+# 409 — distinct from the 400s above (which mean "this invitation itself
+# is unusable") and from a generic 403 ("you're not allowed") — this is
+# specifically "this invitation is valid, but conflicts with who's
+# currently authenticated." Message deliberately never names the invited
+# email/account — see this route's own comment for why.
+_INVITATION_ACCOUNT_MISMATCH = ErrorDef(
+    code="INVITATION_ACCOUNT_MISMATCH",
+    status=http_status.HTTP_409_CONFLICT,
+    message="This invitation was sent to a different account. Please sign out and continue with the invited account.",
 )
 _ORG_NOT_FOUND = ErrorDef(
     code="ORG_NOT_FOUND",
@@ -376,6 +391,18 @@ async def login(
         org_is_team_manager=org_is_team_manager, org_is_project_manager=org_is_project_manager,
     )
 
+    # Task #8B — auth.login is recorded ONLY here, on a genuinely
+    # successful password login that resolves to an active organization.
+    # The three earlier early-returns above (invalid credentials, email
+    # not verified, OTP required) never reach this line. When org_id is
+    # None (brand-new user with zero org memberships yet) this is
+    # deliberately NOT logged — ActivityLog.organization_id is NOT NULL
+    # and must never be invented.
+    if org_id is not None:
+        await activity_service.record(
+            db, organization_id=org_id, actor=user, action=AUTH_LOGIN,
+        )
+
     return LoginPasswordResponse(
         otp_required=False,
         email_verification_required=False,
@@ -428,6 +455,15 @@ async def verify_login_otp(
         user, db, token_cache, org_id=org_id, org_role=org_role, org_status=org_status, org_is_admin=org_is_admin,
         org_is_team_manager=org_is_team_manager, org_is_project_manager=org_is_project_manager,
     )
+
+    # Task #8B — the OTP-required counterpart to login()'s auth.login
+    # recording above. Each genuine login attempt completes through
+    # exactly one of these two routes, so together they produce exactly
+    # one auth.login event per successful login, never zero, never two.
+    if org_id is not None:
+        await activity_service.record(
+            db, organization_id=org_id, actor=user, action=AUTH_LOGIN,
+        )
 
     return LoginPasswordResponse(
         otp_required=False,
@@ -598,6 +634,21 @@ async def accept_invitation(
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     if expires_at < now:
         raise AppException(_INVITATION_EXPIRED)
+
+    # SECURITY — invitation identity-mismatch fix: an invitation may only
+    # be accepted by the identity it was actually sent to. Without this
+    # check, whichever account happened to be authenticated in the browser
+    # that opened the link (e.g. Alice, already logged in) would silently
+    # receive Bob's invited membership/role, AND Bob's invitation would be
+    # marked accepted — a false-success state where Bob never actually
+    # gets access. This must run BEFORE any mutation below (membership
+    # creation, project membership, marking the invitation accepted) —
+    # raising here leaves the invitation exactly as it was (still
+    # `pending`, `accepted_at` still None), since nothing has been
+    # flushed/committed yet. Never names the invited email in the
+    # response — see _INVITATION_ACCOUNT_MISMATCH's own comment.
+    if normalize_email(current_user.email) != normalize_email(invitation.email):
+        raise AppException(_INVITATION_ACCOUNT_MISMATCH)
 
     # Check if already a member
     existing = await org_repo.get_membership(invitation.organization_id, current_user.id)
@@ -880,6 +931,27 @@ async def logout(
     await db.commit()
     ttl = max(0, int(exp) - int(time.time()))
     await token_cache.blacklist_access_token(jti, ttl)
+
+    # Task #8B — one explicit user-initiated logout → at most one
+    # auth.logout event (not one per revoked device/session, and never
+    # for the implicit "cleanup" calls a frontend might fire on its own).
+    # org_id/actor come straight from this same access token's own
+    # claims, never re-derived — a failed lookup or a failed activity
+    # write below must never turn a successful, already-committed logout
+    # into an error response (activity_service.record() itself never
+    # raises, but the org_id/user lookups here are guarded defensively
+    # too, matching that same "never break the real action" rule).
+    try:
+        raw_org_id = token_payload.get("org_id")
+        logout_org_id = uuid.UUID(str(raw_org_id)) if raw_org_id else None
+        if logout_org_id is not None:
+            actor = await db.get(User, int(user_id))
+            await activity_service.record(
+                db, organization_id=logout_org_id, actor=actor, action=AUTH_LOGOUT,
+            )
+    except Exception:
+        logger.exception("Failed to record auth.logout activity for user_id=%s", user_id)
+
     return {"message": "Logged out successfully."}
 
 
@@ -996,4 +1068,17 @@ async def reset_password(
 
     user.hashed_password = hash_password(payload.new_password)
     await db.commit()
+
+    # Task #8B — this route is unauthenticated (identity is proven by the
+    # OTP itself, not a bearer token), so there's no TenantContext/JWT to
+    # pull org_id from. Reuse the same org-resolution helper login() uses
+    # — only log when it resolves a genuine active organization for this
+    # user, same "never invent organization_id" rule as everywhere else.
+    # Never store the OTP, the reset token, or the new/old password here.
+    org_id, *_ = await _resolve_org_for_user(user, db)
+    if org_id is not None:
+        await activity_service.record(
+            db, organization_id=org_id, actor=user, action=AUTH_PASSWORD_RESET_COMPLETED,
+        )
+
     return {"message": "Password reset successful. You can now log in."}

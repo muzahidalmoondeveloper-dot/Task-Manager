@@ -229,6 +229,26 @@ async def require_org_manager(
     return tenant
 
 
+async def require_org_manager_or_project_manager(
+    tenant: TenantContext = Depends(get_tenant_context),
+) -> TenantContext:
+    """Project Manager "All Tasks" follow-up: Owner, Admin, Team Manager,
+    OR a plain Project Manager (role or granted `is_project_manager` flag)
+    — READ access to the org-wide Task list endpoint only. Deliberately a
+    separate, broader dependency from `require_org_manager` above, which
+    still gates every Task *mutation* route (create/update/delete) and is
+    NOT changed by this — a Project Manager being allowed to call
+    GET /tasks does not grant them any new write privilege.
+
+    This does not by itself grant organization-wide Task visibility: the
+    route using this dependency is responsible for narrowing the actual
+    query to `scope_project_ids`/`scope_team_ids` for anyone who isn't
+    Owner/Admin, exactly as it already did for a Team Manager."""
+    if not (tenant.is_manager_or_above or tenant.has_project_manager_access):
+        raise AppException(_ORG_MANAGER_REQUIRED)
+    return tenant
+
+
 def check_active_billing(tenant: TenantContext) -> None:
     """Blocks creation of new teams/projects/members when the org's
     subscription is past_due/cancelled/incomplete_expired (e.g. the trial

@@ -6,6 +6,7 @@ from fastapi import status as http_status
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.org_roles import CLIENT
 from app.core.tenant import TenantContext, get_tenant_context
+from app.models.organization import OrganizationMembership
 from app.repositories.organization_repository import OrganizationRepository
 from app.repositories.project_repository import ProjectRepository
 from app.repositories.task_repository import TaskRepository
@@ -37,7 +38,7 @@ _PERIOD_LABELS = {
 }
 
 
-async def _require_can_view_scoreboard(tenant: TenantContext, target_user_id: int) -> None:
+async def _require_can_view_scoreboard(tenant: TenantContext, target_user_id: int) -> OrganizationMembership:
     # Scoreboards only exist for staff — clients (and anyone no longer an
     # active member of this org) never have one, regardless of who's asking.
     org_repo = OrganizationRepository(tenant.db)
@@ -48,9 +49,9 @@ async def _require_can_view_scoreboard(tenant: TenantContext, target_user_id: in
         raise AppException(_NOT_APPLICABLE)
 
     if tenant.user.id == target_user_id:
-        return
+        return target_membership
     if tenant.is_admin_or_owner:
-        return
+        return target_membership
 
     # Flag-aware (role OR granted privilege flag), and additive — a hybrid
     # Project Manager who's ALSO been granted team-manager privileges gets
@@ -76,12 +77,22 @@ async def _require_can_view_scoreboard(tenant: TenantContext, target_user_id: in
         project_repo = ProjectRepository(tenant.db, tenant.organization_id)
         for project_id in project_ids:
             if await project_repo.is_member(project_id, tenant.user.id):
-                return
+                return target_membership
 
     raise AppException(_FORBIDDEN)
 
 
-async def _resolve_employee(tenant: TenantContext, user_id: int) -> ScoreboardEmployee:
+async def _resolve_employee(tenant: TenantContext, user_id: int, membership: OrganizationMembership) -> ScoreboardEmployee:
+    """Role-consistency fix (organization-role bug): `role` here MUST come
+    from the caller-supplied `OrganizationMembership` (already scoped to
+    THIS organization + this user by `_require_can_view_scoreboard`) —
+    never from the legacy, non-org-specific `User.role` column, which can
+    silently go stale relative to a user's actual membership role (e.g. a
+    user promoted to Owner in this org while `User.role` still reads
+    "team_member"). This is exactly the field the User Detail / Scorecard
+    header renders, so using the wrong source here is what previously made
+    it disagree with the Users list (which already read membership.role
+    correctly)."""
     user_repo = UserRepository(tenant.db)
     employee = await user_repo.get_by_id(user_id)
     if employee is None:
@@ -96,7 +107,7 @@ async def _resolve_employee(tenant: TenantContext, user_id: int) -> ScoreboardEm
 
     return ScoreboardEmployee(
         id=employee.id, full_name=employee.full_name, email=employee.email,
-        role=employee.role, teams=teams,
+        role=membership.role, teams=teams,
     )
 
 
@@ -110,8 +121,8 @@ async def get_scoreboard(
     end_date: date | None = Query(default=None),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    await _require_can_view_scoreboard(tenant, user_id)
-    employee = await _resolve_employee(tenant, user_id)
+    membership = await _require_can_view_scoreboard(tenant, user_id)
+    employee = await _resolve_employee(tenant, user_id, membership)
 
     try:
         data = await scoring.build_employee_scoreboard(

@@ -5,6 +5,7 @@ from sqlalchemy import false, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.task_assignment import validate_task_assignee
 from app.models.task import Task
 from app.repositories.base_tenant_repository import TenantRepository
 from app.schemas.task import TaskCreate, TaskUpdate
@@ -179,6 +180,20 @@ class TaskRepository(TenantRepository):
         return result.scalar_one_or_none()
 
     async def create(self, payload: TaskCreate, created_by_id: int) -> Task:
+        # Defense-in-depth (cross-tenant automation-assignee security fix,
+        # PHASE 16): every caller of this repository — route-level
+        # create_task() (which already validates upstream) AND internal
+        # services that build a TaskCreate directly, like
+        # app.services.automation_tasks — is protected here, so a resolver
+        # defect anywhere upstream can never persist an assignee that is
+        # cross-tenant, a Client, inactive, or not a member of this task's
+        # Team. Raises the same AppException the route layer already
+        # surfaces; a re-validation here for a route call that already
+        # passed is a cheap no-op, never a behavior change for that path.
+        await validate_task_assignee(
+            self.db, organization_id=self.org_id,
+            assignee_id=payload.assignee_id, team_id=payload.team_id,
+        )
         task = Task(
             name=payload.name.strip(),
             description=payload.description,

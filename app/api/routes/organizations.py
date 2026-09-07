@@ -9,10 +9,20 @@ from fastapi import status as http_status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.activity_actions import (
+    ENTITY_INVITATION,
+    ENTITY_ORGANIZATION,
+    ENTITY_USER,
+    ORGANIZATION_SETTINGS_UPDATED,
+    ORGANIZATION_UPDATED,
+    USER_DEACTIVATED,
+    USER_INVITED,
+    USER_ROLE_CHANGED,
+)
 from app.core.auth_errors import AppException, AuthError, ErrorDef
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
-from app.core.org_roles import OWNER, TEAM_MEMBER
+from app.core.org_roles import ORG_ROLE_LABELS, OWNER, TEAM_MEMBER
 from app.core.plan_limits import get_plan_limits
 from app.core.security import create_access_token, create_refresh_token, hash_token
 from app.core.tenant import (
@@ -30,6 +40,7 @@ from app.models.team import Team
 from app.models.user import User
 from app.repositories.organization_repository import OrganizationRepository
 from app.repositories.refresh_token_repository import RefreshTokenRepository
+from app.services import activity_service
 from app.schemas.auth import TokenResponse
 from app.schemas.organization import (
     AcceptInvitationRequest,
@@ -293,9 +304,26 @@ async def update_current_org(
 ):
     repo = OrganizationRepository(db)
     data = payload.model_dump(exclude_unset=True)
+    previous_name = tenant.organization.name
     org = await repo.update(tenant.organization, data)
     await db.commit()
     await db.refresh(org)
+
+    # Task #8B — meaningful field names only, never the whole settings
+    # object; the org's display name is the one field where the safe
+    # scalar before/after value itself is worth recording.
+    changed_fields = list(data.keys())
+    if changed_fields:
+        metadata = {"fields_changed": changed_fields}
+        if "name" in data and data["name"] != previous_name:
+            metadata["name_from"] = previous_name
+            metadata["name_to"] = data["name"]
+        await activity_service.record(
+            db, organization_id=tenant.organization_id, actor=tenant.user,
+            action=ORGANIZATION_UPDATED, entity_type=ENTITY_ORGANIZATION, entity_id=None,
+            entity_label=org.name, metadata=metadata,
+        )
+
     return OrganizationRead.model_validate(org)
 
 
@@ -359,6 +387,22 @@ async def update_scoreboard_weights(
     org.scoreboard_overdue_weight = payload.scoreboard_overdue_weight
     await db.commit()
     await db.refresh(org)
+
+    # Task #8B — a genuine configuration change (affects real scoring
+    # behavior across the org), not a cosmetic UI preference, so it
+    # qualifies as organization.settings_updated. Safe bounded scalars
+    # only — never a dump of the whole settings/org object.
+    await activity_service.record(
+        db, organization_id=tenant.organization_id, actor=tenant.user,
+        action=ORGANIZATION_SETTINGS_UPDATED, entity_type=ENTITY_ORGANIZATION, entity_id=None,
+        entity_label=org.name,
+        metadata={
+            "completion_weight": org.scoreboard_completion_weight,
+            "on_time_weight": org.scoreboard_on_time_weight,
+            "overdue_weight": org.scoreboard_overdue_weight,
+        },
+    )
+
     return ScoreboardWeightsRead.model_validate(org)
 
 
@@ -410,8 +454,21 @@ async def remove_member(
     if membership is None or not membership.is_active:
         raise AuthError.user_not_found()
 
+    from app.repositories.user_repository import UserRepository as _UserRepository
+    removed_user = await _UserRepository(db).get_by_id(user_id)
+
     await repo.remove_member(membership)
     await db.commit()
+
+    # Task #8B — remove_member() is a soft membership deactivation
+    # (`membership.is_active = False`), not a hard delete — maps to
+    # user.deactivated, the same event update_user() emits for an
+    # is_active toggle, just reached through this separate route.
+    await activity_service.record(
+        db, organization_id=tenant.organization_id, actor=tenant.user,
+        action=USER_DEACTIVATED, entity_type=ENTITY_USER, entity_id=user_id,
+        entity_label=removed_user.full_name if removed_user else None,
+    )
 
 
 @router.put("/current/members/{user_id}/role", response_model=MembershipRead)
@@ -429,6 +486,7 @@ async def update_member_role(
     if membership is None or not membership.is_active:
         raise AuthError.user_not_found()
 
+    role_before = membership.role
     updated = await repo.update_member_role(membership, payload.role)
     await db.commit()
     await db.refresh(updated)
@@ -436,6 +494,20 @@ async def update_member_role(
     from app.repositories.user_repository import UserRepository
     user_repo = UserRepository(db)
     user = await user_repo.get_by_id(user_id)
+
+    # Task #8B — this is a second, separate role-change route from
+    # users.py's PATCH /users/{id} (which already logs USER_ROLE_CHANGED)
+    # — was previously a real audit gap: role changes made through this
+    # endpoint were completely unlogged. Same action + metadata shape as
+    # the other route for a consistent history regardless of which UI
+    # surface made the change.
+    if role_before != payload.role:
+        await activity_service.record(
+            db, organization_id=tenant.organization_id, actor=tenant.user,
+            action=USER_ROLE_CHANGED, entity_type=ENTITY_USER, entity_id=user_id,
+            entity_label=user.full_name if user else None,
+            metadata={"from_role": role_before, "to_role": payload.role},
+        )
 
     return MembershipRead(
         id=updated.id,
@@ -492,6 +564,18 @@ async def invite_member(
         inviter_name=tenant.user.full_name,
         token=invitation.token,
         role=invitation.role,
+    )
+
+    # Task #8B — the raw invited email is deliberately never persisted
+    # into activity_metadata/entity_label (avoid permanently storing an
+    # external person's email in an append-only log); a neutral role-based
+    # label is used instead. entity_type is "invitation", not "user" — no
+    # User row exists yet, distinguishing this from user.created.
+    role_label = ORG_ROLE_LABELS.get(invitation.role, invitation.role)
+    await activity_service.record(
+        db, organization_id=tenant.organization_id, actor=tenant.user,
+        action=USER_INVITED, entity_type=ENTITY_INVITATION, entity_id=None,
+        entity_label=f"{role_label} invitation", metadata={"role": invitation.role},
     )
 
     return InvitationRead.model_validate(invitation)

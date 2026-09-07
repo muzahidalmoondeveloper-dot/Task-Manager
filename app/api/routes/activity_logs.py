@@ -3,6 +3,8 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.activity_actions import CATEGORY_PREFIXES, category_for_action
+from app.core.auth_errors import AppException, ErrorDef
 from app.core.database import get_db
 from app.core.tenant import TenantContext, require_org_admin
 from app.models.activity_log import ActivityLog
@@ -12,6 +14,12 @@ from app.repositories.activity_log_repository import (
     ActivityLogRepository,
 )
 from app.schemas.activity_log import ActivityActorSummary, ActivityLogPage, ActivityLogRead
+
+_INVALID_CATEGORY = ErrorDef(
+    code="INVALID_CATEGORY",
+    status=400,
+    message="Unknown activity category.",
+)
 
 router = APIRouter(prefix="/activity-logs", tags=["Activity Log"])
 
@@ -51,6 +59,7 @@ def _serialize(entry: ActivityLog) -> ActivityLogRead:
     return ActivityLogRead(
         id=entry.id,
         action=entry.action,
+        category=category_for_action(entry.action),
         actor=actor_summary,
         entity_type=entry.entity_type,
         entity_id=entry.entity_id,
@@ -66,25 +75,39 @@ async def list_activity_logs(
     page_size: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     actor_user_id: int | None = None,
     action: str | None = None,
+    category: str | None = None,
     entity_type: str | None = None,
     since: datetime | None = None,
     until: datetime | None = None,
     tenant: TenantContext = Depends(require_org_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Organization-wide User Activity Log (Task #8). Owner/Admin only —
-    the exact same `require_org_admin` gate that already protects the
-    org-wide Users system (GET /users), so a plain Team Manager or Project
-    Manager gets the identical 403 they already get there; no new,
-    possibly-inconsistent authorization rule was introduced for this
-    endpoint. Newest-first, paginated (bounded page size), scoped strictly
-    to the caller's own organization via ActivityLogRepository(db,
-    tenant.organization_id) — org_id is never taken from the request.
+    """Organization-wide User Activity Log (Task #8, extended by Task
+    #8B). Owner/Admin only — the exact same `require_org_admin` gate that
+    already protects the org-wide Users system (GET /users), so a plain
+    Team Manager or Project Manager gets the identical 403 they already
+    get there; no new, possibly-inconsistent authorization rule was
+    introduced for this endpoint. Newest-first, paginated (bounded page
+    size), scoped strictly to the caller's own organization via
+    ActivityLogRepository(db, tenant.organization_id) — org_id is never
+    taken from the request.
+
+    `category` (Task #8B) is validated against
+    app.core.activity_actions.CATEGORY_PREFIXES — a closed whitelist —
+    before being turned into a `startswith()` filter, so the client can
+    never inject an arbitrary SQL LIKE pattern via this param.
     """
+    category_prefix = None
+    if category:
+        category_prefix = CATEGORY_PREFIXES.get(category)
+        if category_prefix is None:
+            raise AppException(_INVALID_CATEGORY)
+
     repo = ActivityLogRepository(db, tenant.organization_id)
     items, total = await repo.list_page(
         page=page, page_size=page_size, actor_user_id=actor_user_id,
-        action=action, entity_type=entity_type, since=since, until=until,
+        action=action, category_prefix=category_prefix,
+        entity_type=entity_type, since=since, until=until,
     )
     return ActivityLogPage(
         items=[_serialize(entry) for entry in items],

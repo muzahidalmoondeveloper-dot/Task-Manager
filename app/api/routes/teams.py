@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.activity_actions import ENTITY_TEAM, TEAM_CREATED, TEAM_DELETED, TEAM_UPDATED
@@ -7,6 +8,7 @@ from app.core.database import get_db
 from app.core.org_roles import ORG_MANAGEMENT_ROLES, TEAM_MEMBER
 from app.core.team_access import require_team_access
 from app.core.tenant import TenantContext, check_active_billing, get_tenant_context, require_org_admin, require_org_manager
+from app.models.organization import OrganizationMembership
 from app.models.team import Team
 from app.repositories.team_repository import TeamRepository
 from app.repositories.user_repository import UserRepository
@@ -34,7 +36,35 @@ _PLAN_LIMIT_TEAMS = ErrorDef(code="PLAN_LIMIT_EXCEEDED", status=status.HTTP_402_
 # forgotten per-route (same pattern as app.core.project_access).
 
 
-def _serialize(team: Team) -> TeamDetailRead:
+async def _serialize(db: AsyncSession, org_id, team: Team) -> TeamDetailRead:
+    """Role-consistency fix: `team_manager.role` / each `members[].role`
+    must reflect OrganizationMembership.role for THIS organization, never
+    the legacy `User.role` column `UserRead.model_validate(user)` would
+    otherwise pick up straight off the ORM object — see this file's
+    `list_team_assignable_users` docstring, which already documented this
+    exact gap. `team.memberships` here are *team* memberships
+    (TeamMembership), not org memberships, so `.user.role` was always the
+    stale global column. Batched in one query for the whole roster (team
+    manager + members), never one lookup per person."""
+    member_user_ids = {m.user_id for m in team.memberships if m.user is not None}
+    if team.team_manager_id is not None:
+        member_user_ids.add(team.team_manager_id)
+
+    org_role_by_user_id: dict[int, str] = {}
+    if member_user_ids:
+        rows = await db.execute(
+            select(OrganizationMembership.user_id, OrganizationMembership.role).where(
+                OrganizationMembership.organization_id == org_id,
+                OrganizationMembership.user_id.in_(member_user_ids),
+            )
+        )
+        org_role_by_user_id = dict(rows.all())
+
+    def _user_read_with_org_role(user) -> UserRead:
+        base = UserRead.model_validate(user)
+        org_role = org_role_by_user_id.get(user.id)
+        return base.model_copy(update={"role": org_role}) if org_role is not None else base
+
     return TeamDetailRead(
         id=team.id,
         name=team.name,
@@ -43,9 +73,9 @@ def _serialize(team: Team) -> TeamDetailRead:
         created_by_id=team.created_by_id,
         created_at=team.created_at,
         updated_at=team.updated_at,
-        team_manager=UserRead.model_validate(team.team_manager),
+        team_manager=_user_read_with_org_role(team.team_manager),
         members=[
-            UserRead.model_validate(m.user) for m in team.memberships if m.user is not None
+            _user_read_with_org_role(m.user) for m in team.memberships if m.user is not None
         ],
     )
 
@@ -72,7 +102,7 @@ async def list_teams(tenant: TenantContext = Depends(get_tenant_context)):
         for t in member_of:
             by_id.setdefault(t.id, t)
         teams = list(by_id.values())
-    return [_serialize(t) for t in teams]
+    return [await _serialize(tenant.db, tenant.organization_id, t) for t in teams]
 
 
 @router.post("", response_model=TeamDetailRead, status_code=status.HTTP_201_CREATED)
@@ -105,7 +135,7 @@ async def create_team(
         db, organization_id=tenant.organization_id, actor=tenant.user,
         action=TEAM_CREATED, entity_type=ENTITY_TEAM, entity_id=team.id, entity_label=team.name,
     )
-    return _serialize(team)
+    return await _serialize(db, tenant.organization_id, team)
 
 
 @router.get("/{team_id}", response_model=TeamDetailRead)
@@ -115,7 +145,7 @@ async def get_team(team_id: int, tenant: TenantContext = Depends(get_tenant_cont
     if team is None:
         raise AppException(_TEAM_NOT_FOUND)
     await require_team_access(tenant, repo, team_id)
-    return _serialize(team)
+    return await _serialize(tenant.db, tenant.organization_id, team)
 
 
 @router.get("/{team_id}/assignable-users", response_model=list[TeamAssignableMember])
@@ -226,7 +256,7 @@ async def update_team(
             action=TEAM_UPDATED, entity_type=ENTITY_TEAM, entity_id=updated.id, entity_label=updated.name,
             metadata=metadata,
         )
-    return _serialize(updated)
+    return await _serialize(db, tenant.organization_id, updated)
 
 
 @router.delete("/{team_id}", status_code=status.HTTP_204_NO_CONTENT)

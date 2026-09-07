@@ -69,8 +69,16 @@ async def generate_employee_pdf(
     db, org, employee, generated_by_name: str, report: Report, *,
     period: str, project_id: int | None, team_id: int | None,
     start_date: date | None, end_date: date | None, include_task_details: bool,
+    employee_org_role: str,
 ) -> tuple[bytes, dict]:
-    """Returns (pdf_bytes, performance_snapshot_dict)."""
+    """Returns (pdf_bytes, performance_snapshot_dict).
+
+    `employee_org_role` (role-consistency fix) MUST be the caller's
+    already-resolved `OrganizationMembership.role` for this employee in
+    THIS organization — never derived here from `employee.role` (the
+    legacy, non-org-specific column), which is exactly what previously
+    let this PDF disagree with the Users list / Scorecard header for the
+    same person."""
     data = await scoring.build_employee_scoreboard(
         db, org.id, employee.id, period, project_id, team_id, start_date, end_date,
     )
@@ -104,7 +112,7 @@ async def generate_employee_pdf(
     html = template.render(
         report=report,
         org={"name": org.name, "logo_url": org.logo_url},
-        employee={"full_name": employee.full_name, "role": employee.role, "teams": team_repo_teams},
+        employee={"full_name": employee.full_name, "role": employee_org_role, "teams": team_repo_teams},
         summary=_summary_dict(data.current),
         score=_score_dict(data.current, data.change_from_previous),
         explanation=data.explanation,
