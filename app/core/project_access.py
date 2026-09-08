@@ -116,27 +116,44 @@ async def require_project_management_access(tenant: TenantContext, repo: Project
 
 
 async def list_project_team_ids(db: AsyncSession, organization_id: uuid.UUID, project_id: int) -> set[int]:
-    """Every team currently associated with `project_id` — via its Rocks
-    (including Rocks under the project's own Objectives), the KPIs tracking
-    those Rocks, the project's own KPIs, and its Tasks. There is no explicit
-    Project<->Team membership table in this schema, so this mirrors the
-    derivation GET /projects/{id}/items already uses (inline there, since
-    it also needs the underlying Rock/KPI objects themselves for its other
-    response fields — this copy exists so task-creation's write-side
-    team_id validation can enforce the identical rule without requiring
-    that route's full object graph). Callers already own tenant/project-
-    access checks; this only computes the team id set — it does not
-    authorize the request."""
+    """Every team currently associated with `project_id` — the UNION of:
+      1. explicit `ProjectTeam` assignments (Project Manager Team-selection
+         bug-fix — see that model's own docstring for why this exists: a
+         brand-new project with no Rocks/KPIs/Tasks yet previously had NO
+         way to ever gain its first associated team, since every other
+         source below only derives from artifacts that already carry both
+         a project_id and a team_id).
+      2. the original derived associations: Rocks (including Rocks under
+         the project's own Objectives), the KPIs tracking those Rocks, the
+         project's own KPIs, and its Tasks.
+    This mirrors (and is the shared source for) the derivation
+    GET /projects/{id}/items uses for its own "teams" field — this copy
+    exists so task-creation's write-side team_id validation can enforce
+    the identical rule without requiring that route's full object graph.
+    Callers already own tenant/project-access checks; this only computes
+    the team id set — it does not authorize the request."""
     from app.models.kpi import KPI
     from app.models.objective import Objective
+    from app.models.project import Project, ProjectTeam
     from app.models.rock import Rock
     from app.models.task import Task
+
+    # Same defensive (project_id, organization_id) double-filter every
+    # other source below already uses — project_id is already effectively
+    # org-unique via its own FK, but this keeps the tenant boundary
+    # explicit and consistent rather than implicit.
+    explicit_result = await db.execute(
+        select(ProjectTeam.team_id)
+        .join(Project, Project.id == ProjectTeam.project_id)
+        .where(ProjectTeam.project_id == project_id, Project.organization_id == organization_id)
+    )
+    team_ids: set[int] = {row[0] for row in explicit_result.all()}
 
     rocks_result = await db.execute(
         select(Rock.id, Rock.team_id).where(Rock.project_id == project_id, Rock.organization_id == organization_id)
     )
     rocks = rocks_result.all()
-    team_ids = {row.team_id for row in rocks if row.team_id is not None}
+    team_ids |= {row.team_id for row in rocks if row.team_id is not None}
 
     kpis_result = await db.execute(
         select(KPI.team_id).where(KPI.project_id == project_id, KPI.organization_id == organization_id)

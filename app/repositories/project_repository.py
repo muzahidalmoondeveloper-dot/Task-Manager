@@ -6,7 +6,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.org_roles import PROJECT_MANAGER
 from app.models.organization import OrganizationMembership
-from app.models.project import Project, ProjectMembership
+from app.models.project import Project, ProjectMembership, ProjectTeam
 from app.models.user import User
 from app.repositories.base_tenant_repository import TenantRepository
 from app.schemas.project import ProjectCreate, ProjectUpdate
@@ -190,3 +190,47 @@ class ProjectRepository(TenantRepository):
         if membership is not None:
             await self.db.delete(membership)
             await self.db.commit()
+
+    # ── Project<->Team assignment (Project Manager Team-selection bug-fix) ──
+
+    async def assign_team(self, project_id: int, team_id: int, assigned_by_id: int) -> ProjectTeam:
+        """Idempotent — assigning an already-assigned team is a no-op that
+        returns the existing row, never a duplicate (matches add_member()'s
+        own idempotent convention above)."""
+        existing = await self.db.execute(
+            select(ProjectTeam).where(
+                ProjectTeam.project_id == project_id,
+                ProjectTeam.team_id == team_id,
+            )
+        )
+        assignment = existing.scalar_one_or_none()
+        if assignment is not None:
+            return assignment
+
+        assignment = ProjectTeam(project_id=project_id, team_id=team_id, assigned_by_id=assigned_by_id)
+        self.db.add(assignment)
+        await self.db.commit()
+        await self.db.refresh(assignment)
+        return assignment
+
+    async def unassign_team(self, project_id: int, team_id: int) -> None:
+        stmt = select(ProjectTeam).where(
+            ProjectTeam.project_id == project_id,
+            ProjectTeam.team_id == team_id,
+        )
+        result = await self.db.execute(stmt)
+        assignment = result.scalar_one_or_none()
+        if assignment is not None:
+            await self.db.delete(assignment)
+            await self.db.commit()
+
+    async def list_assigned_team_ids(self, project_id: int) -> set[int]:
+        """Explicit assignments only — never the derived Rock/KPI/Task
+        associations (see list_project_team_ids() in app.core.project_access
+        for the union of both). Used by the assignment UI itself, so it can
+        show which teams are already explicitly attached vs. still
+        available to attach."""
+        result = await self.db.execute(
+            select(ProjectTeam.team_id).where(ProjectTeam.project_id == project_id)
+        )
+        return set(result.scalars().all())

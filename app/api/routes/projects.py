@@ -10,18 +10,24 @@ from sqlalchemy.orm import selectinload
 from app.api.routes.teams import _serialize as serialize_team
 from app.core.activity_actions import (
     ENTITY_PROJECT,
+    ENTITY_TEAM,
     PROJECT_CREATED,
     PROJECT_DELETED,
     PROJECT_MANAGER_ASSIGNED,
     PROJECT_MANAGER_REMOVED,
+    PROJECT_TEAM_ASSIGNED,
+    PROJECT_TEAM_REMOVED,
     PROJECT_UPDATED,
 )
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.database import get_db
 from app.core.org_roles import CLIENT, PROJECT_MANAGER
 from app.core.project_access import (
+    NOT_ASSIGNED,
     is_project_management_blocked,
     is_project_scoped,
+    list_project_team_ids,
+    require_project_access,
     require_project_management_access,
 )
 from app.core.tenant import TenantContext, check_active_billing, get_tenant_context, require_org_admin, require_org_manager
@@ -30,7 +36,6 @@ from app.models.kpi import KPI
 from app.models.objective import Objective
 from app.models.organization import OrganizationMembership
 from app.models.rock import Rock
-from app.models.task import Task
 from app.repositories.project_repository import ProjectRepository
 from app.repositories.task_time_entry_repository import TaskTimeEntryRepository
 from app.repositories.team_repository import TeamRepository
@@ -42,6 +47,7 @@ from app.schemas.project import (
     ProjectMemberAssign,
     ProjectMemberOut,
     ProjectRead,
+    ProjectTeamOption,
     ProjectUpdate,
 )
 from app.schemas.rock import RockOut
@@ -53,6 +59,7 @@ router = APIRouter(prefix="/projects", tags=["Projects"])
 _NOT_FOUND = ErrorDef(code="PROJECT_NOT_FOUND", status=http_status.HTTP_404_NOT_FOUND, message="Project not found.")
 _PLAN_LIMIT = ErrorDef(code="PLAN_LIMIT_EXCEEDED", status=http_status.HTTP_402_PAYMENT_REQUIRED, message="Your plan's project limit has been reached.")
 _CLIENT_FORBIDDEN = ErrorDef(code="CLIENT_ITEMS_FORBIDDEN", status=http_status.HTTP_403_FORBIDDEN, message="Clients view project progress through Reports, not this endpoint.")
+_TEAM_NOT_FOUND = ErrorDef(code="TEAM_NOT_FOUND", status=http_status.HTTP_404_NOT_FOUND, message="Team not found.")
 
 _LOGO_DIR_NAME = "project-logos"
 
@@ -308,17 +315,13 @@ async def get_project_items(
         )
         rock_kpis = rock_kpis_result.scalars().all()
 
-    # Teams involved in this project: via its rocks, KPIs, and tasks.
-    tasks_result = await db.execute(
-        select(Task.team_id).where(Task.project_id == project_id, Task.organization_id == org_id)
-    )
-    team_ids = (
-        {r.team_id for r in rocks}
-        | {r.team_id for r in objective_rocks}
-        | {k.team_id for k in kpis}
-        | {k.team_id for k in rock_kpis}
-        | {row[0] for row in tasks_result.all() if row[0] is not None}
-    )
+    # Teams involved in this project: explicit ProjectTeam assignments
+    # (Project Manager Team-selection bug-fix) UNION the original derived
+    # associations via its rocks, KPIs, and tasks — see
+    # list_project_team_ids()'s own docstring for why the explicit half
+    # exists (a brand-new project with none of the above yet previously
+    # had no way to ever gain its first team).
+    team_ids = await list_project_team_ids(db, org_id, project_id)
     team_repo = TeamRepository(db, org_id)
     project_teams = [t for t in await team_repo.list_all() if t.id in team_ids]
 
@@ -472,5 +475,100 @@ async def remove_project_member(
         tenant.db, organization_id=tenant.organization_id, actor=tenant.user,
         action=PROJECT_MANAGER_REMOVED, entity_type=ENTITY_PROJECT, entity_id=project_id,
         entity_label=project.name, metadata={"user_id": user_id},
+    )
+    return None
+
+
+# ── Project<->Team assignment (Project Manager Team-selection bug-fix) ──────
+
+async def _require_can_manage_project_teams(tenant: TenantContext, repo: ProjectRepository, project_id: int) -> None:
+    """Owner/Admin: unrestricted. A genuine Project Manager (base role, or
+    anyone granted the `is_project_manager` flag) may manage teams on a
+    project they're actually assigned to (ProjectMembership) — never an
+    arbitrary project. Everyone else (plain Team Manager, Team Member,
+    Client) is blocked outright, matching
+    app.core.project_access.is_project_management_blocked's own "a
+    ProjectMembership row alone is never sufficient" rule and never
+    letting a Client mutate project structure."""
+    if tenant.is_admin_or_owner:
+        return
+    if not tenant.has_project_manager_access:
+        raise AppException(NOT_ASSIGNED)
+    await require_project_access(tenant, repo, project_id)
+
+
+@router.get("/{project_id}/teams/assignable", response_model=list[ProjectTeamOption])
+async def list_assignable_teams(
+    project_id: int,
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Deliberately minimal {id, name, assigned} picker data — a plain
+    Project Manager otherwise has NO visibility into the organization's
+    teams at all (GET /teams legitimately returns nothing for them; see
+    the Teams-sidebar-visibility fix), but assigning a team to their OWN
+    project requires seeing team *names* to choose from. Scoped to
+    project members only — never exposes team membership/manager detail,
+    only the name and whether it's already assigned here."""
+    repo = ProjectRepository(tenant.db, tenant.organization_id)
+    project = await repo.get_by_id(project_id)
+    if project is None:
+        raise AppException(_NOT_FOUND)
+    await _require_can_manage_project_teams(tenant, repo, project_id)
+
+    team_repo = TeamRepository(tenant.db, tenant.organization_id)
+    all_teams = await team_repo.list_all()
+    assigned_ids = await repo.list_assigned_team_ids(project_id)
+    return [
+        ProjectTeamOption(id=t.id, name=t.name, assigned=t.id in assigned_ids)
+        for t in all_teams
+    ]
+
+
+@router.post("/{project_id}/teams/{team_id}", status_code=http_status.HTTP_201_CREATED)
+async def assign_project_team(
+    project_id: int,
+    team_id: int,
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    repo = ProjectRepository(tenant.db, tenant.organization_id)
+    project = await repo.get_by_id(project_id)
+    if project is None:
+        raise AppException(_NOT_FOUND)
+    await _require_can_manage_project_teams(tenant, repo, project_id)
+
+    team_repo = TeamRepository(tenant.db, tenant.organization_id)
+    team = await team_repo.get_by_id(team_id)
+    if team is None:
+        raise AppException(_TEAM_NOT_FOUND)
+
+    await repo.assign_team(project_id, team_id, assigned_by_id=tenant.user.id)
+    await activity_service.record(
+        tenant.db, organization_id=tenant.organization_id, actor=tenant.user,
+        action=PROJECT_TEAM_ASSIGNED, entity_type=ENTITY_PROJECT, entity_id=project_id,
+        entity_label=project.name, metadata={"team_id": team_id, "team_name": team.name},
+    )
+    return {"project_id": project_id, "team_id": team_id}
+
+
+@router.delete("/{project_id}/teams/{team_id}", status_code=http_status.HTTP_204_NO_CONTENT)
+async def unassign_project_team(
+    project_id: int,
+    team_id: int,
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    repo = ProjectRepository(tenant.db, tenant.organization_id)
+    project = await repo.get_by_id(project_id)
+    if project is None:
+        raise AppException(_NOT_FOUND)
+    await _require_can_manage_project_teams(tenant, repo, project_id)
+
+    team_repo = TeamRepository(tenant.db, tenant.organization_id)
+    team = await team_repo.get_by_id(team_id)
+
+    await repo.unassign_team(project_id, team_id)
+    await activity_service.record(
+        tenant.db, organization_id=tenant.organization_id, actor=tenant.user,
+        action=PROJECT_TEAM_REMOVED, entity_type=ENTITY_PROJECT, entity_id=project_id,
+        entity_label=project.name, metadata={"team_id": team_id, "team_name": team.name if team else None},
     )
     return None

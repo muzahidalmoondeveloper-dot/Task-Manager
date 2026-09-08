@@ -39,6 +39,11 @@ PROJECT_UPDATED = "project.updated"
 PROJECT_DELETED = "project.deleted"
 PROJECT_MANAGER_ASSIGNED = "project.manager_assigned"
 PROJECT_MANAGER_REMOVED = "project.manager_removed"
+# Project Manager Team-selection bug-fix: explicit Project<->Team
+# assignment (app.models.project.ProjectTeam) is now a real, auditable
+# mutation, same as assigning/removing a Project Manager above.
+PROJECT_TEAM_ASSIGNED = "project.team_assigned"
+PROJECT_TEAM_REMOVED = "project.team_removed"
 
 # ── Team ──────────────────────────────────────────────────────────────────
 TEAM_CREATED = "team.created"
@@ -75,6 +80,7 @@ ALL_ACTIONS = {
     AUTH_LOGIN, AUTH_LOGOUT, AUTH_PASSWORD_CHANGED, AUTH_PASSWORD_RESET_COMPLETED,
     TASK_CREATED, TASK_UPDATED, TASK_DELETED, TASK_TIMER_STARTED, TASK_TIMER_STOPPED,
     PROJECT_CREATED, PROJECT_UPDATED, PROJECT_DELETED, PROJECT_MANAGER_ASSIGNED, PROJECT_MANAGER_REMOVED,
+    PROJECT_TEAM_ASSIGNED, PROJECT_TEAM_REMOVED,
     TEAM_CREATED, TEAM_UPDATED, TEAM_DELETED, TEAM_MEMBER_ADDED, TEAM_MEMBER_REMOVED,
     USER_INVITED, USER_CREATED, USER_UPDATED, USER_ROLE_CHANGED, USER_ACTIVATED, USER_DEACTIVATED,
     ORGANIZATION_UPDATED, ORGANIZATION_SETTINGS_UPDATED,
