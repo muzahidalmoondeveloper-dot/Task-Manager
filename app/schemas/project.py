@@ -62,3 +62,17 @@ class ProjectMemberOut(BaseModel):
     model_config = {
         "from_attributes": True,
     }
+
+
+class ProjectTeamOption(BaseModel):
+    """Project Manager Team-selection bug-fix: a deliberately minimal
+    {id, name, assigned} shape for the team-assignment picker — never a
+    full TeamRead (no members, no manager, no other detail), since a
+    plain Project Manager may reach this endpoint for their own project
+    without otherwise having any visibility into the organization's teams
+    (see app.core.tenant.TenantContext.has_project_manager_access and the
+    Teams-sidebar-visibility fix this mirrors)."""
+
+    id: int
+    name: str
+    assigned: bool
