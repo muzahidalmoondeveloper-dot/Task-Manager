@@ -157,10 +157,25 @@ async def _run():
             ))}
             assert my_task.id in my_tasks_seen, "the newly-created My Task must appear when filtered to the PM's own assignee_id"
 
-            # ── 4. Project required. ──────────────────────────────────────────
+            # ── 4. Personal Task follow-up: Project is required only when
+            # delegating to a Team — a project-less, team-less Task is the
+            # PM's own Personal/Standalone Task (same category every other
+            # role gets) and is now explicitly ALLOWED, self-assigned. See
+            # `test_pm_personal_task_and_edit_payload.py` for the dedicated
+            # coverage of this case and its sibling checks; reconfirmed
+            # here too since this file is the PM-delegation baseline. ──────
+            no_project_task = await _create(TaskCreate(name=f"PMTD No Project {suffix}"), pm_tenant)
+            created_task_ids.append(no_project_task.id)
+            assert no_project_task.project_id is None
+            assert no_project_task.team_id is None
+            assert no_project_task.assignee_id == pm.id, "a project-less PM Personal Task must self-assign"
+
+            # Project is STILL required the moment a Team is attached
+            # (delegation context) — this is the part of the old invariant
+            # that remains unchanged.
             try:
-                await _create(TaskCreate(name=f"PMTD No Project {suffix}"), pm_tenant)
-                raise AssertionError("a plain PM must not be able to create a project-less Task")
+                await _create(TaskCreate(name=f"PMTD Team No Project {suffix}", team_id=team_a.id), pm_tenant)
+                raise AssertionError("a plain PM must still need a Project to delegate a Task to a Team")
             except AppException as exc:
                 assert exc.code == "PROJECT_REQUIRED", exc
 

@@ -1,7 +1,7 @@
 import uuid
 from datetime import date
 
-from sqlalchemy import false, or_, select
+from sqlalchemy import and_, false, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -37,6 +37,7 @@ class TaskRepository(TenantRepository):
         overdue: bool = False,
         scope_team_ids: set[int] | None = None,
         scope_project_ids: set[int] | None = None,
+        scope_personal_owner_id: int | None = None,
     ) -> list[Task]:
         """`scope_team_ids`/`scope_project_ids` are the Team Manager
         Task-scope follow-up's org-wide-listing guard: `None` (the
@@ -47,7 +48,18 @@ class TaskRepository(TenantRepository):
         whose team_id is in scope_team_ids OR whose project_id is in
         scope_project_ids are returned, and a scoped caller who matches
         neither set at all sees nothing — never silently falls back to
-        the full organization."""
+        the full organization.
+
+        `scope_personal_owner_id` (Task ownership/All-Tasks-union
+        follow-up) adds a THIRD branch to that same OR: this exact
+        caller's own Personal/Standalone Tasks (`assignee_id ==
+        scope_personal_owner_id AND team_id IS NULL`) — a Team Manager's
+        or Project Manager's own team-less self-owned work is never
+        anchored by a managed Team/Project, so without this branch it
+        would silently disappear from their "All Tasks" the moment
+        scope_team_ids/scope_project_ids is applied. `None` (Owner/Admin,
+        via the unrestricted `scope_team_ids is None` path) adds nothing
+        here either — they already see everything."""
         stmt = self._base_stmt()
         if status:
             stmt = stmt.where(Task.status == status)
@@ -74,6 +86,8 @@ class TaskRepository(TenantRepository):
                 conditions.append(Task.team_id.in_(scope_team_ids))
             if scope_project_ids:
                 conditions.append(Task.project_id.in_(scope_project_ids))
+            if scope_personal_owner_id is not None:
+                conditions.append(and_(Task.assignee_id == scope_personal_owner_id, Task.team_id.is_(None)))
             stmt = stmt.where(or_(*conditions) if conditions else false())
         stmt = stmt.order_by(Task.due_date.asc(), Task.created_at.desc())
         result = await self.db.execute(stmt)
