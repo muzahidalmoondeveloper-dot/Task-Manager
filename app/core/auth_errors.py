@@ -92,6 +92,11 @@ _OTP_PURPOSE_INVALID = ErrorDef(
     status=status.HTTP_400_BAD_REQUEST,
     message="Invalid OTP purpose.",
 )
+_OTP_RESEND_TOO_SOON = ErrorDef(
+    code="AUTH_OTP_RESEND_TOO_SOON",
+    status=status.HTTP_429_TOO_MANY_REQUESTS,
+    message="Please wait before requesting another OTP.",
+)
 _TOKEN_INVALID = ErrorDef(
     code="TOKEN_INVALID",
     status=status.HTTP_401_UNAUTHORIZED,
@@ -155,6 +160,14 @@ class AuthError:
     @staticmethod
     def otp_purpose_invalid() -> AppException:
         return AppException(_OTP_PURPOSE_INVALID)
+
+    @staticmethod
+    def otp_resend_too_soon(retry_after_seconds: int) -> AppException:
+        return AppException(
+            _OTP_RESEND_TOO_SOON,
+            message=f"Please wait {retry_after_seconds}s before requesting another OTP.",
+            details={"retry_after_seconds": retry_after_seconds},
+        )
 
 
 class TokenError:

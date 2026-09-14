@@ -133,10 +133,18 @@ class AITaskExtractor:
         source_title: str | None,
         source_text: str,
         known_users: list[dict] | None = None,
+        reference_date: date | None = None,
     ) -> tuple[list[ExtractedTask], dict]:
         provider = get_llm_provider()
 
-        today_str = date.today().isoformat()
+        # Due-date/timezone follow-up: relative phrases ("Friday",
+        # "tomorrow", "end of month") must resolve against the source's
+        # own organization's authoritative "today", not the server
+        # process's UTC date — a meeting transcript at 11pm UTC-8 is
+        # already "tomorrow" in UTC. Callers pass the organization-local
+        # date (see automation_tasks.py); defaults to server UTC today
+        # for any caller that doesn't (existing tests/call sites).
+        today_str = (reference_date or date.today()).isoformat()
         system_prompt = (
             _SYSTEM_PROMPT_BASE
             + f"\n\nToday's date is {today_str}. "

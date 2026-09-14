@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
@@ -7,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.integration import IntegrationAccount
 from app.services.integrations.oauth import calculate_expires_at, refresh_microsoft_token
 
+logger = logging.getLogger("integrations.microsoft_graph")
 
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 
@@ -103,9 +105,10 @@ class MicrosoftGraphService:
             response = await client.get(url, headers=self.headers, params=params)
 
             if response.status_code >= 400:
-                print("find_online_meeting_by_join_url failed")
-                print("Status:", response.status_code)
-                print("Body:", response.text)
+                logger.warning(
+                    "find_online_meeting_by_join_url failed",
+                    extra={"provider": "microsoft", "stage": "resolve_online_meeting", "status_code": response.status_code},
+                )
 
             response.raise_for_status()
             data = response.json()

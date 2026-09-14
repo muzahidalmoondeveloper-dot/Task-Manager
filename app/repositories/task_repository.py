@@ -179,7 +179,12 @@ class TaskRepository(TenantRepository):
         result = await self.db.execute(stmt)
         return result.scalar_one_or_none()
 
-    async def create(self, payload: TaskCreate, created_by_id: int) -> Task:
+    async def create_no_commit(self, payload: TaskCreate, created_by_id: int) -> Task:
+        """Same field-building/validation as create(), but flushes instead
+        of committing — for a caller (e.g. Task Request conversion) that
+        needs this Task's insert to land in the SAME transaction/commit as
+        another row it updates atomically. Plain create() below is just
+        this plus the commit, for every other caller."""
         # Defense-in-depth (cross-tenant automation-assignee security fix,
         # PHASE 16): every caller of this repository — route-level
         # create_task() (which already validates upstream) AND internal
@@ -209,6 +214,11 @@ class TaskRepository(TenantRepository):
             organization_id=self.org_id,
         )
         self.db.add(task)
+        await self.db.flush()
+        return task
+
+    async def create(self, payload: TaskCreate, created_by_id: int) -> Task:
+        task = await self.create_no_commit(payload, created_by_id)
         await self.db.commit()
         return await self.get_by_id(task.id)
 

@@ -5,7 +5,7 @@ from fastapi import status as http_status
 
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.team_access import require_team_access
-from app.core.tenant import TenantContext, get_tenant_context
+from app.core.tenant import TenantContext, require_org_admin
 from app.models.team import Team
 from app.repositories.team_repository import TeamRepository
 from app.schemas.scoreboard import (
@@ -36,7 +36,15 @@ async def _get_team_or_404(tenant: TenantContext, team_id: int) -> Team:
 
 
 async def _require_can_view_team_scoreboard(tenant: TenantContext, team: Team) -> None:
-    """Delegates to the shared app.core.team_access rule (Owner/Admin
+    """UNCHANGED — reused only by app.api.routes.reports for its own,
+    separate Team Performance report-viewing rule. This router's own
+    routes below no longer call this at all: Team Scoreboard is now
+    Admin-only (`Depends(require_org_admin)`), per the same Scoreboard
+    authorization follow-up documented in app.api.routes.scoreboard. Do
+    not repurpose this function for Team Scoreboard access — Reports'
+    behavior must stay exactly as it is.
+
+    Delegates to the shared app.core.team_access rule (Owner/Admin
     unrestricted; everyone else must be the team's manager or a member of
     it) instead of the bespoke org_role-string branching this used to do.
 
@@ -103,10 +111,15 @@ async def get_team_scoreboard(
     project_id: int | None = Query(default=None),
     start_date: date | None = Query(default=None),
     end_date: date | None = Query(default=None),
-    tenant: TenantContext = Depends(get_tenant_context),
+    tenant: TenantContext = Depends(require_org_admin),
 ):
+    # Scoreboard authorization follow-up: Team Scoreboard is Admin-only —
+    # the Team-Manager/member access grant (_require_can_view_team_scoreboard,
+    # still used unchanged by Reports for its own separate rule) no longer
+    # applies here. `_get_team_or_404` still enforces tenant isolation for
+    # `team_id` (404 for a team outside this organization), independent of
+    # viewer authorization.
     team = await _get_team_or_404(tenant, team_id)
-    await _require_can_view_team_scoreboard(tenant, team)
 
     try:
         data = await scoring.build_team_scoreboard(
@@ -155,10 +168,9 @@ async def get_team_scoreboard_tasks(
     project_id: int | None = Query(default=None),
     start_date: date | None = Query(default=None),
     end_date: date | None = Query(default=None),
-    tenant: TenantContext = Depends(get_tenant_context),
+    tenant: TenantContext = Depends(require_org_admin),
 ):
     team = await _get_team_or_404(tenant, team_id)
-    await _require_can_view_team_scoreboard(tenant, team)
 
     try:
         period_start, period_end = scoring.resolve_period(period, start_date, end_date)

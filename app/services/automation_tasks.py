@@ -1,17 +1,46 @@
 import logging
-from datetime import datetime, timedelta, timezone
+import re
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select, update as sql_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.auth_errors import AppException
-from app.models.organization import OrganizationMembership
+from app.core.automation_pipeline import (
+    ERROR_AI_ANALYSIS_FAILED,
+    ERROR_PROVIDER_UNAVAILABLE,
+    ERROR_TRANSCRIPT_PERMISSION_DENIED,
+    SOURCE_STATUS_ANALYZING,
+    SOURCE_STATUS_DISCOVERED,
+    SOURCE_STATUS_FAILED,
+    SOURCE_STATUS_NEEDS_REVIEW,
+    SOURCE_STATUS_NO_ACTION_REQUIRED,
+    SOURCE_STATUS_PARTIALLY_CREATED,
+    SOURCE_STATUS_TASK_CREATED,
+    SYNC_RUN_FAILED,
+    SYNC_RUN_PARTIAL_SUCCESS,
+    SYNC_RUN_RUNNING,
+    SYNC_RUN_SUCCESS,
+    TRANSCRIPT_STATUS_AVAILABLE,
+    TRANSCRIPT_STATUS_NOT_SUPPORTED,
+    TRANSCRIPT_STATUS_PERMISSION_DENIED,
+    TRANSCRIPT_STATUS_UNKNOWN,
+    TRANSCRIPT_STATUS_WAITING,
+    classify_http_error,
+    meets_auto_create_bar,
+    safe_error_message,
+    transcript_backoff_minutes,
+)
+from app.models.organization import Organization, OrganizationMembership
 from app.models.integration import (
     CalendarEvent,
     ImportedEmail,
     IntegrationAccount,
     MeetingTranscript,
+    SyncRun,
+    TaskSource,
 )
 from app.models.user import User
 from app.models.project import Project
@@ -27,6 +56,18 @@ from app.services.ai_task_extractor import AITaskExtractor
 from app.services.integrations.microsoft_graph import MicrosoftGraphService
 
 logger = logging.getLogger("automation_tasks")
+
+# First-ever sync for a newly connected account has no checkpoint yet —
+# bootstrap with a bounded lookback window rather than importing the
+# account's entire history (spec: "Do not repeatedly re-download and
+# re-analyze the entire mailbox/history").
+INITIAL_SYNC_LOOKBACK_DAYS = 7
+
+# Re-fetch a small overlap behind the last checkpoint so a message that
+# lands mid-sync (received_at just before start_at, indexed by the
+# provider slightly late) is never silently skipped — upsert-by-
+# provider-message-id makes re-seeing it a safe no-op, never a duplicate.
+SYNC_OVERLAP_BUFFER = timedelta(minutes=5)
 
 
 SPAM_OR_AD_KEYWORDS = [
@@ -147,8 +188,16 @@ def is_probably_non_task_email(
     body: str | None,
     sender: str | None = None,
 ) -> bool:
+    """Smart action-item detection follow-up (bug fix): this used to be a
+    plain substring check (`keyword in text`), which false-positived on
+    any word merely CONTAINING a keyword as a substring — e.g. "sale" is
+    a substring of "sales" ("prepare the monthly SALES report"),
+    "promo" of "promotion" is a keyword itself already but "personal" a
+    substring inside "personalized", etc. A genuinely actionable email
+    could be silently discarded before the AI ever saw it. Fixed to
+    match whole words only (regex `\\b` boundaries), same keyword list."""
     text = f"{subject or ''} {body or ''} {sender or ''}".lower()
-    return any(keyword in text for keyword in SPAM_OR_AD_KEYWORDS)
+    return any(re.search(rf"\b{re.escape(keyword)}\b", text) for keyword in SPAM_OR_AD_KEYWORDS)
 
 
 def get_yesterday_range_utc() -> tuple[datetime, datetime]:
@@ -358,77 +407,175 @@ async def resolve_org_id_for_user(db: AsyncSession, user: User):
     return result.scalar_one_or_none()
 
 
+async def create_sync_run(
+    db: AsyncSession,
+    *,
+    organization_id,
+    provider: str,
+    integration_account_id: int | None,
+    triggered_by_user_id: int | None,
+    trigger: str,
+) -> SyncRun:
+    """Automation Pipeline Audit follow-up — the persistent Sync Run
+    record. Created BEFORE any fetch/analysis work starts so a crash mid-
+    run still leaves a "running" (then, via finish_sync_run, "failed")
+    row behind instead of the attempt vanishing entirely."""
+    run = SyncRun(
+        organization_id=organization_id,
+        provider=provider,
+        integration_account_id=integration_account_id,
+        triggered_by_user_id=triggered_by_user_id,
+        trigger=trigger,
+        status=SYNC_RUN_RUNNING,
+    )
+    db.add(run)
+    await db.commit()
+    await db.refresh(run)
+    logger.info(
+        "sync_run started",
+        extra={"sync_run_id": run.id, "organization_id": str(organization_id), "provider": provider, "trigger": trigger},
+    )
+    return run
+
+
+async def finish_sync_run(
+    db: AsyncSession,
+    run: SyncRun,
+    *,
+    fatal_error_code: str | None = None,
+    fatal_error_message: str | None = None,
+) -> SyncRun:
+    """Finalizes a Sync Run's status from its own accumulated counters —
+    never a caller-guessed "it worked" flag. success: no failures at all.
+    partial_success: some failures, but something also actually
+    completed (fetched/analyzed/created something). failed: a fatal
+    error before any useful work, or failures with nothing else to show
+    for the run."""
+    run.completed_at = datetime.now(timezone.utc)
+    if fatal_error_code:
+        run.status = SYNC_RUN_FAILED
+        run.last_error_code = fatal_error_code
+        run.last_error_message = fatal_error_message or safe_error_message(fatal_error_code)
+    elif run.failed_count == 0:
+        run.status = SYNC_RUN_SUCCESS
+    elif run.fetched_count > 0 or run.analyzed_count > 0 or run.tasks_created_count > 0:
+        run.status = SYNC_RUN_PARTIAL_SUCCESS
+    else:
+        run.status = SYNC_RUN_FAILED
+    await db.commit()
+    await db.refresh(run)
+    logger.info(
+        "sync_run finished",
+        extra={
+            "sync_run_id": run.id, "status": run.status,
+            "fetched_count": run.fetched_count, "analyzed_count": run.analyzed_count,
+            "tasks_created_count": run.tasks_created_count, "failed_count": run.failed_count,
+        },
+    )
+    return run
+
+
+def _org_local_today(org: Organization | None) -> date:
+    """Due-date/timezone follow-up: the organization's own authoritative
+    timezone (Organization.timezone, defaults to 'UTC') decides what
+    "today" means for resolving relative phrases like "Friday" — never
+    the automation worker process's own local/UTC date, which has no
+    relationship to where the organization actually operates."""
+    tz_name = getattr(org, "timezone", None) or "UTC"
+    try:
+        tz = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        tz = ZoneInfo("UTC")
+    return datetime.now(tz).date()
+
+
 async def sync_microsoft_data_for_user(
     *,
     db: AsyncSession,
     user: User,
+    sync_run: SyncRun | None = None,
 ) -> dict:
+    """Microsoft adapter: FETCH + NORMALIZE stage only (see the module
+    docstring in app.core.automation_pipeline) — writes ImportedEmail /
+    CalendarEvent / MeetingTranscript rows and returns. AI analysis and
+    Task creation happen in analyze_pending_sources_for_user(), the same
+    shared function Gmail's adapter feeds into.
+
+    Incremental sync (spec: "do not repeatedly re-download and re-analyze
+    the entire mailbox/history"): each account's own `last_synced_at`
+    checkpoint is the fetch window's start, with a small overlap buffer;
+    a brand-new account bootstraps from INITIAL_SYNC_LOOKBACK_DAYS rather
+    than importing all history. The checkpoint only advances on an
+    account whose fetch stage completed without a fatal error — a failed
+    fetch must never skip over unprocessed data on the next attempt.
+    """
     org_id = await resolve_org_id_for_user(db, user)
+    empty_result = {
+        "emails_imported": 0, "calendar_events_imported": 0,
+        "transcripts_imported": 0, "transcript_errors": [],
+    }
     if org_id is None:
-        return {
-            "emails_imported": 0,
-            "calendar_events_imported": 0,
-            "transcripts_imported": 0,
-            "transcript_errors": [],
-        }
+        return empty_result
 
     repository = IntegrationRepository(db, org_id)
-
-    accounts = await repository.list_accounts_by_provider(
-        user.id,
-        "microsoft",
-    )
-
+    accounts = await repository.list_accounts_by_provider(user.id, "microsoft")
     if not accounts:
-        return {
-            "emails_imported": 0,
-            "calendar_events_imported": 0,
-            "transcripts_imported": 0,
-            "transcript_errors": [],
-        }
+        return empty_result
 
-    start_at, end_at = get_yesterday_range_utc()
-    start_at = ensure_aware_utc(start_at)
-    end_at = ensure_aware_utc(end_at)
-
+    now = ensure_aware_utc(datetime.now(timezone.utc))
     total_emails = 0
     total_events = 0
     total_transcripts = 0
-    transcript_errors = []
-
-    logger.info(
-        "Microsoft sync range for %s: %s -> %s",
-        user.email,
-        start_at.isoformat(),
-        end_at.isoformat(),
-    )
+    transcript_errors: list[dict] = []
 
     for account in accounts:
-        graph = MicrosoftGraphService(account)
-        await graph.ensure_fresh_token(db)
+        checkpoint = ensure_aware_utc(account.last_synced_at)
+        start_at = (checkpoint - SYNC_OVERLAP_BUFFER) if checkpoint else (now - timedelta(days=INITIAL_SYNC_LOOKBACK_DAYS))
+        end_at = now
 
-        logger.info("Syncing Microsoft account: %s", account.account_email)
+        logger.info(
+            "microsoft sync account start",
+            extra={
+                "provider": "microsoft", "stage": "fetch", "status": "running",
+                "integration_account_id": account.id, "user_id": user.id,
+                "organization_id": str(org_id), "window_start": start_at.isoformat(), "window_end": end_at.isoformat(),
+            },
+        )
+
+        account_fetch_failed = False
+
+        try:
+            await MicrosoftGraphService(account).ensure_fresh_token(db)
+        except Exception as exc:
+            error_code = classify_http_error(exc)
+            logger.warning(
+                "microsoft token refresh failed",
+                extra={"provider": "microsoft", "stage": "token_refresh", "status": "failed", "integration_account_id": account.id, "error_code": error_code},
+            )
+            account.last_sync_status = "failed"
+            account.last_sync_error = safe_error_message(error_code)
+            await db.commit()
+            if sync_run is not None:
+                sync_run.failed_count += 1
+            continue
+
+        graph = MicrosoftGraphService(account)
 
         try:
             messages = await graph.list_messages(start_at, end_at)
         except Exception as exc:
-            logger.exception(
-                "Microsoft email sync failed for %s",
-                account.account_email,
+            error_code = classify_http_error(exc)
+            logger.warning(
+                "microsoft email fetch failed",
+                extra={"provider": "microsoft", "stage": "email_fetch", "status": "failed", "integration_account_id": account.id, "error_code": error_code},
             )
             messages = []
+            account_fetch_failed = True
+            if sync_run is not None:
+                sync_run.failed_count += 1
 
         for message in messages:
             received_at = parse_iso_datetime(message.get("receivedDateTime"))
-
-            if not is_datetime_in_range(received_at, start_at, end_at):
-                logger.info(
-                    "Skipping email outside yesterday range. subject=%s received_at=%s",
-                    message.get("subject"),
-                    received_at,
-                )
-                continue
-
             body = message.get("body") or {}
             sender = extract_email_address(message.get("from"))
             recipients = extract_recipients(message.get("toRecipients"))
@@ -444,53 +591,36 @@ async def sync_microsoft_data_for_user(
                 body_text=body.get("content") or message.get("bodyPreview"),
                 raw_payload=message,
             )
-
             total_emails += 1
 
         try:
             events = await graph.list_calendar_events(start_at, end_at)
         except Exception as exc:
-            logger.exception(
-                "Microsoft calendar sync failed for %s",
-                account.account_email,
+            error_code = classify_http_error(exc)
+            logger.warning(
+                "microsoft calendar fetch failed",
+                extra={"provider": "microsoft", "stage": "calendar_fetch", "status": "failed", "integration_account_id": account.id, "error_code": error_code},
             )
             events = []
+            account_fetch_failed = True
+            if sync_run is not None:
+                sync_run.failed_count += 1
 
         for event in events:
             event_starts_at = parse_graph_datetime(event.get("start"))
             event_ends_at = parse_graph_datetime(event.get("end"))
-
-            if not is_datetime_in_range(event_starts_at, start_at, end_at):
-                logger.info(
-                    "Skipping calendar event outside yesterday range. title=%s starts_at=%s",
-                    event.get("subject"),
-                    event_starts_at,
-                )
-                continue
-
             organizer = event.get("organizer") or {}
             organizer_email = extract_email_address(organizer)
-
-            attendees = []
-
-            for attendee in event.get("attendees") or []:
-                email = extract_email_address(attendee)
-
-                attendees.append(
-                    {
-                        "email": email,
-                        "name": (attendee.get("emailAddress") or {}).get("name"),
-                        "type": attendee.get("type"),
-                    }
-                )
-
+            attendees = [
+                {
+                    "email": extract_email_address(attendee),
+                    "name": (attendee.get("emailAddress") or {}).get("name"),
+                    "type": attendee.get("type"),
+                }
+                for attendee in (event.get("attendees") or [])
+            ]
             online_meeting = event.get("onlineMeeting") or {}
-
-            meeting_url = (
-                event.get("onlineMeetingUrl")
-                or online_meeting.get("joinUrl")
-                or event.get("webLink")
-            )
+            meeting_url = event.get("onlineMeetingUrl") or online_meeting.get("joinUrl") or event.get("webLink")
 
             saved_event = await repository.upsert_calendar_event(
                 integration_account_id=account.id,
@@ -504,117 +634,73 @@ async def sync_microsoft_data_for_user(
                 provider="microsoft",
                 raw_payload=event,
             )
-
             total_events += 1
 
             online_meeting_id = online_meeting.get("id")
-
             if not online_meeting_id and meeting_url:
                 try:
-                    found_meeting = await graph.find_online_meeting_by_join_url(
-                        meeting_url
-                    )
-
-                    if found_meeting:
-                        online_meeting_id = found_meeting.get("id")
-
+                    found_meeting = await graph.find_online_meeting_by_join_url(meeting_url)
+                    online_meeting_id = found_meeting.get("id") if found_meeting else None
                 except Exception as exc:
-                    transcript_errors.append(
-                        {
-                            "event_id": event.get("id"),
-                            "title": event.get("subject"),
-                            "stage": "resolve_online_meeting",
-                            "error": str(exc),
-                        }
-                    )
+                    transcript_errors.append({
+                        "event_id": event.get("id"), "title": event.get("subject"),
+                        "stage": "resolve_online_meeting", "error_code": classify_http_error(exc),
+                    })
 
             if not online_meeting_id:
-                logger.info(
-                    "Skipping transcript fetch. No online meeting id. event=%s",
-                    event.get("subject"),
-                )
+                saved_event.transcript_status = TRANSCRIPT_STATUS_NOT_SUPPORTED
+                await db.commit()
                 continue
 
-            try:
-                transcripts = await graph.list_transcripts_for_online_meeting(
-                    online_meeting_id
-                )
+            # Teams transcript handling follow-up: this same event can be
+            # re-seen on every sync tick for as long as it stays inside
+            # the incremental window's overlap buffer (see
+            # SYNC_OVERLAP_BUFFER) — an event already on a scheduled
+            # capped-backoff retry (`waiting`, next_check_at in the
+            # future) must NOT be re-checked here too, or the backoff
+            # schedule is meaningless and this degrades into exactly the
+            # "poll forever" pattern the spec forbids. Already-terminal
+            # states (available/permission_denied/expired) also skip —
+            # _recheck_waiting_transcripts below is the only path that
+            # re-examines a "waiting" event, and only once its own
+            # schedule says it's due.
+            already_tracked = saved_event.transcript_status not in (TRANSCRIPT_STATUS_UNKNOWN, TRANSCRIPT_STATUS_NOT_SUPPORTED)
+            if already_tracked:
+                continue
 
-                for transcript in transcripts:
-                    transcript_timestamp = parse_transcript_datetime(transcript)
+            imported = await _fetch_and_track_transcripts(
+                db=db, repository=repository, graph=graph, event=saved_event, online_meeting_id=online_meeting_id,
+                transcript_errors=transcript_errors,
+            )
+            total_transcripts += imported
 
-                    if transcript_timestamp and not is_datetime_in_range(
-                        transcript_timestamp,
-                        start_at,
-                        end_at,
-                    ):
-                        logger.info(
-                            "Skipping old transcript. event=%s transcript_id=%s transcript_time=%s",
-                            event.get("subject"),
-                            transcript.get("id"),
-                            transcript_timestamp,
-                        )
-                        continue
+        # Meetings discovered in an EARLIER run may have just become
+        # ready ("waiting_for_transcript... retry later using capped
+        # backoff") — re-check those due for a retry now, independent of
+        # this run's own fetch window.
+        total_transcripts += await _recheck_waiting_transcripts(
+            db=db, repository=repository, graph=graph, account_id=account.id, now=now, transcript_errors=transcript_errors,
+        )
 
-                    if not transcript_timestamp and not is_datetime_in_range(
-                        event_starts_at,
-                        start_at,
-                        end_at,
-                    ):
-                        logger.info(
-                            "Skipping transcript without timestamp because event is outside range. event=%s transcript_id=%s",
-                            event.get("subject"),
-                            transcript.get("id"),
-                        )
-                        continue
+        if not account_fetch_failed:
+            account.last_synced_at = end_at
+            account.last_sync_status = "success"
+            account.last_sync_error = None
+        else:
+            account.last_sync_status = "failed"
+            account.last_sync_error = safe_error_message(ERROR_PROVIDER_UNAVAILABLE)
+        await db.commit()
 
-                    transcript_text = await graph.get_transcript_content(
-                        online_meeting_id,
-                        transcript["id"],
-                    )
+        logger.info(
+            "microsoft sync account done",
+            extra={
+                "provider": "microsoft", "stage": "fetch", "status": "failed" if account_fetch_failed else "success",
+                "integration_account_id": account.id, "emails": len(messages), "events": len(events),
+            },
+        )
 
-                    if not transcript_text:
-                        logger.info(
-                            "Skipping empty transcript. event=%s transcript_id=%s",
-                            event.get("subject"),
-                            transcript.get("id"),
-                        )
-                        continue
-
-                    await repository.upsert_meeting_transcript(
-                        calendar_event_id=saved_event.id,
-                        provider_transcript_id=transcript["id"],
-                        transcript_text=transcript_text,
-                        raw_payload={
-                            **transcript,
-                            "event_starts_at": event_starts_at.isoformat()
-                            if event_starts_at
-                            else None,
-                            "event_ends_at": event_ends_at.isoformat()
-                            if event_ends_at
-                            else None,
-                        },
-                    )
-
-                    total_transcripts += 1
-
-            except Exception as exc:
-                transcript_errors.append(
-                    {
-                        "event_id": event.get("id"),
-                        "title": event.get("subject"),
-                        "stage": "fetch_transcripts",
-                        "error": str(exc),
-                    }
-                )
-
-    logger.info(
-        "Microsoft sync done for %s. emails=%s events=%s transcripts=%s",
-        user.email,
-        total_emails,
-        total_events,
-        total_transcripts,
-    )
+    if sync_run is not None:
+        sync_run.fetched_count += total_emails + total_events + total_transcripts
 
     return {
         "emails_imported": total_emails,
@@ -624,35 +710,280 @@ async def sync_microsoft_data_for_user(
     }
 
 
-async def _mark_email_extracted(db: AsyncSession, email_id: int) -> None:
-    await db.execute(
-        sql_update(ImportedEmail)
-        .where(ImportedEmail.id == email_id)
-        .values(tasks_extracted=True)
-    )
+async def sync_gmail_data_for_user(
+    *,
+    db: AsyncSession,
+    user: User,
+    sync_run: SyncRun | None = None,
+) -> dict:
+    """Gmail adapter (Automation Pipeline Audit follow-up, Phase 2) —
+    FETCH + NORMALIZE stage only, mirroring sync_microsoft_data_for_user
+    exactly (same incremental-checkpoint strategy, same
+    last_synced_at-only-advances-on-success rule, same
+    IntegrationRepository.upsert_imported_email() write path). AI
+    analysis and Task creation happen in the SAME shared
+    analyze_pending_sources_for_user() Microsoft already uses — Gmail
+    emails and Outlook emails land in the identical ImportedEmail table
+    and are indistinguishable to that function except by
+    `integration_account.provider`.
+
+    Gmail has no Teams-equivalent meeting/transcript surface, so this
+    adapter never touches CalendarEvent/MeetingTranscript at all."""
+    from app.services.integrations.gmail import GmailService
+
+    org_id = await resolve_org_id_for_user(db, user)
+    empty_result = {"emails_imported": 0, "transcript_errors": []}
+    if org_id is None:
+        return empty_result
+
+    repository = IntegrationRepository(db, org_id)
+    accounts = await repository.list_accounts_by_provider(user.id, "google")
+    if not accounts:
+        return empty_result
+
+    now = ensure_aware_utc(datetime.now(timezone.utc))
+    total_emails = 0
+
+    for account in accounts:
+        checkpoint = ensure_aware_utc(account.last_synced_at)
+        start_at = (checkpoint - SYNC_OVERLAP_BUFFER) if checkpoint else (now - timedelta(days=INITIAL_SYNC_LOOKBACK_DAYS))
+        end_at = now
+
+        logger.info(
+            "gmail sync account start",
+            extra={
+                "provider": "google", "stage": "fetch", "status": "running",
+                "integration_account_id": account.id, "user_id": user.id,
+                "organization_id": str(org_id), "window_start": start_at.isoformat(), "window_end": end_at.isoformat(),
+            },
+        )
+
+        gmail = GmailService(account)
+        account_fetch_failed = False
+
+        try:
+            await gmail.ensure_fresh_token(db)
+            messages = await gmail.list_messages(start_at, end_at)
+        except Exception as exc:
+            error_code = classify_http_error(exc)
+            logger.warning(
+                "gmail fetch failed",
+                extra={"provider": "google", "stage": "email_fetch", "status": "failed", "integration_account_id": account.id, "error_code": error_code},
+            )
+            messages = []
+            account_fetch_failed = True
+            if sync_run is not None:
+                sync_run.failed_count += 1
+
+        for message in messages:
+            body = message.get("body") or {}
+            await repository.upsert_imported_email(
+                integration_account_id=account.id,
+                provider_message_id=message["id"],
+                subject=message.get("subject"),
+                sender=extract_email_address(message.get("from")),
+                recipients=extract_recipients(message.get("toRecipients")),
+                received_at=parse_iso_datetime(message.get("receivedDateTime")),
+                snippet=message.get("bodyPreview"),
+                body_text=body.get("content") or message.get("bodyPreview"),
+                raw_payload=message,
+            )
+            total_emails += 1
+
+        if not account_fetch_failed:
+            account.last_synced_at = end_at
+            account.last_sync_status = "success"
+            account.last_sync_error = None
+        else:
+            account.last_sync_status = "failed"
+            account.last_sync_error = safe_error_message(ERROR_PROVIDER_UNAVAILABLE)
+        await db.commit()
+
+        logger.info(
+            "gmail sync account done",
+            extra={
+                "provider": "google", "stage": "fetch", "status": "failed" if account_fetch_failed else "success",
+                "integration_account_id": account.id, "emails": len(messages),
+            },
+        )
+
+    if sync_run is not None:
+        sync_run.fetched_count += total_emails
+
+    return {"emails_imported": total_emails, "transcript_errors": []}
+
+
+async def _fetch_and_track_transcripts(
+    *, db: AsyncSession, repository: IntegrationRepository, graph: MicrosoftGraphService,
+    event: CalendarEvent, online_meeting_id: str, transcript_errors: list[dict],
+) -> int:
+    """Teams transcript handling follow-up: a meeting ending does NOT
+    guarantee the transcript is instantly available. If Graph returns no
+    transcripts yet, this records `waiting_for_transcript` with a capped-
+    backoff `transcript_next_check_at` (see
+    app.core.automation_pipeline.TRANSCRIPT_RETRY_BACKOFF_MINUTES) rather
+    than treating it as a permanent failure or polling forever."""
+    imported = 0
+    try:
+        transcripts = await graph.list_transcripts_for_online_meeting(online_meeting_id)
+    except Exception as exc:
+        error_code = classify_http_error(exc)
+        transcript_errors.append({"event_id": event.provider_event_id, "title": event.title, "stage": "list_transcripts", "error_code": error_code})
+        if error_code == ERROR_TRANSCRIPT_PERMISSION_DENIED:
+            event.transcript_status = TRANSCRIPT_STATUS_PERMISSION_DENIED
+        else:
+            event.transcript_attempts += 1
+            event.transcript_status = TRANSCRIPT_STATUS_WAITING
+            event.transcript_next_check_at = datetime.now(timezone.utc) + timedelta(minutes=transcript_backoff_minutes(event.transcript_attempts))
+        await db.commit()
+        return 0
+
+    if not transcripts:
+        event.transcript_attempts += 1
+        if event.transcript_attempts >= 5:  # TRANSCRIPT_MAX_ATTEMPTS
+            event.transcript_status = "expired"
+            logger.info(
+                "transcript retry budget exhausted",
+                extra={"provider": "microsoft", "stage": "transcript_fetch", "status": "expired", "event_id": event.provider_event_id, "attempts": event.transcript_attempts},
+            )
+        else:
+            event.transcript_status = TRANSCRIPT_STATUS_WAITING
+            event.transcript_next_check_at = datetime.now(timezone.utc) + timedelta(minutes=transcript_backoff_minutes(event.transcript_attempts))
+            logger.info(
+                "transcript not ready",
+                extra={"provider": "microsoft", "stage": "transcript_fetch", "status": "waiting", "event_id": event.provider_event_id, "attempts": event.transcript_attempts},
+            )
+        await db.commit()
+        return 0
+
+    for transcript in transcripts:
+        transcript_id = transcript.get("id")
+        if not transcript_id:
+            continue
+        try:
+            transcript_text = await graph.get_transcript_content(online_meeting_id, transcript_id)
+        except Exception as exc:
+            transcript_errors.append({"event_id": event.provider_event_id, "title": event.title, "stage": "get_transcript_content", "error_code": classify_http_error(exc)})
+            continue
+        if not transcript_text:
+            continue
+
+        await repository.upsert_meeting_transcript(
+            calendar_event_id=event.id,
+            provider_transcript_id=transcript_id,
+            transcript_text=transcript_text,
+            raw_payload=transcript,
+        )
+        imported += 1
+
+    event.transcript_status = TRANSCRIPT_STATUS_AVAILABLE if imported else event.transcript_status
     await db.commit()
-
-
-async def _mark_transcript_extracted(db: AsyncSession, transcript_id: int) -> None:
-    await db.execute(
-        sql_update(MeetingTranscript)
-        .where(MeetingTranscript.id == transcript_id)
-        .values(tasks_extracted=True)
+    logger.info(
+        "transcript fetch done",
+        extra={"provider": "microsoft", "stage": "transcript_fetch", "status": "success" if imported else "empty", "event_id": event.provider_event_id, "transcripts_imported": imported},
     )
+    return imported
+
+
+async def _recheck_waiting_transcripts(
+    *, db: AsyncSession, repository: IntegrationRepository, graph: MicrosoftGraphService,
+    account_id: int, now: datetime, transcript_errors: list[dict],
+) -> int:
+    result = await db.execute(
+        select(CalendarEvent).where(
+            CalendarEvent.integration_account_id == account_id,
+            CalendarEvent.transcript_status == TRANSCRIPT_STATUS_WAITING,
+            CalendarEvent.transcript_next_check_at.is_not(None),
+            CalendarEvent.transcript_next_check_at <= now,
+        )
+    )
+    due_events = list(result.scalars().all())
+    imported_total = 0
+    for event in due_events:
+        raw = event.raw_payload or {}
+        online_meeting = raw.get("onlineMeeting") or {}
+        online_meeting_id = online_meeting.get("id")
+        if not online_meeting_id and event.meeting_url:
+            try:
+                found = await graph.find_online_meeting_by_join_url(event.meeting_url)
+                online_meeting_id = found.get("id") if found else None
+            except Exception as exc:
+                transcript_errors.append({"event_id": event.provider_event_id, "title": event.title, "stage": "resolve_online_meeting_recheck", "error_code": classify_http_error(exc)})
+        if not online_meeting_id:
+            event.transcript_status = TRANSCRIPT_STATUS_NOT_SUPPORTED
+            await db.commit()
+            continue
+        imported_total += await _fetch_and_track_transcripts(
+            db=db, repository=repository, graph=graph, event=event, online_meeting_id=online_meeting_id,
+            transcript_errors=transcript_errors,
+        )
+    return imported_total
+
+
+async def _claim_source_rows(db: AsyncSession, model, user_id: int, *, account_join, limit: int = 200) -> list:
+    """Idempotency/concurrency follow-up — the actual guard against two
+    overlapping sync runs (manual + scheduled, two app instances, a
+    retried request) double-processing the same email/transcript and
+    creating duplicate Tasks.
+
+    `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING`
+    is a single atomic statement: two concurrent callers running this at
+    the same moment can never claim the same row — the second caller's
+    inner SELECT skips whatever the first has already row-locked, so the
+    two claims are always disjoint sets. This is the database-constraint-
+    grade protection the spec asks for, not a plain
+    `if already_processed: return` race."""
+    id_col = model.id
+    subquery = (
+        account_join(select(id_col))
+        .where(IntegrationAccount.user_id == user_id, model.processing_status == SOURCE_STATUS_DISCOVERED)
+        .limit(limit)
+        .with_for_update(of=model, skip_locked=True)
+    )
+    stmt = (
+        sql_update(model)
+        .where(id_col.in_(subquery))
+        .values(processing_status=SOURCE_STATUS_ANALYZING)
+        .returning(id_col)
+    )
+    result = await db.execute(stmt)
+    claimed_ids = [row[0] for row in result.all()]
     await db.commit()
+    if not claimed_ids:
+        return []
+    rows = await db.execute(select(model).where(id_col.in_(claimed_ids)))
+    return list(rows.scalars().unique().all())
 
 
-async def analyze_yesterday_sources_for_user(
+async def analyze_pending_sources_for_user(
     *,
     db: AsyncSession,
     user: User,
     org_id,
+    sync_run: SyncRun | None = None,
 ) -> dict:
+    """Shared, provider-neutral AI-analysis + Task-creation stage (see the
+    module docstring in app.core.automation_pipeline). Operates on
+    whatever `ImportedEmail`/`MeetingTranscript` rows are sitting in
+    processing_status="discovered" for this user, REGARDLESS of which
+    provider adapter (Microsoft or Gmail) wrote them — both write into
+    the same tables via the same IntegrationRepository upserts, so this
+    function never needs a per-provider branch.
+
+    Renamed from analyze_yesterday_sources_for_user(): it no longer
+    operates on a fixed "yesterday" window at all — it claims whatever is
+    pending, which is what actually made it idempotent-safe to call
+    repeatedly/concurrently (see _claim_source_rows).
+    """
     extractor = AITaskExtractor()
     task_repo = TaskRepository(db, org_id)
     user_repo = UserRepository(db)
     project_repo = ProjectRepository(db, org_id)
     team_repo = TeamRepository(db, org_id)
+
+    org_result = await db.execute(select(Organization).where(Organization.id == org_id))
+    organization = org_result.scalar_one_or_none()
+    reference_date = _org_local_today(organization)
 
     # SECURITY: org-scoped candidate set only (cross-tenant automation-
     # assignee fix) — NEVER user_repo.list_all(), which scans every user in
@@ -664,38 +995,28 @@ async def analyze_yesterday_sources_for_user(
     projects = await project_repo.list_all()
     teams = await team_repo.list_all()
 
-    email_statement = (
-        select(ImportedEmail)
-        .join(
-            IntegrationAccount,
-            ImportedEmail.integration_account_id == IntegrationAccount.id,
-        )
-        .where(IntegrationAccount.user_id == user.id)
-        .where(ImportedEmail.tasks_extracted.is_(False))
-        .order_by(ImportedEmail.received_at.desc())
-    )
+    def _email_account_join(q):
+        return q.join(IntegrationAccount, ImportedEmail.integration_account_id == IntegrationAccount.id)
 
-    email_result = await db.execute(email_statement)
-    emails = list(email_result.scalars().all())
-
-    transcript_statement = (
-        select(MeetingTranscript)
-        .join(
-            CalendarEvent,
-            MeetingTranscript.calendar_event_id == CalendarEvent.id,
+    def _transcript_account_join(q):
+        return (
+            q.join(CalendarEvent, MeetingTranscript.calendar_event_id == CalendarEvent.id)
+            .join(IntegrationAccount, CalendarEvent.integration_account_id == IntegrationAccount.id)
         )
-        .join(
-            IntegrationAccount,
-            CalendarEvent.integration_account_id == IntegrationAccount.id,
-        )
-        .where(IntegrationAccount.user_id == user.id)
-        .where(MeetingTranscript.tasks_extracted.is_(False))
-        .options(selectinload(MeetingTranscript.calendar_event))
-        .order_by(CalendarEvent.starts_at.desc())
-    )
 
-    transcript_result = await db.execute(transcript_statement)
-    transcripts = list(transcript_result.scalars().all())
+    emails = await _claim_source_rows(db, ImportedEmail, user.id, account_join=_email_account_join)
+    transcripts = await _claim_source_rows(db, MeetingTranscript, user.id, account_join=_transcript_account_join)
+    if transcripts:
+        # calendar_event is needed for meeting title/organizer below —
+        # refresh with the relationship eager-loaded (the claim query
+        # above only needs the id, so this is a small, separate fetch).
+        transcript_ids = [t.id for t in transcripts]
+        result = await db.execute(
+            select(MeetingTranscript)
+            .where(MeetingTranscript.id.in_(transcript_ids))
+            .options(selectinload(MeetingTranscript.calendar_event))
+        )
+        transcripts = list(result.scalars().all())
 
     sources_analyzed = 0
     tasks_created = 0
@@ -704,53 +1025,87 @@ async def analyze_yesterday_sources_for_user(
     tasks_created_without_team = 0
     tasks_created_without_start_date = 0
     tasks_created_without_due_date = 0
+    tasks_needing_review = 0
     emails_skipped_as_non_task = 0
     emails_without_text = 0
+    sources_failed = 0
 
     async def handle_extracted_tasks(
         *,
+        source_row,
         source_type: str,
+        provenance_source_type: str,
         source_title: str | None,
         source_text: str,
+        source_external_id: str,
+        provider: str,
+        source_date: datetime | None = None,
         fallback_assignee_email: str | None = None,
-    ):
-        nonlocal sources_analyzed
-        nonlocal tasks_created
-        nonlocal tasks_created_without_assignee
-        nonlocal tasks_created_without_project
-        nonlocal tasks_created_without_team
-        nonlocal tasks_created_without_start_date
-        nonlocal tasks_created_without_due_date
+    ) -> str:
+        """Runs AI analysis for one source row and returns its final
+        processing_status. Never raises — a failure here becomes
+        SOURCE_STATUS_FAILED with a safe error message rather than
+        aborting the whole batch over one bad item."""
+        nonlocal sources_analyzed, tasks_created, tasks_created_without_assignee
+        nonlocal tasks_created_without_project, tasks_created_without_team
+        nonlocal tasks_created_without_start_date, tasks_created_without_due_date
+        nonlocal tasks_needing_review
 
         # Privacy (PHASE 21) + tenant safety: the AI extractor's
         # "known users" hint list is built from the org-scoped candidate
         # set only — never leaks another organization's user names/emails
         # into this org's extraction prompt.
-        known_users_list = [
-            {"name": u.full_name, "email": u.email}
-            for u, _role in user_candidates
-        ]
+        known_users_list = [{"name": u.full_name, "email": u.email} for u, _role in user_candidates]
 
-        extracted_tasks, raw_payload = await extractor.extract_tasks(
-            source_type=source_type,
-            source_title=source_title,
-            source_text=source_text,
-            known_users=known_users_list,
-        )
+        try:
+            extracted_tasks, raw_payload = await extractor.extract_tasks(
+                source_type=source_type,
+                source_title=source_title,
+                source_text=source_text,
+                known_users=known_users_list,
+                reference_date=reference_date,
+            )
+        except Exception:
+            logger.exception(
+                "ai analysis raised unexpectedly",
+                extra={"provider": provider, "stage": "ai_analysis", "status": "failed", "source_type": source_type, "source_external_id": source_external_id},
+            )
+            source_row.last_error = safe_error_message(ERROR_AI_ANALYSIS_FAILED)
+            return SOURCE_STATUS_FAILED
 
         sources_analyzed += 1
+        source_row.ai_result_summary = (raw_payload.get("reason") or "")[:500] or None
+
+        logger.info(
+            "ai analysis done",
+            extra={
+                "provider": provider, "stage": "ai_analysis", "status": "success",
+                "source_type": source_type, "source_external_id": source_external_id,
+                "action_items": len(extracted_tasks), "category": raw_payload.get("source_category"),
+            },
+        )
+
+        if not extracted_tasks:
+            return SOURCE_STATUS_NO_ACTION_REQUIRED
+
+        created_any = False
+        review_any = False
 
         for extracted_task in extracted_tasks:
+            if not meets_auto_create_bar(extracted_task.confidence):
+                # MEDIUM/ambiguous or LOW confidence: never auto-create —
+                # visible in Automation Activity as needs_review instead
+                # (spec's "CONFIDENCE + HUMAN REVIEW").
+                review_any = True
+                tasks_needing_review += 1
+                continue
+
             # Team resolution happens BEFORE assignee resolution (PHASE 13/
             # 14) — a Team Task's assignee boundary is that exact Team, so
             # the candidate set for both explicit name/email matching and
             # fallback selection must already be narrowed to the team
             # before either runs, never widened back to the whole org.
-            team_id = resolve_team_id(
-                teams,
-                extracted_task.suggested_team_name,
-            )
-
+            team_id = resolve_team_id(teams, extracted_task.suggested_team_name)
             if team_id is None and source_type == "transcript":
                 team_id = resolve_team_from_meeting_title(teams, source_title)
 
@@ -762,40 +1117,23 @@ async def analyze_yesterday_sources_for_user(
                 assignee_pool = [u for u, _role in user_candidates]
                 eligible_ids = None
 
-            assignee_id = resolve_user_id(
-                assignee_pool,
-                extracted_task.suggested_assignee_name,
-                extracted_task.suggested_assignee_email,
-            )
-
+            assignee_id = resolve_user_id(assignee_pool, extracted_task.suggested_assignee_name, extracted_task.suggested_assignee_email)
             if assignee_id is None:
-                assignee_id = find_fallback_assignee_id(
-                    user_candidates,
-                    fallback_assignee_email,
-                    user.id,
-                    eligible_ids=eligible_ids,
-                )
+                assignee_id = find_fallback_assignee_id(user_candidates, fallback_assignee_email, user.id, eligible_ids=eligible_ids)
                 tasks_created_without_assignee += 1
 
-            project_id = resolve_project_id(
-                projects,
-                extracted_task.suggested_project_name,
-            )
-
+            project_id = resolve_project_id(projects, extracted_task.suggested_project_name)
             if project_id is None:
                 tasks_created_without_project += 1
-
             if team_id is None:
                 tasks_created_without_team += 1
-
             if extracted_task.suggested_start_date is None:
                 tasks_created_without_start_date += 1
-
             if extracted_task.suggested_due_date is None:
                 tasks_created_without_due_date += 1
 
             try:
-                await task_repo.create(
+                task = await task_repo.create(
                     TaskCreate(
                         name=extracted_task.title,
                         description=extracted_task.description,
@@ -816,84 +1154,147 @@ async def analyze_yesterday_sources_for_user(
                 # assignee — it fails safe to Unassigned instead of
                 # crashing the whole batch over one bad candidate.
                 logger.warning(
-                    "Automation-resolved assignee %s failed final validation for org %s — creating task unassigned instead.",
-                    assignee_id, org_id,
+                    "automation-resolved assignee failed final validation — creating unassigned instead",
+                    extra={"provider": provider, "stage": "task_creation", "organization_id": str(org_id)},
                 )
-                await task_repo.create(
-                    TaskCreate(
-                        name=extracted_task.title,
-                        description=extracted_task.description,
-                        start_date=extracted_task.suggested_start_date,
-                        due_date=extracted_task.suggested_due_date,
-                        assignee_id=None,
-                        project_id=project_id,
-                        team_id=team_id,
-                        status="todo",
-                    ),
-                    created_by_id=user.id,
-                )
+                try:
+                    task = await task_repo.create(
+                        TaskCreate(
+                            name=extracted_task.title,
+                            description=extracted_task.description,
+                            start_date=extracted_task.suggested_start_date,
+                            due_date=extracted_task.suggested_due_date,
+                            assignee_id=None,
+                            project_id=project_id,
+                            team_id=team_id,
+                            status="todo",
+                        ),
+                        created_by_id=user.id,
+                    )
+                except AppException:
+                    logger.exception(
+                        "task creation failed even unassigned",
+                        extra={"provider": provider, "stage": "task_creation", "status": "failed", "organization_id": str(org_id)},
+                    )
+                    review_any = True
+                    tasks_needing_review += 1
+                    continue
                 tasks_created_without_assignee += 1
 
+            # Source -> Task provenance: exactly one TaskSource row per
+            # created Task, safe display metadata only (never the email
+            # body / transcript text, which stay on the source row).
+            db.add(TaskSource(
+                task_id=task.id,
+                organization_id=org_id,
+                provider=provider,
+                source_type=provenance_source_type,
+                source_external_id=source_external_id,
+                integration_account_id=getattr(source_row, "integration_account_id", None),
+                sync_run_id=sync_run.id if sync_run is not None else None,
+                ai_generated=True,
+                confidence=extracted_task.confidence,
+                source_title=(source_title or "")[:500] or None,
+                source_date=source_date,
+            ))
+            await db.commit()
+
             tasks_created += 1
+            created_any = True
+
+        if created_any and review_any:
+            return SOURCE_STATUS_PARTIALLY_CREATED
+        if created_any:
+            return SOURCE_STATUS_TASK_CREATED
+        if review_any:
+            return SOURCE_STATUS_NEEDS_REVIEW
+        return SOURCE_STATUS_NO_ACTION_REQUIRED
 
     for email in emails:
+        provider = (email.integration_account.provider if email.integration_account else "microsoft")
+        source_type_label = "gmail_email" if provider == "google" else "microsoft_outlook_email"
         source_text = email.body_text or email.snippet
 
         if not source_text:
             emails_without_text += 1
-            await _mark_email_extracted(db, email.id)
+            email.processing_status = SOURCE_STATUS_NO_ACTION_REQUIRED
+            await db.commit()
             continue
 
         if is_probably_non_task_email(email.subject, source_text, email.sender):
             emails_skipped_as_non_task += 1
-            await _mark_email_extracted(db, email.id)
+            email.processing_status = SOURCE_STATUS_NO_ACTION_REQUIRED
+            await db.commit()
             continue
 
-        await handle_extracted_tasks(
+        final_status = await handle_extracted_tasks(
+            source_row=email,
             source_type="email",
+            provenance_source_type=source_type_label,
             source_title=email.subject,
             source_text=source_text,
+            source_external_id=email.provider_message_id,
+            provider=provider,
+            source_date=ensure_aware_utc(email.received_at),
             fallback_assignee_email=email.sender,
         )
-
-        await _mark_email_extracted(db, email.id)
+        email.processing_status = final_status
+        if final_status == SOURCE_STATUS_FAILED:
+            sources_failed += 1
+        await db.commit()
 
     for transcript in transcripts:
+        calendar_event = transcript.calendar_event
+        provider = (calendar_event.integration_account.provider if calendar_event and calendar_event.integration_account else "microsoft")
+        meeting_title = calendar_event.title if calendar_event else None
+        organizer_email = calendar_event.organizer_email if calendar_event else None
+
         if not transcript.transcript_text:
-            await _mark_transcript_extracted(db, transcript.id)
+            transcript.processing_status = SOURCE_STATUS_NO_ACTION_REQUIRED
+            await db.commit()
             continue
 
-        meeting_title = None
-        organizer_email = None
-
-        if transcript.calendar_event:
-            meeting_title = transcript.calendar_event.title
-            organizer_email = transcript.calendar_event.organizer_email
-
-        await handle_extracted_tasks(
+        source_type_label = "microsoft_teams_transcript"
+        final_status = await handle_extracted_tasks(
+            source_row=transcript,
             source_type="transcript",
+            provenance_source_type=source_type_label,
             source_title=meeting_title or f"Meeting Transcript #{transcript.id}",
             source_text=transcript.transcript_text,
+            source_external_id=transcript.provider_transcript_id or str(transcript.id),
+            provider=provider,
+            source_date=ensure_aware_utc(calendar_event.starts_at) if calendar_event else None,
             fallback_assignee_email=organizer_email,
         )
+        transcript.processing_status = final_status
+        if final_status == SOURCE_STATUS_FAILED:
+            sources_failed += 1
+        await db.commit()
 
-        await _mark_transcript_extracted(db, transcript.id)
+    if sync_run is not None:
+        sync_run.analyzed_count += sources_analyzed
+        sync_run.actionable_count += tasks_created + tasks_needing_review
+        sync_run.tasks_created_count += tasks_created
+        sync_run.skipped_count += emails_skipped_as_non_task + emails_without_text
+        sync_run.failed_count += sources_failed
 
     logger.info(
-            "AI task creation done for %s. emails=%s transcripts=%s sources=%s tasks=%s skipped_email=%s",
-            user.email,
-            len(emails),
-            len(transcripts),
-            sources_analyzed,
-            tasks_created,
-            emails_skipped_as_non_task,
-        )
+        "ai task creation done",
+        extra={
+            "user_id": user.id, "organization_id": str(org_id),
+            "emails": len(emails), "transcripts": len(transcripts),
+            "sources_analyzed": sources_analyzed, "tasks_created": tasks_created,
+            "needs_review": tasks_needing_review, "skipped_non_task": emails_skipped_as_non_task,
+            "failed": sources_failed,
+        },
+    )
 
     return {
         "emails_found": len(emails),
         "transcripts_found": len(transcripts),
         "sources_analyzed": sources_analyzed,
         "tasks_created": tasks_created,
+        "tasks_needing_review": tasks_needing_review,
         "tasks_created_without_assignee": tasks_created_without_assignee,
         "tasks_created_without_project": tasks_created_without_project,
         "tasks_created_without_team": tasks_created_without_team,
@@ -901,4 +1302,5 @@ async def analyze_yesterday_sources_for_user(
         "tasks_created_without_due_date": tasks_created_without_due_date,
         "emails_skipped_as_non_task": emails_skipped_as_non_task,
         "emails_without_text": emails_without_text,
+        "sources_failed": sources_failed,
     }

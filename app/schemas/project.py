@@ -76,3 +76,20 @@ class ProjectTeamOption(BaseModel):
     id: int
     name: str
     assigned: bool
+
+
+class ProjectForManagedTeams(BaseModel):
+    """Team Manager Create-Task-form Project-dropdown follow-up: a Project
+    reachable through a Team the caller manages, via the explicit
+    Project<->Team association — same deliberately minimal shape idea as
+    ProjectTeamOption above (no description/status/logo — just enough for
+    a dropdown option). `team_ids` is scoped to ONLY the subset of the
+    caller's OWN managed Teams attached to this Project — never an
+    unrelated Team this caller doesn't manage, even one also attached to
+    the same Project — so the frontend's Project->Team cascade can filter
+    correctly without a second, separate request or leaking another
+    manager's Team."""
+
+    id: int
+    name: str
+    team_ids: list[int]

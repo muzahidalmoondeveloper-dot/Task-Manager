@@ -16,9 +16,10 @@ from app.core.activity_actions import (
 )
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.database import get_db
-from app.core.org_roles import PROJECT_MANAGER, TEAM_MEMBER
+from app.core.org_roles import CLIENT, PROJECT_MANAGER, TEAM_MEMBER
 from app.core.project_access import is_project_scoped, list_project_team_ids, require_project_access
 from app.core.task_assignment import validate_task_assignee
+from app.core.team_access import require_team_access
 from app.core.tenant import (
     TenantContext,
     get_tenant_context,
@@ -78,6 +79,27 @@ _TASK_TIMER_ACTIVE = ErrorDef(
     code="TASK_TIMER_ACTIVE",
     status=http_status.HTTP_409_CONFLICT,
     message="Stop the active task timer before changing the assignee.",
+)
+
+# Project Manager Task-delegation follow-up: a Project-Manager-only actor
+# (has_project_manager_access, no Owner/Admin/Team-Manager capability)
+# creating a Task through the Project-management flow may never directly
+# name an individual as the assignee — they delegate to a Team (which the
+# Team Manager then staffs) or, when there's no Team at all, the Task is
+# understood as their own personal work and the assignee is fixed to
+# themselves. Either way, the actor never gets to *choose* another
+# person. Deliberately 403 (an authorization refusal on who did the
+# choosing), not a validation-style 400 — the request may otherwise be
+# perfectly well-formed.
+_PM_CANNOT_ASSIGN_MEMBER = ErrorDef(
+    code="PROJECT_MANAGER_CANNOT_ASSIGN_MEMBER",
+    status=http_status.HTTP_403_FORBIDDEN,
+    message="Project Managers delegate tasks to teams. The Team Manager assigns the individual owner.",
+)
+_PM_PROJECT_REQUIRED = ErrorDef(
+    code="PROJECT_REQUIRED",
+    status=http_status.HTTP_400_BAD_REQUEST,
+    message="Project is required.",
 )
 
 
@@ -152,6 +174,98 @@ async def can_access_task(tenant: TenantContext, task: Task) -> bool:
         if await team_repo.is_manager(task.team_id, tenant.user.id):
             return True
     return False
+
+
+# Project Manager Task-management follow-up: fields a plain Project
+# Manager (has_project_manager_access, no Owner/Admin/Team-Manager
+# capability) may mutate on a Task belonging to a project they legitimately
+# manage. Deliberately a strict whitelist, not a blocklist — any field not
+# named here (assignee_id, project_id, icon, ...) stays protected by
+# default, even if a new Task field is added later and someone forgets to
+# update this set. `team_id` is here because the PM owns the Project→Team
+# delegation decision — see the team_id-specific re-validation this sits
+# alongside in update_task(), which independently guarantees a Team change
+# can never leave an existing assignee invalid for the new team.
+PM_ALLOWED_TASK_UPDATE_FIELDS = {
+    "name", "description", "priority", "status", "start_date", "due_date", "team_id",
+}
+
+_PM_TASK_UPDATE_FORBIDDEN = ErrorDef(
+    code="PROJECT_MANAGER_TASK_FIELD_FORBIDDEN",
+    status=http_status.HTTP_403_FORBIDDEN,
+    message="Project Managers may only update a task's core details (title, description, priority, status, dates, team) — not this field.",
+)
+
+# Team Manager Task-update-scope follow-up: the fields a "bare assignee" —
+# someone who passes require_task_update_access() ONLY because
+# task.assignee_id == their own id, with no elevated capability over this
+# specific Task (not Owner/Admin, not managing its Team, not a PM member
+# of its Project) — may mutate through PATCH /tasks/{id}. Deliberately as
+# narrow as the spec's own "OWN ASSIGNED TASK" list (status change / mark
+# done / reopen): never assignee_id, team_id, project_id, or anything
+# else, so a plain Team Member who merely happens to be a Task's assignee
+# can never use this route to grant themselves manager-level editing —
+# they get exactly the same assignee-safe scope PATCH /tasks/{id}/status
+# already gives them, just reachable through the canonical route too.
+ASSIGNEE_ALLOWED_TASK_UPDATE_FIELDS = {"status"}
+
+_ASSIGNEE_TASK_UPDATE_FORBIDDEN = ErrorDef(
+    code="ASSIGNEE_TASK_FIELD_FORBIDDEN",
+    status=http_status.HTTP_403_FORBIDDEN,
+    message="As the assignee, you may only update this task's status.",
+)
+
+
+async def require_task_update_access(
+    tenant: TenantContext, task: Task, project_repo: ProjectRepository, team_repo: TeamRepository,
+) -> None:
+    """Project Manager Task-management follow-up — the scoped counterpart
+    to `require_org_manager` (which this route used to gate on
+    exclusively, excluding a plain Project Manager from ANY task update at
+    all, even on their own managed project's tasks).
+
+    Team Manager Task-update-scope follow-up (bug fix): this used to grant
+    ANY Team Manager (`is_manager_or_above` is also true for Team Manager,
+    not just Owner/Admin) an unconditional pass — organization-wide Task
+    update access, completely unscoped, the exact "if is_team_manager:
+    allow" anti-pattern the product rules forbid. Fixed to mirror the
+    already-correct read-side rule `can_access_task()` uses: a Team
+    Manager is authorized ONLY for a Task belonging to a Team they
+    actually manage (`TeamRepository.is_manager` — `Team.team_manager_id
+    == tenant.user.id`, never merely a `TeamMembership` row), never any
+    other Task in the org.
+
+    Also newly covers the "own assigned task" rule, independent of role:
+    the actual assignee of ANY task may pass this gate for assignee-safe
+    operational updates — the caller (update_task/update_task_status)
+    still narrows WHICH fields a bare assignee (no elevated role over
+    this task) may actually set via ASSIGNEE_ALLOWED_TASK_UPDATE_FIELDS;
+    this function only answers "may touch this task at all". A Client is
+    explicitly excluded from this assignee bypass — Clients are never a
+    legal Task assignee (see app.core.task_assignment's Rule A) and must
+    stay fully denied here regardless of any stray assignee_id.
+
+    - Owner/Admin (`is_admin_or_owner`): unconditional, unchanged.
+    - The task's actual assignee (never a Client): allowed.
+    - Team Manager (role or granted flag, not Owner/Admin): allowed ONLY
+      for a Task belonging to a Team they manage — see above.
+    - A plain Project Manager: allowed ONLY if the task belongs to a
+      Project (`task.project_id is not None`) they hold a genuine
+      `ProjectMembership` on — never merely because they're in the same
+      organization, and never for a project-less task. Unchanged.
+    - Everyone else (Team Member who isn't the assignee, Client): denied.
+    """
+    if tenant.is_admin_or_owner:
+        return
+    if task.assignee_id == tenant.user.id and tenant.org_role != CLIENT:
+        return
+    if tenant.is_manager_or_above and task.team_id is not None:
+        if await team_repo.is_manager(task.team_id, tenant.user.id):
+            return
+    if tenant.has_project_manager_access and task.project_id is not None:
+        if await project_repo.is_member(task.project_id, tenant.user.id):
+            return
+    raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="You are not allowed to update tasks.")
 
 
 def can_control_task_timer(task: Task, user_id: int) -> bool:
@@ -271,6 +385,23 @@ async def create_task(
     if not tenant.is_manager_or_above and tenant.org_role != PROJECT_MANAGER:
         raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="You are not allowed to create tasks.")
 
+    # A plain Project Manager: has Project Manager capability (role or
+    # granted flag) but NOT Owner/Admin/Team-Manager capability — the
+    # exact actor this whole Task-delegation follow-up targets. An Owner/
+    # Admin/Team Manager who also happens to hold PM capability is NOT
+    # "plain" and keeps their existing, unrestricted assignment behavior
+    # (capability, not primary-role text, decides this — see
+    # TenantContext.has_project_manager_access/is_manager_or_above).
+    is_plain_project_manager = tenant.has_project_manager_access and not tenant.is_manager_or_above
+
+    # Project Manager Task-delegation follow-up: Project is required for
+    # every Task a plain Project Manager creates — their authority
+    # originates entirely from Project scope (ProjectMembership), so a
+    # project-less Task would have no scope to have been authorized
+    # through at all. Owners/Admins/Team Managers are unaffected.
+    if is_plain_project_manager and payload.project_id is None:
+        raise AppException(_PM_PROJECT_REQUIRED)
+
     # Project scope (see app.core.project_access): a Team Manager or
     # Project Manager without ProjectMembership on the target project may
     # not create tasks under it — previously only plain PROJECT_MANAGER was
@@ -278,7 +409,21 @@ async def create_task(
     # skipped this block entirely) could create a task under ANY project in
     # the org, not just one they're assigned to manage.
     if payload.project_id is not None and is_project_scoped(tenant):
-        if not await project_repo.is_member(payload.project_id, tenant.user.id):
+        authorized = await project_repo.is_member(payload.project_id, tenant.user.id)
+        if not authorized and tenant.is_manager_or_above:
+            # Team Manager Create-Task-form follow-up: a Team Manager (the
+            # only actor left here after the plain-PM/Owner-Admin cases
+            # above/below) may also reference a Project reachable through
+            # a Team they actually manage — the same explicit
+            # Project<->Team association their Project dropdown is now
+            # scoped from (GET /projects/for-managed-teams) — never bare
+            # ProjectMembership only. A plain Project Manager's rule above
+            # is unchanged: is_member() is still their sole path.
+            managed_team_ids = await team_repo.list_managed_team_ids(tenant.user.id)
+            if managed_team_ids:
+                project_team_ids = await list_project_team_ids(db, tenant.organization_id, payload.project_id)
+                authorized = bool(managed_team_ids & project_team_ids)
+        if not authorized:
             raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="You can only create tasks under a project you are assigned to.")
 
     if payload.project_id is not None:
@@ -288,6 +433,20 @@ async def create_task(
     if payload.team_id is not None:
         if await team_repo.get_by_id(payload.team_id) is None:
             raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="Selected team is invalid.")
+
+        # Team Manager Create-Task-form follow-up: the actor must actually
+        # manage (or hold TeamMembership on) this exact team —
+        # previously unchecked here at all, so a Team Manager could create
+        # a Task under ANY team in the org, not just one of their own.
+        # require_team_access already short-circuits for Owner/Admin
+        # (unrestricted, unchanged). Deliberately NOT applied to a plain
+        # Project Manager — their team_id is authorized through the
+        # Project association checked just below instead, and a PM
+        # legitimately has no TeamMembership on most teams they delegate
+        # to; require_team_access would wrongly reject that existing,
+        # correct delegation flow.
+        if not is_plain_project_manager:
+            await require_team_access(tenant, team_repo, payload.team_id)
 
         # A plain Project Manager (not also Owner/Admin/Team Manager) may
         # only assign a team that's actually associated with the project
@@ -299,7 +458,6 @@ async def create_task(
         # nicety, not the security boundary; a crafted request must be
         # rejected the same way. Owners/Admins/Team Managers are unaffected
         # (unchanged, existing behavior).
-        is_plain_project_manager = tenant.has_project_manager_access and not tenant.is_manager_or_above
         if is_plain_project_manager and payload.project_id is not None:
             allowed_team_ids = await list_project_team_ids(db, tenant.organization_id, payload.project_id)
             if payload.team_id not in allowed_team_ids:
@@ -307,6 +465,37 @@ async def create_task(
                     status_code=http_status.HTTP_403_FORBIDDEN,
                     detail="That team is not assignable within this project.",
                 )
+
+    # Project Manager Task-delegation follow-up: a plain Project Manager
+    # never directly names an individual assignee through this Project-
+    # management flow — deliberately enforced HERE (server-side, before
+    # persistence), never merely by hiding the control in the UI.
+    #   - team_id set  -> "Project Task": delegated to the Team; the Team
+    #     Manager decides the individual owner later. assignee_id must be
+    #     NULL — even the PM's own id is rejected, not silently accepted,
+    #     since self-assignment on a delegated Team Task would bypass the
+    #     Team Manager's ownership decision exactly like assigning anyone
+    #     else would.
+    #   - team_id absent -> "My Task": personal PM work with no Team
+    #     involved at all. assignee_id is fixed to the PM themself — an
+    #     explicit different value is rejected (never silently
+    #     overwritten, so a manipulated request is refused rather than
+    #     quietly corrected); an omitted/None value is filled in as the
+    #     PM's own id, matching the "Assignee: Me" UI, which never
+    #     exposes an editable choice.
+    # This only ever runs for a plain Project Manager's OWN manual Task
+    # creation through this route — automation/meeting-extraction Task
+    # creation never reaches this branch (they don't go through this
+    # human-actor permission gate at all), so this cannot break those
+    # flows regardless of the integration owner's org role.
+    if is_plain_project_manager:
+        if payload.team_id is not None:
+            if payload.assignee_id is not None:
+                raise AppException(_PM_CANNOT_ASSIGN_MEMBER)
+        else:
+            if payload.assignee_id is not None and payload.assignee_id != tenant.user.id:
+                raise AppException(_PM_CANNOT_ASSIGN_MEMBER)
+            payload.assignee_id = tenant.user.id
 
     # Task Assignee bug-fix follow-up: Client exclusion (Rule A),
     # organization-membership/active checks, and — when this task belongs
@@ -657,6 +846,8 @@ async def update_task_status(
     if tenant.org_role == TEAM_MEMBER:
         if task.assignee_id != tenant.user.id:
             raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="You can only update status on tasks assigned to you.")
+        # Below this line is TEAM_MEMBER's own existing assignee-only
+        # review-submission workflow — completely unchanged.
 
         if payload.status == "done":
             task.status = "pending_review"
@@ -695,8 +886,21 @@ async def update_task_status(
         updated = await repo.update(task, TaskUpdate(status=payload.status))
         return serialize_task(updated)
 
-    if not tenant.is_admin_or_owner:
-        raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="You are not allowed to update tasks.")
+    # Team Manager Task-update-scope bug fix: this used to be a bare
+    # `if not tenant.is_admin_or_owner: raise` — a SECOND, stale
+    # authorization implementation that flatly rejected every non-Owner/
+    # Admin, non-TEAM_MEMBER caller, including a Team Manager updating the
+    # status of a Task assigned to themselves (the exact reported bug:
+    # "Task appears in My Tasks... but changing Task status fails with
+    # 'You are not allowed to update tasks.'"). Now shares the SAME
+    # canonical gate PATCH /tasks/{id} uses — Owner/Admin unconditional,
+    # the actual assignee, a Team Manager scoped to a Team they manage, or
+    # a Project Manager scoped to a Project they're a member of — so this
+    # endpoint and the generic update route can never drift into two
+    # conflicting authorization rules again.
+    project_repo = ProjectRepository(db, tenant.organization_id)
+    team_repo = TeamRepository(db, tenant.organization_id)
+    await require_task_update_access(tenant, task, project_repo, team_repo)
 
     if payload.status == "done" and task.status != "done":
         task.completed_by_id = task.assignee_id or tenant.user.id
@@ -779,14 +983,89 @@ async def update_task(
     task_id: int,
     payload: TaskUpdate,
     background_tasks: BackgroundTasks,
-    tenant: TenantContext = Depends(require_org_manager),
+    tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db),
 ):
     repo = TaskRepository(db, tenant.organization_id)
+    project_repo = ProjectRepository(db, tenant.organization_id)
+    team_repo = TeamRepository(db, tenant.organization_id)
     task = await get_task_or_404(tenant, task_id)
 
+    # Project Manager Task-management follow-up: this dependency used to
+    # be `require_org_manager` (Owner/Admin/Team Manager only), which
+    # denied a plain Project Manager ANY update at all, even on their own
+    # managed project's tasks. `require_task_update_access` is the scoped
+    # replacement. Team Manager Task-update-scope follow-up: it used to
+    # grant ANY Team Manager an unconditional, organization-wide pass —
+    # now scoped to a Task belonging to a Team they actually manage (or
+    # one they're personally the assignee of), matching the already-
+    # correct read-side rule `can_access_task()` uses. This must never be
+    # solved by adding Team Manager/Project Manager to `require_org_manager`
+    # itself, which would grant organization-wide Task mutation instead of
+    # this per-task, per-team/per-project scope.
+    await require_task_update_access(tenant, task, project_repo, team_repo)
+
+    # A plain Project Manager may only mutate a strict whitelist of core
+    # Task fields — never assignee_id/project_id/icon/anything else not
+    # explicitly named, even if the value sent would be a no-op (e.g.
+    # re-sending the task's own current assignee_id). The PM frontend is
+    # expected to omit these fields entirely; a request that includes them
+    # is treated as a deliberate (or manipulated) attempt, not silently
+    # ignored or corrected.
+    is_plain_project_manager = tenant.has_project_manager_access and not tenant.is_manager_or_above
+    if is_plain_project_manager:
+        fields_set = payload.model_fields_set
+        if "assignee_id" in fields_set:
+            raise AppException(_PM_CANNOT_ASSIGN_MEMBER)
+        disallowed_fields = fields_set - PM_ALLOWED_TASK_UPDATE_FIELDS
+        if disallowed_fields:
+            raise AppException(_PM_TASK_UPDATE_FORBIDDEN)
+        # Team change: the PM owns the Project→Team delegation decision,
+        # but only among Teams already attached to THIS task's project —
+        # never an arbitrary org team (same rule create_task() enforces).
+        # Whether this would leave an existing assignee invalid for the
+        # new team is independently re-checked by the existing
+        # team_id-changing/assignee re-validation block right below —
+        # unchanged, not duplicated here.
+        if "team_id" in fields_set and payload.team_id != task.team_id:
+            allowed_team_ids = await list_project_team_ids(db, tenant.organization_id, task.project_id)
+            if payload.team_id not in allowed_team_ids:
+                raise HTTPException(
+                    status_code=http_status.HTTP_403_FORBIDDEN,
+                    detail="That team is not assignable within this project.",
+                )
+
+    # Team Manager Task-update-scope follow-up: a Team Manager managing
+    # THIS task's team keeps the full, unrestricted field access the
+    # product has always intended for them (no whitelist here, matching
+    # existing behavior) — recomputed independently from the access gate
+    # above, same pattern as `is_plain_project_manager`. Anyone who only
+    # passed `require_task_update_access` because they personally ARE the
+    # assignee, with no elevated capability over this specific Task
+    # (not Owner/Admin, not managing its Team, not a PM member of its
+    # Project), gets the same narrow, assignee-safe field whitelist
+    # PATCH /tasks/{id}/status already limits a plain Team Member to —
+    # never assignee_id/team_id/project_id/delete, regardless of role.
+    is_team_manager_scoped_to_task = (
+        tenant.is_manager_or_above
+        and not tenant.is_admin_or_owner
+        and task.team_id is not None
+        and await team_repo.is_manager(task.team_id, tenant.user.id)
+    )
+    is_bare_assignee_only = (
+        not tenant.is_admin_or_owner
+        and not is_plain_project_manager
+        and not is_team_manager_scoped_to_task
+        and task.assignee_id == tenant.user.id
+    )
+    if is_bare_assignee_only:
+        fields_set = payload.model_fields_set
+        disallowed_fields = fields_set - ASSIGNEE_ALLOWED_TASK_UPDATE_FIELDS
+        if disallowed_fields:
+            raise AppException(_ASSIGNEE_TASK_UPDATE_FORBIDDEN)
+
     if payload.team_id is not None:
-        if await TeamRepository(db, tenant.organization_id).get_by_id(payload.team_id) is None:
+        if await team_repo.get_by_id(payload.team_id) is None:
             raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="Selected team is invalid.")
 
     # Task Assignee bug-fix follow-up: re-validate whenever the assignee

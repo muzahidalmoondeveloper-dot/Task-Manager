@@ -377,6 +377,61 @@ async def lifespan(app: FastAPI):
         await conn.execute(text(
             "ALTER TABLE activity_logs ADD COLUMN IF NOT EXISTS actor_label VARCHAR(255)"
         ))
+        # Automation Pipeline Audit follow-up — incremental-sync checkpoint
+        # + last-run summary on the connected account, and observable
+        # per-item processing lifecycle/Teams-transcript-retry tracking.
+        # SyncRun/TaskSource are brand-new tables handled by create_all()
+        # above; these are ADD COLUMN IF NOT EXISTS because the tables
+        # already exist with data.
+        await conn.execute(text(
+            "ALTER TABLE integration_accounts ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE integration_accounts ADD COLUMN IF NOT EXISTS last_sync_status VARCHAR(20)"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE integration_accounts ADD COLUMN IF NOT EXISTS last_sync_error TEXT"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE imported_emails ADD COLUMN IF NOT EXISTS processing_status VARCHAR(30) NOT NULL DEFAULT 'discovered'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE imported_emails ADD COLUMN IF NOT EXISTS last_error TEXT"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE imported_emails ADD COLUMN IF NOT EXISTS ai_result_summary VARCHAR(500)"
+        ))
+        # Backfill: rows already marked tasks_extracted=true predate this
+        # column and have no way to know what actually happened to them —
+        # rather than leaving them stuck at the 'discovered' default
+        # (which would make them look unprocessed in Automation Activity),
+        # mark them with a generic historical status.
+        await conn.execute(text(
+            "UPDATE imported_emails SET processing_status = 'no_action_required' "
+            "WHERE tasks_extracted = TRUE AND processing_status = 'discovered'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meeting_transcripts ADD COLUMN IF NOT EXISTS processing_status VARCHAR(30) NOT NULL DEFAULT 'discovered'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meeting_transcripts ADD COLUMN IF NOT EXISTS last_error TEXT"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE meeting_transcripts ADD COLUMN IF NOT EXISTS ai_result_summary VARCHAR(500)"
+        ))
+        await conn.execute(text(
+            "UPDATE meeting_transcripts SET processing_status = 'no_action_required' "
+            "WHERE tasks_extracted = TRUE AND processing_status = 'discovered'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS transcript_status VARCHAR(30) NOT NULL DEFAULT 'unknown'"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS transcript_attempts INTEGER NOT NULL DEFAULT 0"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS transcript_next_check_at TIMESTAMPTZ"
+        ))
         # Best-effort backfill for rows written before this column existed
         # (see alembic/versions/e5a9c3f7d2b4_add_actor_label_to_activity_logs.py
         # for the full rationale) — safe to run on every startup since it

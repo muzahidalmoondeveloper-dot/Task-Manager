@@ -1019,6 +1019,17 @@ async def resend_otp(
             raise AuthError.email_not_verified()
 
     security_service = AuthSecurityService(db)
+
+    # OTP resend cooldown follow-up: backend-authoritative — a direct API
+    # call (or a page refresh that resets the frontend's own countdown)
+    # must still be rejected before the cooldown has genuinely elapsed.
+    # Never merely a frontend timer.
+    seconds_remaining = await security_service.get_seconds_until_resend_allowed(
+        email=user.email, purpose=payload.purpose,
+    )
+    if seconds_remaining > 0:
+        raise AuthError.otp_resend_too_soon(seconds_remaining)
+
     await security_service.create_and_send_otp(user=user, email=user.email, purpose=payload.purpose)
     return {"message": "OTP resent successfully.", "email": user.email, "purpose": payload.purpose}
 
