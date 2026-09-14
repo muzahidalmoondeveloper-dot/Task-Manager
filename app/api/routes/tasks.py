@@ -497,27 +497,24 @@ async def create_task(
     if is_plain_project_manager and payload.team_id is not None and payload.project_id is None:
         raise AppException(_PM_PROJECT_REQUIRED)
 
-    # Project scope (see app.core.project_access): a Team Manager or
-    # Project Manager without ProjectMembership on the target project may
-    # not create tasks under it — previously only plain PROJECT_MANAGER was
-    # checked here, so a Team Manager (who passes is_manager_or_above and
-    # skipped this block entirely) could create a task under ANY project in
-    # the org, not just one they're assigned to manage.
-    if payload.project_id is not None and is_project_scoped(tenant):
+    # Project/Team-independence follow-up: Project and Team are
+    # INDEPENDENT Task/To-Do context fields for a Team Manager (or anyone
+    # is_manager_or_above) — this ProjectMembership-based restriction now
+    # applies ONLY to a plain Project Manager (not also Team Manager/
+    # Owner/Admin), whose delegation authority genuinely does originate
+    # from Project scope (unchanged). A Team Manager's project_id needs
+    # no ProjectMembership and no Project<->Team attachment — only to
+    # belong to this organization, which the existence check right below
+    # already covers. This used to also gate Team Managers (via
+    # `is_project_scoped`, which returns True for them too) with a
+    # ProjectMembership-or-managed-team-Project-attachment fallback —
+    # that fallback made a Team Manager's Task Create fail (or silently
+    # empty the Team dropdown, client-side) the instant they picked a
+    # Project with no explicit ProjectTeam link to any Team they manage,
+    # which is exactly the reported bug. Never applied to Owner/Admin
+    # either way (`is_project_scoped` already excludes them).
+    if payload.project_id is not None and is_project_scoped(tenant) and not tenant.is_manager_or_above:
         authorized = await project_repo.is_member(payload.project_id, tenant.user.id)
-        if not authorized and tenant.is_manager_or_above:
-            # Team Manager Create-Task-form follow-up: a Team Manager (the
-            # only actor left here after the plain-PM/Owner-Admin cases
-            # above/below) may also reference a Project reachable through
-            # a Team they actually manage — the same explicit
-            # Project<->Team association their Project dropdown is now
-            # scoped from (GET /projects/for-managed-teams) — never bare
-            # ProjectMembership only. A plain Project Manager's rule above
-            # is unchanged: is_member() is still their sole path.
-            managed_team_ids = await team_repo.list_managed_team_ids(tenant.user.id)
-            if managed_team_ids:
-                project_team_ids = await list_project_team_ids(db, tenant.organization_id, payload.project_id)
-                authorized = bool(managed_team_ids & project_team_ids)
         if not authorized:
             raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="You can only create tasks under a project you are assigned to.")
 
@@ -1233,6 +1230,21 @@ async def update_task(
     if payload.team_id is not None:
         if await team_repo.get_by_id(payload.team_id) is None:
             raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="Selected team is invalid.")
+
+    # Project/Team-independence follow-up (TM Task Edit): `project_id`,
+    # if supplied, must exist and belong to this exact organization —
+    # `project_repo` is already org-scoped (ProjectRepository(db,
+    # tenant.organization_id)), so a forged cross-tenant or nonexistent
+    # id is rejected here the same way create_task() already rejects one
+    # at creation time. Deliberately NOT gated behind any role check and
+    # NEVER requires the task's team_id to be attached to this project —
+    # a Team Manager managing this task's Team may freely change Project
+    # independently of Team (a plain Project Manager's payload can never
+    # even reach this line with project_id set — PM_ALLOWED_TASK_UPDATE_
+    # FIELDS excludes it entirely, unchanged, above).
+    if payload.project_id is not None:
+        if await project_repo.get_by_id(payload.project_id) is None:
+            raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="Selected project is invalid.")
 
     # Task Assignee bug-fix follow-up: re-validate whenever the assignee
     # is being explicitly changed, OR whenever team_id is changing — the
