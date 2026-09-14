@@ -24,7 +24,6 @@ from app.core.tenant import (
     TenantContext,
     get_tenant_context,
     require_org_admin,
-    require_org_manager,
     require_org_manager_or_project_manager,
 )
 from app.models.notification import Notification
@@ -99,7 +98,7 @@ _PM_CANNOT_ASSIGN_MEMBER = ErrorDef(
 _PM_PROJECT_REQUIRED = ErrorDef(
     code="PROJECT_REQUIRED",
     status=http_status.HTTP_400_BAD_REQUEST,
-    message="Project is required.",
+    message="Project is required to delegate a task to a team.",
 )
 
 
@@ -215,6 +214,49 @@ _ASSIGNEE_TASK_UPDATE_FORBIDDEN = ErrorDef(
     message="As the assignee, you may only update this task's status.",
 )
 
+# Task ownership follow-up: fields a Personal/Standalone Task's own owner
+# (see is_personal_task_owner — team_id IS NULL and they ARE the
+# assignee, e.g. an AI-generated Task with no Team resolved) may mutate.
+# Deliberately broader than ASSIGNEE_ALLOWED_TASK_UPDATE_FIELDS (a bare
+# Team Task assignee, a genuinely different/weaker concept — see that
+# constant's own comment) but still a strict whitelist, not the fully
+# unrestricted access Owner/Admin/a managing Team Manager get: never
+# `assignee_id` — reassigning a Personal Task to a DIFFERENT person isn't
+# part of "manage my own Task" and is deliberately not granted here, only
+# `team_id`/`project_id` transitions (still independently re-validated by
+# the existing team-change/assignee-compatibility block below).
+PERSONAL_TASK_OWNER_ALLOWED_FIELDS = {
+    "name", "description", "priority", "status", "start_date", "due_date", "project_id", "team_id",
+}
+
+_PERSONAL_TASK_FIELD_FORBIDDEN = ErrorDef(
+    code="PERSONAL_TASK_FIELD_FORBIDDEN",
+    status=http_status.HTTP_403_FORBIDDEN,
+    message="As this task's personal owner, you may update its core details (title, description, priority, status, dates, project, team) — not this field.",
+)
+
+
+def is_personal_task_owner(tenant: TenantContext, task: Task) -> bool:
+    """Task ownership/default-assignee follow-up — the canonical "is this
+    a self-owned Personal/Standalone Task for the current caller" check,
+    reused everywhere that distinction matters (update_task's field
+    whitelist, require_task_manage_access's delete gate) instead of each
+    call site re-deriving it slightly differently.
+
+    A Personal Task is one with NO Team (`team_id is None`) — the Team
+    itself is what anchors ownership for a Team Task, so a team-less Task
+    needs an individual owner instead, and that owner is whoever
+    `assignee_id` names. This is deliberately a DIFFERENT, STRONGER
+    concept than "bare Team Task assignee": a Team Member who merely
+    happens to be assigned a Task under a Team they don't manage stays on
+    the narrow ASSIGNEE_ALLOWED_TASK_UPDATE_FIELDS whitelist (see
+    is_bare_assignee_only in update_task) — only a team-less Task's own
+    assignee gets full personal-task management. Client is excluded
+    (never a legal assignee at all — see app.core.task_assignment's Rule
+    A), matching require_task_update_access's own assignee-bypass
+    exclusion."""
+    return task.team_id is None and task.assignee_id == tenant.user.id and tenant.org_role != CLIENT
+
 
 async def require_task_update_access(
     tenant: TenantContext, task: Task, project_repo: ProjectRepository, team_repo: TeamRepository,
@@ -266,6 +308,41 @@ async def require_task_update_access(
         if await project_repo.is_member(task.project_id, tenant.user.id):
             return
     raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="You are not allowed to update tasks.")
+
+
+async def require_task_manage_access(
+    tenant: TenantContext, task: Task, team_repo: TeamRepository, *, allow_personal_owner: bool = False,
+) -> None:
+    """Team Manager Task-authority-precedence follow-up (security fix):
+    Delete/Approve/Assign-Back previously gated on the bare
+    `require_org_manager` dependency — Owner, Admin, OR ANY Team Manager,
+    completely unscoped, the exact "if is_team_manager: allow_all_tasks"
+    organization-wide-escalation anti-pattern the product rules forbid
+    (a Team Manager of "Technology" could delete/approve/assign-back a
+    Task belonging to "Marketing", a team they have no authority over at
+    all). Fixed to require the SAME per-task managed-Team scope
+    `require_task_update_access` already enforces for PATCH — Owner/Admin
+    unconditional; a Team Manager ONLY for a Task whose Team they
+    actually manage (`TeamRepository.is_manager`).
+
+    `allow_personal_owner` (Task ownership follow-up): Delete is one of
+    the minimum personal-task-management actions a self-owned Personal
+    Task's own owner must have (see is_personal_task_owner) — passed
+    `True` only by delete_task. Approve/Assign-Back stay `False`
+    (default): those are Team-review-workflow actions for reviewing
+    SOMEONE ELSE's submitted work, meaningless for a Task whose owner
+    already has full direct-completion authority over their own status
+    (never funneled through the pending_review workflow in the first
+    place) — still never available to a plain Project Manager or a bare
+    Team Task assignee either way."""
+    if tenant.is_admin_or_owner:
+        return
+    if tenant.is_manager_or_above and task.team_id is not None:
+        if await team_repo.is_manager(task.team_id, tenant.user.id):
+            return
+    if allow_personal_owner and is_personal_task_owner(tenant, task):
+        return
+    raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="You are not allowed to manage this task.")
 
 
 def can_control_task_timer(task: Task, user_id: int) -> bool:
@@ -351,6 +428,7 @@ async def list_tasks(
 
     scope_team_ids: set[int] | None = None
     scope_project_ids: set[int] | None = None
+    scope_personal_owner_id: int | None = None
     if not tenant.is_admin_or_owner:
         team_repo = TeamRepository(tenant.db, tenant.organization_id)
         scope_team_ids = await team_repo.list_managed_team_ids(tenant.user.id)
@@ -358,12 +436,24 @@ async def list_tasks(
             project_repo = ProjectRepository(tenant.db, tenant.organization_id)
             member_projects = await project_repo.list_for_user(tenant.user.id)
             scope_project_ids = {p.id for p in member_projects}
+        # Task ownership/All-Tasks-union follow-up: a Team Manager's or
+        # Project Manager's own team-less Personal/Standalone Task has no
+        # managed-Team/managed-Project anchor to be scoped in by the two
+        # sets above — without this, it would silently vanish from "All
+        # Tasks" the moment they created it there. Owner/Admin never need
+        # this (they stay fully unrestricted — scope_team_ids/
+        # scope_project_ids/scope_personal_owner_id all None, so
+        # list_all()'s scoping block never even activates); this only
+        # ever widens THIS exact caller's own team-less Tasks, never "any
+        # assignee."
+        scope_personal_owner_id = tenant.user.id
 
     tasks = await repo.list_all(
         status=status_filter, priority=priority_filter,
         project_id=project_id, team_id=team_id, assignee_id=assignee_id,
         due_date_from=due_date_from, due_date_to=due_date_to, overdue=overdue,
         scope_team_ids=scope_team_ids, scope_project_ids=scope_project_ids,
+        scope_personal_owner_id=scope_personal_owner_id,
     )
     return [serialize_task(t) for t in tasks]
 
@@ -394,12 +484,17 @@ async def create_task(
     # TenantContext.has_project_manager_access/is_manager_or_above).
     is_plain_project_manager = tenant.has_project_manager_access and not tenant.is_manager_or_above
 
-    # Project Manager Task-delegation follow-up: Project is required for
-    # every Task a plain Project Manager creates — their authority
-    # originates entirely from Project scope (ProjectMembership), so a
-    # project-less Task would have no scope to have been authorized
-    # through at all. Owners/Admins/Team Managers are unaffected.
-    if is_plain_project_manager and payload.project_id is None:
+    # Personal Task follow-up: a plain Project Manager's authority
+    # originates entirely from Project scope (ProjectMembership) — but
+    # ONLY when they're delegating a Task to a Team. A Project-less,
+    # Team-less Task is that PM's own Personal/Standalone Task (same
+    # category every other role already gets), which needs no Project
+    # anchor at all — it's owned directly by the PM as its assignee.
+    # Project is therefore required only in the delegation context
+    # (team_id set): without a Project, a delegated Team Task would have
+    # no scope to have been authorized through. Owners/Admins/Team
+    # Managers are unaffected either way.
+    if is_plain_project_manager and payload.team_id is not None and payload.project_id is None:
         raise AppException(_PM_PROJECT_REQUIRED)
 
     # Project scope (see app.core.project_access): a Team Manager or
@@ -496,6 +591,31 @@ async def create_task(
             if payload.assignee_id is not None and payload.assignee_id != tenant.user.id:
                 raise AppException(_PM_CANNOT_ASSIGN_MEMBER)
             payload.assignee_id = tenant.user.id
+    elif payload.team_id is None and payload.assignee_id is None:
+        # Task ownership/default-assignee follow-up: this used to be a
+        # plain-PM-only rule — every OTHER role (Owner/Admin/Team
+        # Manager) creating a Task with no Team and no explicit assignee
+        # got assignee_id=NULL, unconditionally. For a Team Manager's own
+        # "My Tasks -> Add Task" (no Team selected, Assignee left at the
+        # only option, "Unassigned") this silently produced an orphan:
+        # team_id=NULL, project_id=often-NULL, assignee_id=NULL — a Task
+        # with no ownership anchor at all, invisible to My Tasks (assignee-
+        # scoped) the instant it was created.
+        #
+        # Context-aware default: a Task with NO Team is, by definition,
+        # this app's "Personal / Standalone Task" category — it needs an
+        # individual owner, never a bare Team/Project anchor. Whenever the
+        # creator didn't explicitly name someone else, the Task becomes
+        # THEIRS, server-side — never silently left ownerless. This is
+        # deliberately in the `elif` branch below the plain-PM case above
+        # (unchanged) and deliberately gated on `payload.team_id is None`
+        # — a Team-delegated Task (team_id set) NEVER auto-assigns its
+        # creator merely for creating it, for ANY role, preserving the
+        # existing "Team Manager decides the individual owner" contract
+        # untouched. An explicit assignee_id (any role picking someone
+        # else via their own existing Assignee dropdown) is left exactly
+        # as given — this only fills in what was OMITTED.
+        payload.assignee_id = tenant.user.id
 
     # Task Assignee bug-fix follow-up: Client exclusion (Rule A),
     # organization-membership/active checks, and — when this task belongs
@@ -923,10 +1043,11 @@ async def update_task_status(
 async def approve_task(
     task_id: int,
     background_tasks: BackgroundTasks,
-    tenant: TenantContext = Depends(require_org_manager),
+    tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db),
 ):
     task = await get_task_or_404(tenant, task_id)
+    await require_task_manage_access(tenant, task, TeamRepository(db, tenant.organization_id))
     if task.status != "pending_review":
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="Only pending review tasks can be approved.")
 
@@ -954,10 +1075,11 @@ async def assign_task_back(
     task_id: int,
     payload: AssignBackRequest,
     background_tasks: BackgroundTasks,
-    tenant: TenantContext = Depends(require_org_manager),
+    tenant: TenantContext = Depends(get_tenant_context),
     db: AsyncSession = Depends(get_db),
 ):
     task = await get_task_or_404(tenant, task_id)
+    await require_task_manage_access(tenant, task, TeamRepository(db, tenant.organization_id))
     if task.status != "pending_review":
         raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail="Only pending review tasks can be assigned back.")
 
@@ -1052,13 +1174,57 @@ async def update_task(
         and task.team_id is not None
         and await team_repo.is_manager(task.team_id, tenant.user.id)
     )
+    # Task ownership follow-up: a Personal/Standalone Task's own owner
+    # (team_id IS NULL, they ARE the assignee — e.g. an AI-generated Task
+    # with no Team resolved) is a DIFFERENT, STRONGER concept than a bare
+    # Team Task assignee, and must not be downgraded to the same narrow
+    # status-only whitelist merely because both cases satisfy
+    # `task.assignee_id == tenant.user.id`. Checked independently of (and
+    # takes precedence over) the bare-assignee case below.
+    is_personal_owner_only = (
+        not tenant.is_admin_or_owner
+        and not is_plain_project_manager
+        and not is_team_manager_scoped_to_task
+        and is_personal_task_owner(tenant, task)
+    )
     is_bare_assignee_only = (
         not tenant.is_admin_or_owner
         and not is_plain_project_manager
         and not is_team_manager_scoped_to_task
+        and not is_personal_owner_only
         and task.assignee_id == tenant.user.id
     )
-    if is_bare_assignee_only:
+    # Edit-Task-flow follow-up: a Personal Task owner moving their OWN
+    # Task into a Team they legitimately manage may set `team_id` AND
+    # `assignee_id` in the SAME PATCH — the one atomic hop from "I own
+    # this personally" to "I own this as that Team's manager," so the
+    # frontend never needs a Save-then-reopen round trip just to name who
+    # works it. Deliberately narrow: only when `team_id` is actually
+    # present and non-None in THIS payload (never merely because a
+    # Personal Task happens to have team_id omitted) AND the caller
+    # manages that EXACT target team (`is_manager`, not merely
+    # `has_access`/team membership) — this is never "Personal Task
+    # owners may set assignee_id," only this one specific, verified
+    # transition. Everything else about the target assignee (Client/
+    # inactive/cross-tenant/wrong-team exclusion) is still fully
+    # re-validated below by the existing, unmodified
+    # `validate_task_assignee` — this only grants permission to include
+    # the field, never bypasses what value it may hold.
+    is_personal_to_managed_team_transition = (
+        is_personal_owner_only
+        and "team_id" in payload.model_fields_set
+        and payload.team_id is not None
+        and await team_repo.is_manager(payload.team_id, tenant.user.id)
+    )
+    if is_personal_owner_only:
+        fields_set = payload.model_fields_set
+        allowed_fields = PERSONAL_TASK_OWNER_ALLOWED_FIELDS
+        if is_personal_to_managed_team_transition:
+            allowed_fields = allowed_fields | {"assignee_id"}
+        disallowed_fields = fields_set - allowed_fields
+        if disallowed_fields:
+            raise AppException(_PERSONAL_TASK_FIELD_FORBIDDEN)
+    elif is_bare_assignee_only:
         fields_set = payload.model_fields_set
         disallowed_fields = fields_set - ASSIGNEE_ALLOWED_TASK_UPDATE_FIELDS
         if disallowed_fields:
@@ -1182,8 +1348,9 @@ async def update_task(
 
 
 @router.delete("/{task_id}", status_code=http_status.HTTP_204_NO_CONTENT)
-async def delete_task(task_id: int, tenant: TenantContext = Depends(require_org_manager)):
+async def delete_task(task_id: int, tenant: TenantContext = Depends(get_tenant_context)):
     task = await get_task_or_404(tenant, task_id)
+    await require_task_manage_access(tenant, task, TeamRepository(tenant.db, tenant.organization_id), allow_personal_owner=True)
     # Captured before the hard delete — Task is genuinely gone afterward
     # (no soft-delete), so this is the only chance to record a safe label
     # for the activity entry (entity_id/entity_type are plain columns, not

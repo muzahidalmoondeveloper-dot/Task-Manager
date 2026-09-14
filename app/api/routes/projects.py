@@ -47,6 +47,7 @@ from app.schemas.project import (
     ProjectForManagedTeams,
     ProjectMemberAssign,
     ProjectMemberOut,
+    ProjectOption,
     ProjectRead,
     ProjectTeamOption,
     ProjectUpdate,
@@ -157,6 +158,34 @@ async def list_projects_for_managed_teams(tenant: TenantContext = Depends(get_te
         ProjectForManagedTeams(id=p.id, name=p.name, team_ids=team_ids_by_project.get(p.id, []))
         for p in projects
     ]
+
+
+@router.get("/options", response_model=list[ProjectOption])
+async def list_project_options(tenant: TenantContext = Depends(get_tenant_context)):
+    """Canonical org-scoped Project-options source (Team Manager
+    Project-dropdown follow-up): Team Manager Task Create and Rock Create
+    both need "every active Project in the current organization" for
+    their Project dropdown — a plain Team Manager has no Project-
+    management capability (`GET /projects` returns nothing for them by
+    design — see list_projects() above) and `GET /projects/for-managed-
+    teams` is deliberately narrower still (only Projects already attached
+    to a Team they manage via the explicit Project<->Team association) —
+    neither is "all org Projects." This is a THIRD, deliberately minimal,
+    read-only endpoint: Project VISIBILITY for dropdown/context purposes,
+    which this app treats as broader than Project MANAGEMENT authority by
+    design (matches list_projects_for_managed_teams()'s own precedent of
+    not reusing/broadening `GET /projects` itself, which many other pages
+    — the Projects page, Sidebar, Rocks/KPI/Issues tabs — also call).
+    Returning {id, name} only, for every role except Client (who has no
+    Task/Rock-creation surface that would need this), keeps this strictly
+    a visibility grant — it confers no edit/delete/member/Team-attach
+    capability over any Project it lists; those stay exactly as
+    authorized elsewhere (`require_project_management_access`, etc.)."""
+    if tenant.org_role == CLIENT:
+        return []
+    repo = ProjectRepository(tenant.db, tenant.organization_id)
+    projects = await repo.list_all()
+    return [ProjectOption(id=p.id, name=p.name) for p in projects]
 
 
 @router.post("", response_model=ProjectRead, status_code=http_status.HTTP_201_CREATED)

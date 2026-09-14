@@ -93,3 +93,17 @@ class ProjectForManagedTeams(BaseModel):
     id: int
     name: str
     team_ids: list[int]
+
+
+class ProjectOption(BaseModel):
+    """Team Manager / Rock Create Project-dropdown follow-up: the
+    canonical org-scoped Project-options shape — deliberately just
+    {id, name}, the minimum a dropdown needs, and nothing that implies
+    management capability (no status, no project_manager, no
+    description/logo). Project VISIBILITY here is intentionally broader
+    than Project MANAGEMENT authority (see GET /projects/options's own
+    docstring) — seeing a Project in this list grants no ability to edit
+    it, delete it, manage its members, or attach/detach its Teams."""
+
+    id: int
+    name: str
