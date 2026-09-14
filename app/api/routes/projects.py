@@ -27,7 +27,6 @@ from app.core.project_access import (
     is_project_management_blocked,
     is_project_scoped,
     list_project_team_ids,
-    require_project_access,
     require_project_management_access,
 )
 from app.core.tenant import TenantContext, check_active_billing, get_tenant_context, require_org_admin, require_org_manager
@@ -35,6 +34,7 @@ from app.models.issue import Issue
 from app.models.kpi import KPI
 from app.models.objective import Objective
 from app.models.organization import OrganizationMembership
+from app.models.project import ProjectTeam
 from app.models.rock import Rock
 from app.repositories.project_repository import ProjectRepository
 from app.repositories.task_time_entry_repository import TaskTimeEntryRepository
@@ -44,6 +44,7 @@ from app.schemas.kpi import KPIOut
 from app.schemas.org import ObjectiveRead
 from app.schemas.project import (
     ProjectCreate,
+    ProjectForManagedTeams,
     ProjectMemberAssign,
     ProjectMemberOut,
     ProjectRead,
@@ -105,6 +106,57 @@ async def list_projects(tenant: TenantContext = Depends(get_tenant_context)):
     # list can show which Project Manager owns each project at a glance.
     managers = await repo.get_project_managers([p.id for p in projects])
     return [_serialize_project(p, managers) for p in projects]
+
+
+@router.get("/for-managed-teams", response_model=list[ProjectForManagedTeams])
+async def list_projects_for_managed_teams(tenant: TenantContext = Depends(get_tenant_context)):
+    """Team Manager Create-Task-form Project-dropdown follow-up. `GET
+    /projects` returns nothing at all for a plain Team Manager
+    (is_project_management_blocked — by design, they have no direct
+    Project-management capability), which previously left the Create Task
+    form's Project dropdown empty even when their own managed Team(s) have
+    real Projects attached via the explicit Project<->Team association.
+    This is a SEPARATE, narrowly-scoped, read-only endpoint rather than
+    broadening `GET /projects` itself (which many other pages — the
+    Projects page, Sidebar, Rocks/KPI/Issues tabs, ... — also call, and
+    whose behavior for a plain Team Manager this task's scope does not
+    otherwise touch): self-scoped entirely from the caller's OWN
+    TeamMembership manager relationships, never a client-supplied team id,
+    and never organization-wide Project access. Additive for every other
+    role — Owner/Admin/Project Manager already get their Projects from the
+    existing `GET /projects`; this only contributes something extra when
+    the caller also happens to manage a Team (harmless empty list
+    otherwise)."""
+    team_repo = TeamRepository(tenant.db, tenant.organization_id)
+    managed_teams = await team_repo.list_for_manager(tenant.user.id)
+    if not managed_teams:
+        return []
+    managed_team_ids = {t.id for t in managed_teams}
+
+    project_repo = ProjectRepository(tenant.db, tenant.organization_id)
+    projects = await project_repo.list_for_teams(list(managed_team_ids))
+    if not projects:
+        return []
+    project_ids = [p.id for p in projects]
+
+    # Which of THIS caller's own managed Teams is attached to each
+    # Project — never an unrelated Team this caller doesn't manage, even
+    # one also attached to the same Project (the `ProjectTeam.team_id.in_`
+    # filter below is what enforces that, not just the join above).
+    team_rows = await tenant.db.execute(
+        select(ProjectTeam.project_id, ProjectTeam.team_id).where(
+            ProjectTeam.project_id.in_(project_ids),
+            ProjectTeam.team_id.in_(managed_team_ids),
+        )
+    )
+    team_ids_by_project: dict[int, list[int]] = {}
+    for project_id, team_id in team_rows.all():
+        team_ids_by_project.setdefault(project_id, []).append(team_id)
+
+    return [
+        ProjectForManagedTeams(id=p.id, name=p.name, team_ids=team_ids_by_project.get(p.id, []))
+        for p in projects
+    ]
 
 
 @router.post("", response_model=ProjectRead, status_code=http_status.HTTP_201_CREATED)
@@ -482,19 +534,28 @@ async def remove_project_member(
 # ── Project<->Team assignment (Project Manager Team-selection bug-fix) ──────
 
 async def _require_can_manage_project_teams(tenant: TenantContext, repo: ProjectRepository, project_id: int) -> None:
-    """Owner/Admin: unrestricted. A genuine Project Manager (base role, or
-    anyone granted the `is_project_manager` flag) may manage teams on a
-    project they're actually assigned to (ProjectMembership) — never an
-    arbitrary project. Everyone else (plain Team Manager, Team Member,
-    Client) is blocked outright, matching
-    app.core.project_access.is_project_management_blocked's own "a
-    ProjectMembership row alone is never sufficient" rule and never
-    letting a Client mutate project structure."""
+    """Project-Team Overview-visibility follow-up: Owner/Admin ONLY
+    (role, or the granted `is_org_admin` flag) may manage which Teams are
+    attached to a Project — both the write actions here (assign/unassign)
+    and the Project Overview's "Teams" display/Add-Team affordance the
+    frontend gates on the identical rule.
+
+    Project Manager capability (`has_project_manager_access`, base role
+    or the granted `is_project_manager` flag) does NOT grant this — a
+    Project Manager's own `ProjectMembership` on this project is what
+    lets them READ the already-attached Teams for Task Create/Edit
+    dropdowns (see GET /projects/{id}/items, gated by the separate,
+    unchanged `require_project_access`), never a reason to let them
+    change which Teams the project has. Likewise Team-management
+    capability (`is_team_manager`) does not grant this either — managing
+    a Team is a different concept from deciding which Teams a Project
+    uses, and this app has no product decision granting Team Managers
+    that authority. `repo`/`project_id` are accepted for a consistent
+    call signature across this file's other permission helpers, even
+    though this particular rule needs no membership lookup."""
     if tenant.is_admin_or_owner:
         return
-    if not tenant.has_project_manager_access:
-        raise AppException(NOT_ASSIGNED)
-    await require_project_access(tenant, repo, project_id)
+    raise AppException(NOT_ASSIGNED)
 
 
 @router.get("/{project_id}/teams/assignable", response_model=list[ProjectTeamOption])

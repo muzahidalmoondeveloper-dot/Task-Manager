@@ -94,15 +94,16 @@ async def _search_client_requests_handler(ctx: ToolContext, params: SearchClient
 
 
 async def _get_my_scoreboard_handler(ctx: ToolContext, params: GetMyScoreboardInput) -> ToolResult:
-    # Domain buildout — Scoreboards (strict acceptance audit: 0% chat
-    # coverage). Deliberately "my own score only" — scores are a computed,
-    # read-only projection of task completion data (no write path exists or
-    # should exist for them; see scoreboard_service.py, entirely derived),
-    # and viewing a COLLEAGUE's score is a sensitive, managerial action this
-    # pass does not extend chat into — that's a real ABAC dimension (who
-    # can see whose score) this app's existing scoreboard API already
-    # enforces at the HTTP layer that a chat tool would need to replicate
-    # faithfully, not guess at.
+    # Scoreboard authorization follow-up (current product rule): Scoreboard
+    # is an ADMIN-ONLY feature — "Team Member -> own scoreboard access" is
+    # explicitly one of the old rules removed by that fix, so even a
+    # self-view is no longer allowed without the canonical Admin capability
+    # (see app/api/routes/scoreboard.py's own docstring for the full
+    # rationale, and app/services/copilot/tools/scoreboard_tools.py for the
+    # same rule applied to the colleague-scoreboard tools next to this one).
+    if ctx.org_role not in {"owner", "admin"}:
+        return ToolResult(False, "You don't have permission to view a scoreboard.")
+
     from app.services.scoreboard_service import build_employee_scoreboard
 
     data = await build_employee_scoreboard(ctx.db, ctx.org_id, ctx.user_id, params.period)

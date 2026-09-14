@@ -156,12 +156,20 @@ async def run_due_date_email_reminders() -> None:
 
 async def run_daily_ai_task_sync() -> None:
     """
-    For each active user with a Microsoft account, run the data sync and
-    AI extraction directly (no Celery enqueuing).
+    For each active user with a Microsoft and/or Gmail account, run the
+    provider fetch + shared AI extraction directly (no Celery
+    enqueuing — see the module docstring). One SyncRun row is created per
+    (user, provider) attempt, trigger="scheduled", so a scheduled run is
+    just as observable in Automation Activity as a manual one — the same
+    create_sync_run/finish_sync_run helpers the manual routes use.
     """
+    from app.core.automation_pipeline import ERROR_UNKNOWN
     from app.services.automation_tasks import (
-        analyze_yesterday_sources_for_user,
+        analyze_pending_sources_for_user,
+        create_sync_run,
+        finish_sync_run,
         resolve_org_id_for_user,
+        sync_gmail_data_for_user,
         sync_microsoft_data_for_user,
     )
 
@@ -178,44 +186,50 @@ async def run_daily_ai_task_sync() -> None:
                 try:
                     org_id = await resolve_org_id_for_user(db, user)
                     if org_id is None:
-                        logger.info(
-                            "Scheduler: skipping user %s — no organization context.",
-                            user.email,
-                        )
                         continue
 
                     integration_repo = IntegrationRepository(db, org_id)
-                    microsoft_accounts = await integration_repo.list_accounts_by_provider(
-                        user.id, "microsoft"
-                    )
-                    if not microsoft_accounts:
-                        logger.info(
-                            "Scheduler: skipping user %s — no Microsoft account.",
-                            user.email,
+
+                    for provider, sync_fn in (
+                        ("microsoft", sync_microsoft_data_for_user),
+                        ("google", sync_gmail_data_for_user),
+                    ):
+                        accounts = await integration_repo.list_accounts_by_provider(user.id, provider)
+                        if not accounts:
+                            continue
+
+                        sync_run = await create_sync_run(
+                            db, organization_id=org_id, provider=provider,
+                            integration_account_id=accounts[0].id if len(accounts) == 1 else None,
+                            triggered_by_user_id=user.id, trigger="scheduled",
                         )
-                        continue
-
-                    logger.info(
-                        "Scheduler: syncing Microsoft data | user_id=%s email=%s",
-                        user.id, user.email,
-                    )
-                    sync_result = await sync_microsoft_data_for_user(db=db, user=user)
-                    logger.info(
-                        "Scheduler: sync done | user_id=%s | emails=%s events=%s transcripts=%s",
-                        user.id,
-                        sync_result.get("emails_imported", 0),
-                        sync_result.get("calendar_events_imported", 0),
-                        sync_result.get("transcripts_imported", 0),
-                    )
-
-                    ai_result = await analyze_yesterday_sources_for_user(db=db, user=user, org_id=org_id)
-                    logger.info(
-                        "Scheduler: AI extraction done | user_id=%s"
-                        " | sources=%s tasks_created=%s",
-                        user.id,
-                        ai_result.get("sources_analyzed", 0),
-                        ai_result.get("tasks_created", 0),
-                    )
+                        try:
+                            sync_result = await sync_fn(db=db, user=user, sync_run=sync_run)
+                            logger.info(
+                                "scheduled sync fetch done",
+                                extra={
+                                    "provider": provider, "stage": "fetch", "status": "success",
+                                    "user_id": user.id, "sync_run_id": sync_run.id,
+                                    "emails": sync_result.get("emails_imported", 0),
+                                    "transcripts": sync_result.get("transcripts_imported", 0),
+                                },
+                            )
+                            ai_result = await analyze_pending_sources_for_user(db=db, user=user, org_id=org_id, sync_run=sync_run)
+                            logger.info(
+                                "scheduled sync analysis done",
+                                extra={
+                                    "provider": provider, "stage": "ai_analysis", "status": "success",
+                                    "user_id": user.id, "sync_run_id": sync_run.id,
+                                    "tasks_created": ai_result.get("tasks_created", 0),
+                                },
+                            )
+                            await finish_sync_run(db, sync_run)
+                        except Exception:
+                            logger.exception(
+                                "scheduled sync failed",
+                                extra={"provider": provider, "user_id": user.id, "sync_run_id": sync_run.id},
+                            )
+                            await finish_sync_run(db, sync_run, fatal_error_code=ERROR_UNKNOWN)
 
                 except Exception:
                     logger.exception(

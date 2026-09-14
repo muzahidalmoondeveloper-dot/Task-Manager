@@ -4,6 +4,7 @@ from sqlalchemy import select
 
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.org_roles import ADMIN, CLIENT, OWNER, PROJECT_MANAGER
+from app.core.project_access import list_project_team_ids
 from app.core.tenant import TenantContext, get_tenant_context
 from app.models.notification import Notification
 from app.models.organization import OrganizationMembership
@@ -12,6 +13,7 @@ from app.models.user import User
 from app.repositories.project_repository import ProjectRepository
 from app.repositories.task_repository import TaskRepository
 from app.repositories.task_request_repository import TaskRequestRepository
+from app.repositories.team_repository import TeamRepository
 from app.schemas.task import TaskCreate
 from app.schemas.task_request import (
     TaskRequestConvert,
@@ -21,7 +23,6 @@ from app.schemas.task_request import (
 )
 from app.services.background_email import (
     bg_send_client_task_request,
-    bg_send_task_assigned,
     bg_send_task_request_reviewed,
 )
 
@@ -32,6 +33,14 @@ _NOT_ASSIGNED = ErrorDef(code="PROJECT_NOT_ASSIGNED", status=http_status.HTTP_40
 _STAFF_ONLY = ErrorDef(code="TASK_REQUEST_STAFF_ONLY", status=http_status.HTTP_403_FORBIDDEN, message="Only staff can perform this action.")
 _REQUEST_NOT_FOUND = ErrorDef(code="TASK_REQUEST_NOT_FOUND", status=http_status.HTTP_404_NOT_FOUND, message="Task request not found.")
 _ALREADY_REVIEWED = ErrorDef(code="TASK_REQUEST_ALREADY_REVIEWED", status=http_status.HTTP_409_CONFLICT, message="This task request has already been reviewed.")
+# Client Task Request conversion follow-up: "team is not assignable
+# within this project" now applies to every converting role (not only a
+# plain Project Manager) — see convert_task_request. A Team must be
+# explicitly attached to the request's Project through the existing
+# Project<->Team association (app.core.project_access.list_project_team_ids)
+# regardless of who is converting; this also rejects a cross-tenant team
+# id, since that association can never include one.
+_TEAM_NOT_ASSIGNABLE = ErrorDef(code="TEAM_NOT_ASSIGNABLE", status=http_status.HTTP_403_FORBIDDEN, message="That team is not assignable within this project.")
 
 
 async def _require_is_staff(tenant: TenantContext, project_repo: ProjectRepository, project_id: int) -> None:
@@ -146,47 +155,85 @@ async def convert_task_request(
     background_tasks: BackgroundTasks,
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    """Client Task Request -> Task conversion follow-up.
+
+    Root cause of the original "PM cannot convert" bug: `TaskRequestConvert`
+    required a `team_id` on every conversion (no way to omit it), and the
+    frontend still offered an optional individual `assignee_id` dropdown —
+    but the backend's plain-PM branch rejected any non-null `assignee_id`
+    outright. There was no "take it for myself" path at all: a plain PM
+    picking a team member (the only individual-owner UI available) always
+    hit `_PM_CANNOT_ASSIGN_MEMBER` and had no other way to complete a
+    conversion. Fixed by replacing the implicit team_id/assignee_id shape
+    with the explicit `conversion_mode` contract below, which has exactly
+    two legal shapes and never exposes an individual assignee.
+
+    Atomicity/double-conversion: the request row is locked with
+    SELECT ... FOR UPDATE (get_by_id_for_update) and the new Task's insert
+    plus the request's status flip share a single commit — see that
+    method's and TaskRepository.create_no_commit's docstrings. If Task
+    creation raises (e.g. a failed assignee/team validation), nothing is
+    committed and the request stays "pending" for a retry.
+    """
     project_repo = ProjectRepository(tenant.db, tenant.organization_id)
     if await project_repo.get_by_id(project_id) is None:
         raise AppException(_PROJECT_NOT_FOUND)
     await _require_is_staff(tenant, project_repo, project_id)
 
     repo = TaskRequestRepository(tenant.db, tenant.organization_id)
-    request = await repo.get_by_id(request_id)
+    request = await repo.get_by_id_for_update(request_id)
     if request is None or request.project_id != project_id:
         raise AppException(_REQUEST_NOT_FOUND)
     if request.status != "pending":
         raise AppException(_ALREADY_REVIEWED)
 
+    team_id: int | None = None
+    assignee_id: int | None = None
+
+    if payload.conversion_mode == "team":
+        team_id = payload.team_id
+        # Defense-in-depth: confirm the team actually exists IN THIS ORG
+        # first (TeamRepository is tenant-scoped — same explicit existence
+        # check app.api.routes.tasks.create_task performs before its own
+        # project-attachment check), rejecting a cross-tenant or
+        # nonexistent id with a plain 403 rather than leaking whether an
+        # id merely isn't attached vs. doesn't exist at all.
+        team_repo = TeamRepository(tenant.db, tenant.organization_id)
+        if await team_repo.get_by_id(team_id) is None:
+            raise AppException(_TEAM_NOT_ASSIGNABLE)
+        # Project<->Team validation applies to EVERY converting role, not
+        # only a plain Project Manager — the selected Team must be
+        # explicitly attached to this exact Project through the existing
+        # association (app.core.project_access.list_project_team_ids),
+        # never an arbitrary org team or a non-attached team injected
+        # through direct API manipulation.
+        allowed_team_ids = await list_project_team_ids(tenant.db, tenant.organization_id, project_id)
+        if team_id not in allowed_team_ids:
+            raise AppException(_TEAM_NOT_ASSIGNABLE)
+        # assignee_id stays None — the Team Manager decides the individual
+        # owner later; a PM (or anyone converting) never picks one here.
+    else:
+        # "self": the AUTHENTICATED converting user becomes the assignee,
+        # derived server-side. There is no assignee_id field on this
+        # schema at all — a forged assignee cannot be smuggled in.
+        assignee_id = tenant.user.id
+
     task_repo = TaskRepository(tenant.db, tenant.organization_id)
-    task = await task_repo.create(
+    task = await task_repo.create_no_commit(
         TaskCreate(
             name=request.title,
             description=request.description,
             project_id=project_id,
-            team_id=payload.team_id,
-            assignee_id=payload.assignee_id,
+            team_id=team_id,
+            assignee_id=assignee_id,
             priority=payload.priority,
             due_date=payload.due_date,
         ),
         created_by_id=tenant.user.id,
     )
-
-    request = await repo.mark_converted(request, task.id, tenant.user.id)
-
-    if payload.assignee_id and payload.assignee_id != tenant.user.id:
-        tenant.db.add(
-            Notification(
-                user_id=payload.assignee_id,
-                task_id=task.id,
-                project_id=project_id,
-                title="New task assigned to you",
-                message=f"You have been assigned a new task: '{task.name}'.",
-                type="task_assigned",
-            )
-        )
-        await tenant.db.commit()
-        background_tasks.add_task(bg_send_task_assigned, task.id, payload.assignee_id, tenant.user.id)
+    repo.mark_converted_no_commit(request, task.id, tenant.user.id)
+    await tenant.db.commit()
+    request = await repo.get_by_id(request.id)
 
     if request.submitted_by_id:
         tenant.db.add(
@@ -212,19 +259,32 @@ async def reject_task_request(
     background_tasks: BackgroundTasks,
     tenant: TenantContext = Depends(get_tenant_context),
 ):
+    """Reject/Convert race-condition follow-up: this route previously read
+    the request with a plain (unlocked) get_by_id() while
+    convert_task_request already locked it with SELECT ... FOR UPDATE — so
+    a Convert and a Reject firing at the same moment could both observe
+    status="pending" before either committed, and both proceed: a Task
+    gets created AND the request ends up "rejected", an inconsistent final
+    state. Fixed by locking the row here too (get_by_id_for_update), the
+    exact same TOCTOU pattern convert_task_request already uses (see that
+    method's docstring) — whichever of the two commits first wins the
+    lock, and the other re-reads the now-committed status and is rejected
+    by the unchanged `if request.status != "pending"` check below."""
     project_repo = ProjectRepository(tenant.db, tenant.organization_id)
     if await project_repo.get_by_id(project_id) is None:
         raise AppException(_PROJECT_NOT_FOUND)
     await _require_is_staff(tenant, project_repo, project_id)
 
     repo = TaskRequestRepository(tenant.db, tenant.organization_id)
-    request = await repo.get_by_id(request_id)
+    request = await repo.get_by_id_for_update(request_id)
     if request is None or request.project_id != project_id:
         raise AppException(_REQUEST_NOT_FOUND)
     if request.status != "pending":
         raise AppException(_ALREADY_REVIEWED)
 
-    request = await repo.mark_rejected(request, tenant.user.id)
+    repo.mark_rejected_no_commit(request, tenant.user.id)
+    await tenant.db.commit()
+    request = await repo.get_by_id(request.id)
 
     if request.submitted_by_id:
         reason_suffix = f" Reason: {payload.reason}" if payload.reason else ""

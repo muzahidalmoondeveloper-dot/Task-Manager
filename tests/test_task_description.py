@@ -163,11 +163,6 @@ async def _scenario():
             await db.commit()
             await db.refresh(project)
 
-            team = Team(name=f"Desc Team {suffix}", team_manager_id=owner.id, created_by_id=owner.id, organization_id=org.id)
-            db.add(team)
-            await db.commit()
-            await db.refresh(team)
-
             request = TaskRequest(
                 organization_id=org.id, project_id=project.id, submitted_by_id=owner.id,
                 title=f"Requested task {suffix}", description="Client-provided context that must not be lost.",
@@ -179,7 +174,7 @@ async def _scenario():
 
             await convert_task_request(
                 project_id=project.id, request_id=request.id,
-                payload=TaskRequestConvert(team_id=team.id),
+                payload=TaskRequestConvert(conversion_mode="self"),
                 background_tasks=BackgroundTasks(),
                 tenant=owner_tenant,
             )

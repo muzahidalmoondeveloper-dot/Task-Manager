@@ -11,6 +11,15 @@ the Project Overview's "Teams" count) stayed empty even when the
 organization plainly had teams, with no way to ever create the first
 team-tagged task.
 
+Also covers the follow-up Project-Team Overview-visibility fix, which
+tightened association MANAGEMENT (attach/detach + the assignable-teams
+picker) to Owner/Admin only — a Project Manager, even one who is a
+genuine ProjectMembership member of the project, does NOT get
+management authority merely from Project Manager capability. This is
+deliberately separate from Project-Team READ access for Task Create/
+Edit dropdowns (GET /projects/{id}/items), which a Project Manager keeps
+using their existing, unchanged ProjectMembership-based access.
+
 Covers:
   1. A brand-new project (no tasks/rocks/kpis) starts with zero associated
      teams — confirms the bug's starting state.
@@ -19,10 +28,17 @@ Covers:
      {id}/items' own "teams" field, and the write-side team_id check
      create_task() uses, both read this).
   4. A Project Manager who is a genuine ProjectMembership member of this
-     project can now create a Team Task using the newly-assigned team.
+     project can now create a Team Task using the newly-assigned team —
+     READ access is preserved even though they cannot manage it.
   5. GET /projects/{id}/teams/assignable returns {id, name, assigned} only
-     — never full team detail (no members/manager fields).
+     — never full team detail (no members/manager fields) — for Owner/
+     Admin; a Project Manager (even a project member) is denied this
+     endpoint entirely, since it exists only to back the management UI.
   6. A Project Manager NOT a member of this project is denied assigning.
+  6b. A Project Manager WHO IS a member of this project is ALSO denied
+      assigning/unassigning/listing-assignable — Project Manager
+      capability never grants Project-Team management, regardless of
+      membership.
   7. A plain Team Manager (no PM capability) is denied assigning —
      ProjectMembership/team-manager status alone is never sufficient.
   8. A Client is denied assigning.
@@ -147,6 +163,27 @@ async def _run():
             except AppException as exc:
                 assert exc.status_code == 403, exc
 
+            # ── 6b. A Project Manager who IS a member of this project is
+            # ALSO denied management — Project Manager capability never
+            # grants Project-Team management, membership or not. ──────────
+            try:
+                await assign_project_team(project.id, team.id, tenant=pm_tenant)
+                raise AssertionError("a Project Manager must never be able to attach a Team, even to their own project")
+            except AppException as exc:
+                assert exc.status_code == 403, exc
+
+            try:
+                await unassign_project_team(project.id, team.id, tenant=pm_tenant)
+                raise AssertionError("a Project Manager must never be able to detach a Team, even from their own project")
+            except AppException as exc:
+                assert exc.status_code == 403, exc
+
+            try:
+                await list_assignable_teams(project.id, tenant=pm_tenant)
+                raise AssertionError("a Project Manager must be denied the management-only assignable-teams picker")
+            except AppException as exc:
+                assert exc.status_code == 403, exc
+
             # ── 11. Cross-tenant: another org's team_id never assignable. ─────
             try:
                 await assign_project_team(project.id, other_org_team.id, tenant=owner_tenant)
@@ -186,8 +223,9 @@ async def _run():
             assert task.team_id == team.id
             assert task.project_id == project.id
 
-            # ── 5. Assignable-teams listing is minimal {id, name, assigned}. ──
-            options = await list_assignable_teams(project.id, tenant=pm_tenant)
+            # ── 5. Assignable-teams listing is minimal {id, name, assigned}
+            # — for Owner/Admin, the only roles allowed to call it. ──────────
+            options = await list_assignable_teams(project.id, tenant=owner_tenant)
             assert any(o.id == team.id and o.assigned is True and o.name == team.name for o in options)
             for o in options:
                 assert not hasattr(o, "members")

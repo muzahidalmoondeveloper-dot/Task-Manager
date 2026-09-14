@@ -1,3 +1,4 @@
+import math
 import random
 from datetime import datetime, timedelta, timezone
 
@@ -15,6 +16,14 @@ MAX_FAILED_ATTEMPTS = 3
 LOCK_MINUTES = 3
 OTP_EXPIRE_MINUTES = 10
 LOGIN_OTP_VALID_DAYS = 7
+# OTP resend cooldown follow-up: how long a caller must wait between OTP
+# sends for the same (email, purpose) before "Resend OTP" is allowed
+# again. Deliberately separate from OTP_EXPIRE_MINUTES above — this is
+# "how soon can you ask for a NEW code," not "how long is a code valid
+# for once sent." The single shared constant both the backend check
+# (get_seconds_until_resend_allowed) and its own regression tests use, so
+# there is only one number to change if this is ever revisited.
+OTP_RESEND_COOLDOWN_SECONDS = 60
 
 
 def get_client_ip(request: Request) -> str:
@@ -89,6 +98,40 @@ class AuthSecurityService:
             lock.failed_attempts = 0
             lock.locked_until = None
             await self.db.commit()
+
+    async def get_seconds_until_resend_allowed(self, *, email: str, purpose: str) -> int:
+        """OTP resend cooldown follow-up: the actual backend-enforced
+        "wait N seconds before requesting another OTP" check — never
+        merely a frontend countdown a client could bypass by refreshing
+        the page or calling the API directly. Based on the most recently
+        CREATED EmailOTP row for this exact (email, purpose), regardless
+        of whether it has since been used/expired/superseded — a resend
+        always starts a fresh cooldown window from when the last code was
+        actually sent, not from whether that code is still valid.
+        Returns 0 when a resend is currently allowed, otherwise the
+        number of whole seconds still remaining (rounded up, so "1s
+        left" never reads as "0s left" / allowed one tick early)."""
+        normalized_email = normalize_email(email)
+        statement = (
+            select(EmailOTP.created_at)
+            .where(EmailOTP.email == normalized_email)
+            .where(EmailOTP.purpose == purpose)
+            .order_by(EmailOTP.created_at.desc())
+            .limit(1)
+        )
+        result = await self.db.execute(statement)
+        last_created_at = result.scalar_one_or_none()
+        if last_created_at is None:
+            return 0
+
+        if last_created_at.tzinfo is None:
+            last_created_at = last_created_at.replace(tzinfo=timezone.utc)
+
+        elapsed_seconds = (datetime.now(timezone.utc) - last_created_at).total_seconds()
+        remaining_seconds = OTP_RESEND_COOLDOWN_SECONDS - elapsed_seconds
+        if remaining_seconds <= 0:
+            return 0
+        return math.ceil(remaining_seconds)
 
     async def create_and_send_otp(
         self,

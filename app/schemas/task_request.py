@@ -1,6 +1,7 @@
 from datetime import date, datetime
+from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.schemas.task import TASK_PRIORITIES
 from app.schemas.user import UserRead
@@ -12,10 +13,26 @@ class TaskRequestCreate(BaseModel):
 
 
 class TaskRequestConvert(BaseModel):
-    team_id: int
-    assignee_id: int | None = None
+    """Client Task Request -> Task conversion follow-up. Exactly two
+    explicit conversion modes — never inferred from whether `team_id`
+    happens to be present, and there is deliberately no `assignee_id`
+    field at all: a Project Manager (or any other staff converting a
+    request) picks EITHER themself ("self") OR a Team ("team"); the Team
+    Manager decides the individual owner afterwards. See
+    app.api.routes.task_requests.convert_task_request for the
+    authoritative server-side enforcement of what each mode actually
+    persists — this schema only rejects a contradictory payload shape."""
+    conversion_mode: Literal["self", "team"]
+    team_id: int | None = None
     priority: str = "medium"
     due_date: date | None = None
+
+    # extra="forbid": a submitted `assignee_id` (or any other unknown
+    # field) is rejected outright (422) rather than silently ignored —
+    # there is no ambiguity about whether a forged individual assignee
+    # was "accepted but dropped" vs. never a legal input in the first
+    # place.
+    model_config = {"extra": "forbid"}
 
     @field_validator("priority")
     @classmethod
@@ -23,6 +40,14 @@ class TaskRequestConvert(BaseModel):
         if value not in TASK_PRIORITIES:
             raise ValueError("Invalid task priority.")
         return value
+
+    @model_validator(mode="after")
+    def validate_mode_shape(self) -> "TaskRequestConvert":
+        if self.conversion_mode == "self" and self.team_id is not None:
+            raise ValueError("team_id must not be provided when conversion_mode is 'self'.")
+        if self.conversion_mode == "team" and self.team_id is None:
+            raise ValueError("team_id is required when conversion_mode is 'team'.")
+        return self
 
 
 class TaskRequestReject(BaseModel):

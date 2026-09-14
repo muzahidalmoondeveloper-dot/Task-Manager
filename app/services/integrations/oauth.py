@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
@@ -5,6 +6,8 @@ import httpx
 from itsdangerous import URLSafeSerializer
 
 from app.core.config import settings
+
+logger = logging.getLogger("integrations.oauth")
 
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -34,11 +37,37 @@ async def refresh_microsoft_token(refresh_token: str) -> dict:
             },
         )
 
+        # Structured logging follow-up: status code + provider only —
+        # never the response body (may contain a token or account-
+        # identifying claims) and never printed to stdout, which bypasses
+        # log levels/redaction entirely.
         if response.status_code >= 400:
-            print("Microsoft token refresh failed")
-            print("Status:", response.status_code)
-            print("Body:", response.text)
+            logger.warning("microsoft token refresh failed", extra={"provider": "microsoft", "stage": "token_refresh", "status_code": response.status_code})
 
+        response.raise_for_status()
+        return response.json()
+
+
+async def refresh_google_token(refresh_token: str) -> dict:
+    """Google OAuth access tokens expire in ~1 hour; unlike Microsoft's
+    flow, Google does not reliably re-issue a new `refresh_token` on
+    refresh — the original one (obtained with `access_type=offline` +
+    `prompt=consent`, see google_auth_url()) keeps working indefinitely
+    until the user revokes access, so this never needs to persist a new
+    one back (GmailService.ensure_fresh_token only updates access_token/
+    expires_at, mirroring MicrosoftGraphService)."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            GOOGLE_TOKEN_URL,
+            data={
+                "client_id": settings.GOOGLE_CLIENT_ID,
+                "client_secret": settings.GOOGLE_CLIENT_SECRET,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+        )
+        if response.status_code >= 400:
+            logger.warning("google token refresh failed", extra={"provider": "google", "stage": "token_refresh", "status_code": response.status_code})
         response.raise_for_status()
         return response.json()
 

@@ -16,7 +16,16 @@ from app.models.meeting import (
     Meeting, MeetingParticipant, MeetingAgendaItem,
     MeetingNote, MeetingDecision, MeetingTask, MeetingTemplate,
 )
+from app.models.organization import OrganizationMembership
+from app.models.project import ProjectMembership
 from app.models.task import Task
+from app.models.user import User
+from app.core.auth_errors import AppException, ErrorDef
+from app.core.org_roles import CLIENT
+from app.core.project_access import list_project_team_ids
+from app.core.task_assignment import validate_task_assignee
+from app.repositories.organization_repository import OrganizationRepository
+from app.repositories.project_repository import ProjectRepository
 from app.repositories.team_repository import TeamRepository
 from app.schemas.meeting import (
     MeetingCreate, MeetingUpdate, MeetingOut,
@@ -26,6 +35,7 @@ from app.schemas.meeting import (
     MeetingCreateTask, MeetingLinkTask, MeetingTaskOut,
     MeetingSummaryOut,
     MeetingParticipantOut, ParticipantJoinUpdate, ParticipantScoreUpdate, SelectSpeakerRequest,
+    UserRef,
     MeetingTemplateCreate, MeetingTemplateOut, SuggestedTasksOut,
     MeetingReactionCreate, MeetingReactionOut,
     TranscriptSubmit, TranscriptAnalyzeResult, ExtractedTaskSummary,
@@ -310,6 +320,154 @@ def _can_manage_all_meetings(tenant: TenantContext) -> bool:
     return tenant.is_manager_or_above or tenant.has_project_manager_access
 
 
+# Meeting Attendees follow-up (hardening pass): who a caller may add as a
+# Meeting attendee. Meetings have no per-meeting Project/Team selector in
+# this UI (`team_id`/`project_id` are optional, org-wide by default — see
+# the Meeting model's own docstring), so scoping is derived from the
+# ACTOR's own capability, not from a field on the meeting being created.
+#
+# Authoritative rule (this internal Meeting module, every meeting type —
+# Level 10, EOS, Same Page, Custom Agenda all share this same create/update
+# path, so there is only one rule to state): a Client is NEVER an eligible
+# attendee, for ANY role, even with a TeamMembership row — Meetings are an
+# internal-organization tool. Client status is decided ONLY by the
+# authoritative `OrganizationMembership.role` (never the legacy, possibly
+# stale `User.role` column), matching every other actor-scoped rule in
+# this codebase. Inactive users (OrganizationMembership.is_active /
+# User.is_active) are excluded the same way.
+#
+# Owner/Admin/Team Manager already see and manage every meeting in the org
+# (`_can_manage_all_meetings` above) and keep that same org-wide reach here
+# (minus Clients/inactive users — narrower than before, never broader). A
+# plain Project Manager (has_project_manager_access, no Owner/Admin/Team-
+# Manager capability) gets the union, across every Project they genuinely
+# manage (ProjectMembership), of: that Project's other members, plus every
+# member/manager of a Team attached to that Project (the same
+# `list_project_team_ids` union create_task()/update_task() already use for
+# Task delegation) — then the WHOLE candidate set (Project-membership-
+# sourced users included, since ProjectMembership carries no role
+# information and is also how a Client gets Project access at all) is
+# re-scoped through the same authoritative role/active check. Never
+# organization-wide `/users` access.
+async def _eligible_attendee_ids(db: AsyncSession, tenant: TenantContext) -> set[int]:
+    """Always returns an explicit id set (never a "no scoping" sentinel).
+    Only a plain Project Manager (has_project_manager_access, no Owner/
+    Admin/Team-Manager capability) gets the narrow Project/Team-scoped set
+    below — that is the one actual scope this fix narrows. Every other
+    actor who can reach a Meeting's participant_ids at all (Owner/Admin/
+    Team Manager, or a Team Member/Client who organizes their own meeting)
+    keeps its EXISTING, org-wide-within-this-organization reach; the only
+    thing every one of them newly loses here is a Client/inactive user,
+    per the Client Rule below, which is a universal Meeting-module rule,
+    not a role-specific narrowing."""
+    is_plain_project_manager = tenant.has_project_manager_access and not tenant.is_manager_or_above
+    if not is_plain_project_manager:
+        return await _active_non_client_ids(db, tenant.organization_id, None)
+
+    project_repo = ProjectRepository(db, tenant.organization_id)
+    managed_projects = await project_repo.list_for_user(tenant.user.id)
+    if not managed_projects:
+        return set()
+    project_ids = [p.id for p in managed_projects]
+
+    # One bulk query for every managed Project's ProjectMembership rows —
+    # never one query per Project.
+    membership_result = await db.execute(
+        select(ProjectMembership.user_id).where(ProjectMembership.project_id.in_(project_ids))
+    )
+    candidate_ids: set[int] = {row[0] for row in membership_result.all()}
+
+    # list_project_team_ids is a single-Project utility (shared with Task
+    # delegation's write-side validation) — looping it once per MANAGED
+    # PROJECT is a small, constant-ish cost bounded by how many Projects
+    # this PM manages, never by how many candidate USERS or ROWS come out
+    # of it, so this is not the N+1-per-user/per-row pattern the fix must
+    # avoid.
+    team_ids: set[int] = set()
+    for project_id in project_ids:
+        team_ids |= await list_project_team_ids(db, tenant.organization_id, project_id)
+    if team_ids:
+        team_repo = TeamRepository(db, tenant.organization_id)
+        # Bulk, one query regardless of how many Teams — already excludes
+        # Client/inactive via the authoritative OrganizationMembership.role.
+        members_by_team = await team_repo.list_assignable_members_bulk(list(team_ids))
+        for users in members_by_team.values():
+            candidate_ids.update(u.id for u in users)
+
+    if not candidate_ids:
+        return set()
+    return await _active_non_client_ids(db, tenant.organization_id, candidate_ids)
+
+
+async def _active_non_client_ids(db: AsyncSession, organization_id, candidate_ids: set[int] | None) -> set[int]:
+    """One query: active, non-Client members of THIS organization, from
+    `candidate_ids` when given (also the tenant-isolation re-check — a
+    candidate id from anywhere else, including another tenant, that isn't
+    a real row here is simply absent from the result) or every such member
+    when `candidate_ids` is None."""
+    q = (
+        select(OrganizationMembership.user_id)
+        .join(User, User.id == OrganizationMembership.user_id)
+        .where(
+            OrganizationMembership.organization_id == organization_id,
+            OrganizationMembership.role != CLIENT,
+            OrganizationMembership.is_active.is_(True),
+            User.is_active.is_(True),
+        )
+    )
+    if candidate_ids is not None:
+        q = q.where(OrganizationMembership.user_id.in_(candidate_ids))
+    result = await db.execute(q)
+    return {row[0] for row in result.all()}
+
+
+async def _validate_attendee_ids(db: AsyncSession, tenant: TenantContext, participant_ids: list[int]) -> None:
+    """Backend-enforced attendee scope for create/update — the frontend's
+    scoped dropdown (GET /meetings/eligible-attendees) is a convenience,
+    never the security boundary. Rejects (400) rather than silently
+    dropping unauthorized ids, matching this app's "never silently strip"
+    convention for every other actor-scoped mutation. A Client, an inactive
+    user, a cross-tenant id, or (for a plain Project Manager) a user
+    outside their managed-Project scope are all rejected the same way —
+    `_eligible_attendee_ids` already encodes every one of those rules."""
+    if not participant_ids:
+        return
+    requested = set(participant_ids)
+
+    eligible = await _eligible_attendee_ids(db, tenant)
+    unauthorized = requested - eligible
+    if unauthorized:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="One or more selected attendees are not available to this meeting.",
+        )
+
+
+@router.get("/eligible-attendees", response_model=list[UserRef])
+async def list_eligible_attendees(
+    db: AsyncSession = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Backs the Create/Edit Meeting page's "Select Attendee to Add"
+    dropdown. Previously this page called the org-wide `GET /users`
+    (Owner/Admin only) directly, so a plain Project Manager's request
+    403'd, was swallowed, and left the dropdown empty. This is the
+    smallest scoped replacement rather than restoring org-wide `/users`
+    access for Project Managers — see `_eligible_attendee_ids` for the
+    exact scoping rule. Same permission gate as create_meeting itself:
+    only a caller who could actually create a meeting needs this list."""
+    if not (tenant.is_manager_or_above or tenant.has_project_manager_access):
+        raise HTTPException(status_code=403, detail="You don't have permission to create meetings.")
+
+    org_repo = OrganizationRepository(db)
+    members = await org_repo.list_members(tenant.organization_id)
+
+    eligible_ids = await _eligible_attendee_ids(db, tenant)
+    members = [(m, u) for m, u in members if u.id in eligible_ids]
+
+    return [UserRef.model_validate(u) for _membership, u in members]
+
+
 async def _is_meeting_participant(db: AsyncSession, meeting_id: int, user_id: int) -> bool:
     result = await db.execute(
         select(MeetingParticipant.id).where(
@@ -448,6 +606,12 @@ async def create_meeting(
         if await team_repo.get_by_id(payload.team_id) is None:
             raise HTTPException(status_code=404, detail="Team not found")
 
+    # Meeting Attendees follow-up: backend-enforced attendee scope — never
+    # trust the frontend's scoped dropdown alone. Rejects outright (never
+    # silently drops) any attendee id outside this actor's real reach,
+    # including a cross-tenant user id from a manipulated request.
+    await _validate_attendee_ids(db, tenant, payload.participant_ids)
+
     # Authoritative re-check (the Create Meeting page also checks live via
     # GET /meetings/check-title as the user types) — this is the one that
     # actually blocks a race between two people typing the same name at once.
@@ -532,6 +696,15 @@ async def update_meeting(
         setattr(meeting, field, value)
 
     if payload.participant_ids is not None:
+        # Only the NEWLY added ids are checked against this actor's scope —
+        # an existing participant someone else legitimately added earlier
+        # (e.g. an Owner adding a user outside a plain PM's own Project
+        # scope) must never block this actor from later adding one more
+        # attendee via the same "resend the whole list" update shape this
+        # UI uses, and removing someone is never a scope concern either
+        # way.
+        newly_added = set(payload.participant_ids) - previously_participating
+        await _validate_attendee_ids(db, tenant, list(newly_added))
         for p in list(meeting.participants):
             await db.delete(p)
         await db.flush()
@@ -1089,6 +1262,13 @@ async def delete_decision(
 
 # ─── Tasks ────────────────────────────────────────────────────────────────────
 
+_MEETING_TODO_PM_CANNOT_ASSIGN_MEMBER = ErrorDef(
+    code="PROJECT_MANAGER_CANNOT_ASSIGN_MEMBER",
+    status=status.HTTP_403_FORBIDDEN,
+    message="Project Managers delegate tasks to teams. The Team Manager assigns the individual owner.",
+)
+
+
 @router.post("/{meeting_id}/tasks", response_model=MeetingTaskOut, status_code=status.HTTP_201_CREATED)
 async def create_meeting_task(
     meeting_id: int,
@@ -1098,6 +1278,31 @@ async def create_meeting_task(
 ):
     from datetime import date as dt_date
     meeting = await _get_meeting(meeting_id, tenant, db)
+
+    # Meeting To-Do permission follow-up: this used to accept `assignee_id`
+    # with NO validation at all — any meeting participant could, via a
+    # direct/manipulated request, create a real Task assigned to anyone,
+    # completely bypassing create_task()'s whole delegation model (a plain
+    # Project Manager may never directly assign an individual Team Member;
+    # a Client may never be an assignee; the assignee must be a real,
+    # active member of THIS organization). Reuses the exact same
+    # authoritative helper create_task()/update_task() already use
+    # (validate_task_assignee) rather than inventing a second, weaker Task
+    # permission system for Meetings. Only an actor who could already
+    # manage this meeting (Owner/Admin/Team Manager/Project Manager) may
+    # add a to-do here at all — matches the only UI entry points that ever
+    # exposed this action.
+    if not _can_manage_all_meetings(tenant):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You don't have permission to add to-dos to this meeting.")
+
+    is_plain_project_manager = tenant.has_project_manager_access and not tenant.is_manager_or_above
+    if is_plain_project_manager and payload.assignee_id is not None and payload.assignee_id != tenant.user.id:
+        raise AppException(_MEETING_TODO_PM_CANNOT_ASSIGN_MEMBER)
+
+    await validate_task_assignee(
+        db, organization_id=tenant.organization_id,
+        assignee_id=payload.assignee_id, team_id=meeting.team_id,
+    )
 
     due_date = None
     if payload.due_date:

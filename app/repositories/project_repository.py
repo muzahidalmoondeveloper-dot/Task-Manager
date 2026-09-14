@@ -234,3 +234,25 @@ class ProjectRepository(TenantRepository):
             select(ProjectTeam.team_id).where(ProjectTeam.project_id == project_id)
         )
         return set(result.scalars().all())
+
+    async def list_for_teams(self, team_ids: list[int]) -> list[Project]:
+        """Team Manager Create-Task-form Project-dropdown follow-up: the
+        reverse of list_assigned_team_ids() above — every Project
+        (deduplicated) with an explicit ProjectTeam row for any of these
+        team_ids, within this tenant. Explicit assignments only, same as
+        list_assigned_team_ids — never the wider derived Rock/KPI/Task
+        union list_project_team_ids() also includes, since this is meant
+        to mirror "a Team a manager can see has real Project(s) attached
+        to it," not every Project a Task under that Team has ever
+        happened to reference."""
+        if not team_ids:
+            return []
+        stmt = (
+            select(Project)
+            .join(ProjectTeam, ProjectTeam.project_id == Project.id)
+            .where(Project.organization_id == self.org_id, ProjectTeam.team_id.in_(team_ids))
+            .distinct()
+            .order_by(Project.created_at.desc())
+        )
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())

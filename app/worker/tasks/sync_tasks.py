@@ -17,7 +17,7 @@ from app.worker.celery_app import celery_app
 from app.worker.database import WorkerSession
 from app.repositories.user_repository import UserRepository
 from app.services.automation_tasks import (
-    analyze_yesterday_sources_for_user,
+    analyze_pending_sources_for_user,
     resolve_org_id_for_user,
     sync_microsoft_data_for_user,
 )
@@ -89,4 +89,4 @@ async def _do_analyze_sources(user_id: int) -> dict:
         if org_id is None:
             logger.warning("analyze_sources: no organization context | user_id=%s", user_id)
             return {}
-        return await analyze_yesterday_sources_for_user(db=db, user=user, org_id=org_id)
+        return await analyze_pending_sources_for_user(db=db, user=user, org_id=org_id)

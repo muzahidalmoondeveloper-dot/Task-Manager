@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, Query
 from fastapi import status as http_status
 
 from app.core.auth_errors import AppException, ErrorDef
-from app.core.tenant import TenantContext, get_tenant_context
+from app.core.tenant import TenantContext, require_org_admin
 from app.repositories.team_repository import TeamRepository
 from app.schemas.scoreboard import (
     ManagerRankingResponse,
@@ -18,21 +18,19 @@ from app.services import scoreboard_service as scoring
 
 router = APIRouter(prefix="/scoreboard", tags=["Scoreboard"])
 
-_FORBIDDEN = ErrorDef(code="ORG_SCOREBOARD_FORBIDDEN", status=http_status.HTTP_403_FORBIDDEN, message="You do not have permission to view the company scoreboard.")
 _INVALID_PERIOD = ErrorDef(code="SCOREBOARD_INVALID_PERIOD", status=http_status.HTTP_400_BAD_REQUEST, message="Invalid period or date range.")
 
 
 async def _visible_teams(tenant: TenantContext):
-    """Owner/Admin see every team in the org; Team Managers see only the
-    team(s) they manage. Everyone else is forbidden from all three rankings —
-    there is no per-employee self-view here; that's `GET /users/{id}/scoreboard`."""
-    if not tenant.is_manager_or_above:
-        raise AppException(_FORBIDDEN)
-
+    """Scoreboard authorization follow-up: the Company Scoreboard (org-wide
+    employee/team/manager rankings) is Admin-only — every caller reaching
+    here has already passed `Depends(require_org_admin)` on the route
+    itself, so this always sees every team in the org. The previous Team-
+    Manager-scoped-to-their-own-team(s) branch is removed — PM/TM capability
+    alone no longer grants any Scoreboard access, per the current product
+    rule."""
     team_repo = TeamRepository(tenant.db, tenant.organization_id)
-    if tenant.is_admin_or_owner:
-        return await team_repo.list_all()
-    return await team_repo.list_for_manager(tenant.user.id)
+    return await team_repo.list_all()
 
 
 @router.get("/employees", response_model=OrgScoreboardResponse)
@@ -43,7 +41,7 @@ async def get_organization_scoreboard(
     manager_id: int | None = Query(None),
     team_id: int | None = Query(None),
     employee_id: int | None = Query(None),
-    tenant: TenantContext = Depends(get_tenant_context),
+    tenant: TenantContext = Depends(require_org_admin),
 ):
     """Individual employee leaderboard."""
     teams = await _visible_teams(tenant)
@@ -88,7 +86,7 @@ async def get_team_rankings(
     period: str = Query("this_month"),
     start_date: date | None = Query(None),
     end_date: date | None = Query(None),
-    tenant: TenantContext = Depends(get_tenant_context),
+    tenant: TenantContext = Depends(require_org_admin),
 ):
     """Team leaderboard — every visible team ranked by its own team-wide score."""
     teams = await _visible_teams(tenant)
@@ -130,15 +128,16 @@ async def get_manager_rankings(
     period: str = Query("this_month"),
     start_date: date | None = Query(None),
     end_date: date | None = Query(None),
-    tenant: TenantContext = Depends(get_tenant_context),
+    tenant: TenantContext = Depends(require_org_admin),
 ):
     """Manager leaderboard — every visible manager ranked by the combined
-    score across every team and/or project they manage. The full manager
-    roster (including anyone not currently assigned a team/project) and
-    Project Manager assignments are both org-wide, so they're only included
-    for Owner/Admin (whose team visibility is already org-wide) — a Team
-    Manager's own restricted view stays scoped to their own team(s), same as
-    before."""
+    score across every team and/or project they manage. `require_org_admin`
+    on this route means every caller reaching here is Owner/Admin, so the
+    full manager roster (including anyone not currently assigned a team/
+    project) and org-wide Project Manager assignments are always fetched —
+    left as an explicit `is_admin_or_owner` check (always true here) rather
+    than restructured, since scoreboard calculations are out of scope for
+    this fix."""
     teams = await _visible_teams(tenant)
     project_manager_assignments = []
     all_manager_users = []

@@ -5,7 +5,7 @@ from fastapi import status as http_status
 
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.org_roles import CLIENT
-from app.core.tenant import TenantContext, get_tenant_context
+from app.core.tenant import TenantContext, require_org_admin
 from app.models.organization import OrganizationMembership
 from app.repositories.organization_repository import OrganizationRepository
 from app.repositories.project_repository import ProjectRepository
@@ -38,37 +38,83 @@ _PERIOD_LABELS = {
 }
 
 
-async def _require_can_view_scoreboard(tenant: TenantContext, target_user_id: int) -> OrganizationMembership:
-    # Scoreboards only exist for staff — clients (and anyone no longer an
-    # active member of this org) never have one, regardless of who's asking.
+# ── Scoreboard authorization follow-up ──────────────────────────────────────
+# Product rule (final): Scoreboard is an ADMIN-ONLY feature. Access depends
+# solely on the existing, canonical `is_admin_or_owner` capability (Owner,
+# Admin, or anyone additionally granted `is_org_admin` — the exact same
+# capability `require_org_admin` already enforces everywhere else in this
+# app, e.g. org settings/billing/member management). A Team Manager or
+# Project Manager capability — alone or combined — NEVER grants Scoreboard
+# access on its own; a hybrid PM/TM user who ALSO holds admin capability is
+# allowed purely because of that admin capability, not because of PM/TM.
+# Every route below is gated by `Depends(require_org_admin)` — the same
+# dependency used elsewhere, not a second, Scoreboard-specific permission
+# system.
+#
+# Previously, `_require_can_view_scoreboard` mixed TWO different concerns
+# into one function: (1) is the VIEWER allowed to see this scoreboard at
+# all (self/Owner/Admin/managing-Team-Manager/project-linked-PM), and (2)
+# what IS the target user's own OrganizationMembership. Its Team-Manager
+# branch had a bare `return` (no value) on every SUCCESSFUL access path,
+# so callers received `None` instead of the target's membership; the
+# caller (`_resolve_employee`) then dereferenced `.role` on `None` and
+# crashed with `AttributeError: 'NoneType' object has no attribute
+# 'role'` — a 500. `GET /scoreboard/tasks` never crashed because it only
+# used the return value for a truthiness/side-effect check and never
+# touched `.role`, which is why one endpoint 500'd and the sibling
+# endpoint for the exact same user didn't.
+#
+# `_require_can_view_scoreboard` (and the equivalent
+# `_require_can_view_team_scoreboard` in team_scoreboard.py) still exist,
+# UNCHANGED, because `app.api.routes.reports` reuses them, as-is, for a
+# DIFFERENT feature's authorization (Employee/Team Performance PDF
+# Reports) — this task is scoped to the Scoreboard feature itself, not a
+# redesign of Reports' own viewing rules, so those helpers — and the
+# PM/TM/self eligibility they still encode for Reports' purposes — are
+# deliberately left exactly as they were. The Scoreboard routes below no
+# longer call them at all.
+async def _resolve_target_membership(tenant: TenantContext, target_user_id: int) -> OrganizationMembership:
+    """Resolves and validates the TARGET user's OrganizationMembership for
+    the ACTIVE organization — deliberately the only thing this function
+    does. Viewer authorization is a completely separate concern, handled
+    by this router's own `Depends(require_org_admin)`; a function must
+    never sometimes return a membership and sometimes return None for a
+    caller to dereference unchecked — every return here is a real,
+    active, non-Client OrganizationMembership, or this raises instead.
+    Cross-tenant isolation is inherent: `get_membership` is scoped to
+    `tenant.organization_id`, so a user who belongs only to a different
+    organization simply has no row here and resolves as not found, never
+    as another organization's data leaking through."""
     org_repo = OrganizationRepository(tenant.db)
     target_membership = await org_repo.get_membership(tenant.organization_id, target_user_id)
     if target_membership is None or not target_membership.is_active:
         raise AppException(_USER_NOT_FOUND)
     if target_membership.role == CLIENT:
         raise AppException(_NOT_APPLICABLE)
+    return target_membership
+
+
+async def _require_can_view_scoreboard(tenant: TenantContext, target_user_id: int) -> OrganizationMembership:
+    """UNCHANGED — reused only by app.api.routes.reports for its own,
+    separate Employee/Team Performance report-viewing rule (self/Owner/
+    Admin/managing-Team-Manager/project-linked-PM). The Scoreboard routes
+    in THIS file no longer call this; see `_resolve_target_membership` +
+    `require_org_admin` above for the Scoreboard feature's own,
+    Admin-only rule. Do not repurpose this function for Scoreboard access
+    — Reports' behavior must stay exactly as it is."""
+    target_membership = await _resolve_target_membership(tenant, target_user_id)
 
     if tenant.user.id == target_user_id:
         return target_membership
     if tenant.is_admin_or_owner:
         return target_membership
 
-    # Flag-aware (role OR granted privilege flag), and additive — a hybrid
-    # Project Manager who's ALSO been granted team-manager privileges gets
-    # the union of both checks below, not just one. Previously branched on
-    # `tenant.org_role == "team_manager"` literally, which a user whose
-    # base role is "project_manager" (even with the is_team_manager flag
-    # granted and made an actual team's manager) could never match — they
-    # fell into the project_manager branch instead, which checks a
-    # completely different, project-membership-based criterion and
-    # incorrectly returned 403 for someone who legitimately manages a team
-    # the target user is on.
     if tenant.is_manager_or_above:
         team_repo = TeamRepository(tenant.db, tenant.organization_id)
         teams = await team_repo.list_for_manager(tenant.user.id)
         for team in teams:
             if any(m.user_id == target_user_id for m in team.memberships):
-                return
+                return target_membership
 
     if tenant.has_project_manager_access:
         task_repo = TaskRepository(tenant.db, tenant.organization_id)
@@ -84,15 +130,15 @@ async def _require_can_view_scoreboard(tenant: TenantContext, target_user_id: in
 
 async def _resolve_employee(tenant: TenantContext, user_id: int, membership: OrganizationMembership) -> ScoreboardEmployee:
     """Role-consistency fix (organization-role bug): `role` here MUST come
-    from the caller-supplied `OrganizationMembership` (already scoped to
-    THIS organization + this user by `_require_can_view_scoreboard`) —
-    never from the legacy, non-org-specific `User.role` column, which can
-    silently go stale relative to a user's actual membership role (e.g. a
-    user promoted to Owner in this org while `User.role` still reads
-    "team_member"). This is exactly the field the User Detail / Scorecard
-    header renders, so using the wrong source here is what previously made
-    it disagree with the Users list (which already read membership.role
-    correctly)."""
+    from the caller-supplied `OrganizationMembership` (already resolved
+    and scoped to THIS organization + this user by
+    `_resolve_target_membership`) — never from the legacy, non-org-specific
+    `User.role` column, which can silently go stale relative to a user's
+    actual membership role (e.g. a user promoted to Owner in this org
+    while `User.role` still reads "team_member"). This is exactly the
+    field the User Detail / Scorecard header renders, so using the wrong
+    source here is what previously made it disagree with the Users list
+    (which already read membership.role correctly)."""
     user_repo = UserRepository(tenant.db)
     employee = await user_repo.get_by_id(user_id)
     if employee is None:
@@ -119,9 +165,9 @@ async def get_scoreboard(
     team_id: int | None = Query(default=None),
     start_date: date | None = Query(default=None),
     end_date: date | None = Query(default=None),
-    tenant: TenantContext = Depends(get_tenant_context),
+    tenant: TenantContext = Depends(require_org_admin),
 ):
-    membership = await _require_can_view_scoreboard(tenant, user_id)
+    membership = await _resolve_target_membership(tenant, user_id)
     employee = await _resolve_employee(tenant, user_id, membership)
 
     try:
@@ -172,9 +218,18 @@ async def get_scoreboard_tasks(
     team_id: int | None = Query(default=None),
     start_date: date | None = Query(default=None),
     end_date: date | None = Query(default=None),
-    tenant: TenantContext = Depends(get_tenant_context),
+    tenant: TenantContext = Depends(require_org_admin),
 ):
-    await _require_can_view_scoreboard(tenant, user_id)
+    # Scoreboard authorization follow-up: previously this only called
+    # _require_can_view_scoreboard for its side effect and never touched
+    # `.role`, which is exactly why this endpoint never 500'd while the
+    # sibling `GET ""` endpoint above did for the same user. Still
+    # validates the target the same way every other Scoreboard endpoint
+    # now does (real/active/non-Client, within this organization) — an
+    # Admin must not be able to pull another organization's or a Client's
+    # task data through this endpoint even though it doesn't need the
+    # membership object itself.
+    await _resolve_target_membership(tenant, user_id)
 
     try:
         period_start, period_end = scoring.resolve_period(period, start_date, end_date)
