@@ -16,7 +16,7 @@ from app.core.activity_actions import (
 )
 from app.core.auth_errors import AppException, ErrorDef
 from app.core.database import get_db
-from app.core.org_roles import CLIENT, PROJECT_MANAGER, TEAM_MEMBER
+from app.core.org_roles import CLIENT, PROJECT_MANAGER
 from app.core.project_access import is_project_scoped, list_project_team_ids, require_project_access
 from app.core.task_assignment import validate_task_assignee
 from app.core.team_access import require_team_access
@@ -78,6 +78,22 @@ _TASK_TIMER_ACTIVE = ErrorDef(
     code="TASK_TIMER_ACTIVE",
     status=http_status.HTTP_409_CONFLICT,
     message="Stop the active task timer before changing the assignee.",
+)
+# Task-completion-policy follow-up: Pending Review is a REVIEW state, not
+# just another status a generic PATCH may freely transition out of into
+# "done" — that specific transition has its own canonical business logic
+# (require_task_manage_access authorization, "Approved" review note,
+# completed-submitter notification) that only `POST /tasks/{id}/approve`
+# implements. Both `PATCH /tasks/{id}/status` and `PATCH /tasks/{id}`
+# reject a "done" request against a Pending Review Task outright — for
+# EVERY caller, Owner/Admin included, who already has unconditional
+# Approve access anyway — rather than silently producing a "Marked done
+# directly." note that would misrepresent an un-reviewed submission as
+# reviewed, or a reviewed one via the wrong code path.
+_PENDING_REVIEW_REQUIRES_APPROVAL = ErrorDef(
+    code="PENDING_REVIEW_REQUIRES_APPROVAL",
+    status=http_status.HTTP_409_CONFLICT,
+    message="This task is pending review. Use Approve (or Assign Back) instead of a direct status update.",
 )
 
 # Project Manager Task-delegation follow-up: a Project-Manager-only actor
@@ -256,6 +272,129 @@ def is_personal_task_owner(tenant: TenantContext, task: Task) -> bool:
     A), matching require_task_update_access's own assignee-bypass
     exclusion."""
     return task.team_id is None and task.assignee_id == tenant.user.id and tenant.org_role != CLIENT
+
+
+async def can_complete_task_directly(
+    tenant: TenantContext, task: Task, team_repo: TeamRepository, project_repo: ProjectRepository,
+) -> bool:
+    """Task-completion-policy follow-up — the single canonical answer to
+    "is this exact caller eligible to complete THEIR OWN assigned Task
+    directly to Done, with no self-review step?" Used by BOTH
+    `update_task_status` and `update_task` so the two endpoints (and any
+    future one) can never drift into two different completion rules.
+
+    This answers ONE specific question — self-completion — and is
+    deliberately narrower than "may this caller set this Task's status at
+    all" (that's `require_task_update_access`) or "may this caller freely
+    manage any of this Team's/Project's Tasks, including someone else's"
+    (that pre-existing, UNRELATED authority — e.g. a Team Manager setting
+    a teammate's Task status directly — is still exercised by each route's
+    own call site, never by this function, which is why every branch
+    below requires `task.assignee_id == tenant.user.id`).
+
+    ROOT CAUSE this replaces: `update_task_status` used to key entirely on
+    the literal `tenant.org_role == TEAM_MEMBER` string — a global, task-
+    agnostic primary-role check. Two bugs fell out of that: a Team/Project
+    Manager who was merely the ORDINARY, non-managing assignee of a Task
+    under a Team/Project they do NOT manage got waved through to direct
+    completion purely for not being literally "team_member"; and a plain
+    Team Member's own PERSONAL Task (no Team reviewer exists at all) was
+    incorrectly forced through `pending_review` anyway. A LATER pass fixed
+    both by keying on managed-Team/managed-Project scope instead of the
+    role string — but that pass's TM/PM branches still didn't require
+    `task.assignee_id == tenant.user.id`, so a TM/PM managing a Team/
+    Project could (in principle, if a caller ever invoked this function
+    for that purpose) be read as having direct-completion authority over
+    a TEAMMATE's Task too, conflating "may I complete MY OWN work" with
+    "may I manage this Task" — two different concepts this function must
+    keep separate. This version requires the assignee check explicitly,
+    inside every TM/PM branch.
+
+    ELIGIBLE for direct self-completion (True):
+      - Owner/Admin: unconditional, unchanged, existing authority.
+      - The Task's own Personal/Standalone owner (`is_personal_task_owner`
+        — team_id NULL, they ARE the assignee) — role-agnostic; a
+        Personal Task has no Team/Project reviewer at all, for ANY role,
+        including a plain Team Member's own Personal Task.
+      - `task.assignee_id == tenant.user.id` AND a Team Manager (role or
+        granted `is_team_manager` flag) who actually manages THIS Task's
+        Team (`TeamRepository.is_manager`).
+      - `task.assignee_id == tenant.user.id` AND a Project Manager (role
+        or granted `is_project_manager` flag) who actually manages THIS
+        Task's Project — "manages" here is the SAME canonical definition
+        used everywhere else in this app for PM project scope (PM
+        capability + genuine `ProjectMembership` via `project_repo.
+        is_member` — see app.core.project_access's own docstring: for a
+        Project Manager, ProjectMembership IS the management grant, never
+        mere org-wide visibility; a non-PM caller can never reach this
+        branch at all since `has_project_manager_access` gates it first).
+
+    NOT eligible (False) — must go through the existing `pending_review`
+    workflow instead:
+      - An ordinary Team Member who is simply the assignee of a Team Task.
+      - A Team Manager who is simply the assignee of a Team they do NOT
+        manage — Team Manager title alone never grants direct-Done
+        authority outside their own managed scope.
+      - A Project Manager who is simply the assignee of a Project they do
+        NOT manage — same idea, Project Manager title alone never grants
+        organization-wide direct-Done authority.
+
+    This function does not itself perform any authorization gate (it
+    assumes the caller already legitimately reached this Task via
+    `require_task_update_access`), and it never answers "may this Task's
+    Team/Project manager touch a TEAMMATE's Task" — each call site keeps
+    that separate, pre-existing authority explicit and distinct (see the
+    `task.assignee_id != tenant.user.id` branch at each of this
+    function's call sites)."""
+    if tenant.is_admin_or_owner:
+        return True
+    if is_personal_task_owner(tenant, task):
+        return True
+    if task.assignee_id != tenant.user.id:
+        return False
+    if tenant.is_manager_or_above and task.team_id is not None:
+        if await team_repo.is_manager(task.team_id, tenant.user.id):
+            return True
+    if tenant.has_project_manager_access and task.project_id is not None:
+        if await project_repo.is_member(task.project_id, tenant.user.id):
+            return True
+    return False
+
+
+async def notify_task_pending_review(
+    db: AsyncSession, background_tasks: BackgroundTasks, tenant: TenantContext, task: Task,
+) -> None:
+    """Task-completion-policy follow-up: the ONE shared implementation of
+    the "submitted for review" side effects (in-app notification, reviewer
+    resolution, background email) — used by both `update_task_status` and
+    `update_task` so their "ordinary assignee, not eligible for direct
+    completion" downgrade-to-Pending-Review path can never drift apart.
+    Callers are responsible for setting `task.status`/`completed_*`/
+    `reviewed_*` themselves and for committing — this only adds the
+    notification row and schedules the background email; it never touches
+    `task.status` and never commits."""
+    team = task.team
+    if team and team.team_manager_id:
+        await create_notification(
+            db=db, user_id=team.team_manager_id, task_id=task.id, title="Task pending review",
+            message=f"{tenant.user.full_name} marked '{task.name}' as completed. Please review it.",
+            type_="task_review",
+        )
+
+    user_repo = UserRepository(db)
+    reviewer: User | None = None
+    if team and team.team_manager_id:
+        reviewer = await user_repo.get_by_id(team.team_manager_id)
+    if reviewer is None:
+        membership_result = await db.execute(select(TeamMembership).where(TeamMembership.user_id == tenant.user.id).limit(1))
+        membership = membership_result.scalar_one_or_none()
+        if membership:
+            member_team_result = await db.execute(select(Team).where(Team.id == membership.team_id))
+            member_team = member_team_result.scalar_one_or_none()
+            if member_team and member_team.team_manager_id:
+                reviewer = await user_repo.get_by_id(member_team.team_manager_id)
+    if reviewer:
+        background_tasks.add_task(bg_send_task_sent_for_review, task.id, tenant.user.id, reviewer.id)
 
 
 async def require_task_update_access(
@@ -960,49 +1099,6 @@ async def update_task_status(
     repo = TaskRepository(db, tenant.organization_id)
     task = await get_task_or_404(tenant, task_id)
 
-    if tenant.org_role == TEAM_MEMBER:
-        if task.assignee_id != tenant.user.id:
-            raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="You can only update status on tasks assigned to you.")
-        # Below this line is TEAM_MEMBER's own existing assignee-only
-        # review-submission workflow — completely unchanged.
-
-        if payload.status == "done":
-            task.status = "pending_review"
-            task.completed_by_id = tenant.user.id
-            task.completed_at = datetime.now(timezone.utc)
-            task.reviewed_by_id = None
-            task.reviewed_at = None
-            task.review_note = None
-
-            team = task.team
-            if team and team.team_manager_id:
-                await create_notification(db=db, user_id=team.team_manager_id, task_id=task.id, title="Task pending review", message=f"{tenant.user.full_name} marked '{task.name}' as completed. Please review it.", type_="task_review")
-
-            await db.commit()
-            await db.refresh(task)
-
-            user_repo = UserRepository(db)
-            reviewer: User | None = None
-            if team and team.team_manager_id:
-                reviewer = await user_repo.get_by_id(team.team_manager_id)
-            if reviewer is None:
-                membership_result = await db.execute(select(TeamMembership).where(TeamMembership.user_id == tenant.user.id).limit(1))
-                membership = membership_result.scalar_one_or_none()
-                if membership:
-                    member_team_result = await db.execute(select(Team).where(Team.id == membership.team_id))
-                    member_team = member_team_result.scalar_one_or_none()
-                    if member_team and member_team.team_manager_id:
-                        reviewer = await user_repo.get_by_id(member_team.team_manager_id)
-            if reviewer:
-                background_tasks.add_task(bg_send_task_sent_for_review, task.id, tenant.user.id, reviewer.id)
-            return serialize_task(task)
-
-        if payload.status not in {"todo", "in_progress"}:
-            raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="Members can only move tasks to Todo, In Progress, or submit Done for review.")
-
-        updated = await repo.update(task, TaskUpdate(status=payload.status))
-        return serialize_task(updated)
-
     # Team Manager Task-update-scope bug fix: this used to be a bare
     # `if not tenant.is_admin_or_owner: raise` — a SECOND, stale
     # authorization implementation that flatly rejected every non-Owner/
@@ -1018,6 +1114,54 @@ async def update_task_status(
     project_repo = ProjectRepository(db, tenant.organization_id)
     team_repo = TeamRepository(db, tenant.organization_id)
     await require_task_update_access(tenant, task, project_repo, team_repo)
+
+    # Pending Review must remain a review state — see
+    # _PENDING_REVIEW_REQUIRES_APPROVAL's own comment. Checked before any
+    # completion-policy branching below, for every caller.
+    if task.status == "pending_review" and payload.status == "done":
+        raise AppException(_PENDING_REVIEW_REQUIRES_APPROVAL)
+
+    # Task-completion-policy follow-up: this used to branch on the literal
+    # `tenant.org_role == TEAM_MEMBER` — a global, task-agnostic primary-
+    # role check that produced two bugs: a Team/Project Manager's own
+    # ORDINARY assignment under a Team/Project they don't manage got waved
+    # through to direct completion purely for not being literally
+    # "team_member", and a plain Team Member's own PERSONAL Task (no Team
+    # reviewer at all) got incorrectly forced through Pending Review. The
+    # real question is never "what is this caller's primary role" — it's
+    # "is this caller eligible for direct completion of THIS exact Task",
+    # answered once, canonically, by `can_complete_task_directly` (shared
+    # with `update_task`'s identical rule below, so the two endpoints can
+    # never drift). Only reachable here when the caller IS this Task's
+    # actual assignee (an Owner/Admin, or a TM/PM managing this Task's
+    # scope, is always direct-completion-eligible by that same helper —
+    # see its own docstring — so this branch is never taken for them).
+    is_ordinary_assignee_review_case = (
+        task.assignee_id == tenant.user.id
+        and not await can_complete_task_directly(tenant, task, team_repo, project_repo)
+    )
+
+    if is_ordinary_assignee_review_case:
+        # Below this line is the existing assignee-only review-submission
+        # workflow — completely unchanged in its own effects, only its
+        # entry condition changed (see above).
+        if payload.status == "done":
+            task.status = "pending_review"
+            task.completed_by_id = tenant.user.id
+            task.completed_at = datetime.now(timezone.utc)
+            task.reviewed_by_id = None
+            task.reviewed_at = None
+            task.review_note = None
+            await notify_task_pending_review(db, background_tasks, tenant, task)
+            await db.commit()
+            await db.refresh(task)
+            return serialize_task(task)
+
+        if payload.status not in {"todo", "in_progress"}:
+            raise HTTPException(status_code=http_status.HTTP_403_FORBIDDEN, detail="Members can only move tasks to Todo, In Progress, or submit Done for review.")
+
+        updated = await repo.update(task, TaskUpdate(status=payload.status))
+        return serialize_task(updated)
 
     if payload.status == "done" and task.status != "done":
         task.completed_by_id = task.assignee_id or tenant.user.id
@@ -1123,6 +1267,12 @@ async def update_task(
     # itself, which would grant organization-wide Task mutation instead of
     # this per-task, per-team/per-project scope.
     await require_task_update_access(tenant, task, project_repo, team_repo)
+
+    # Pending Review must remain a review state — see
+    # _PENDING_REVIEW_REQUIRES_APPROVAL's own comment. Checked before any
+    # field-whitelist/completion-policy branching below, for every caller.
+    if task.status == "pending_review" and payload.status == "done":
+        raise AppException(_PENDING_REVIEW_REQUIRES_APPROVAL)
 
     # A plain Project Manager may only mutate a strict whitelist of core
     # Task fields — never assignee_id/project_id/icon/anything else not
@@ -1296,11 +1446,48 @@ async def update_task(
     before = {"status": task.status, "priority": task.priority, "name": task.name, "assignee_id": task.assignee_id}
 
     if payload.status == "done" and task.status != "done":
-        task.completed_by_id = task.assignee_id or tenant.user.id
-        task.completed_at = datetime.now(timezone.utc)
-        task.reviewed_by_id = tenant.user.id
-        task.reviewed_at = datetime.now(timezone.utc)
-        task.review_note = "Marked done directly."
+        # Task-completion-policy follow-up: `can_complete_task_directly`
+        # is the SAME canonical check `update_task_status` uses — this
+        # route used to unconditionally mark ANY caller who passed the
+        # field-whitelist gates above as "Marked done directly.", with no
+        # distinction between "eligible for direct completion of THIS
+        # Task" and "merely permitted to set the status field at all." In
+        # practice that let a plain Project Manager who was simply the
+        # bare assignee of an unrelated, unmanaged Project's Task (or,
+        # symmetrically, a Team Manager on a Team they don't manage) skip
+        # Pending Review entirely. `task.assignee_id != tenant.user.id`
+        # short-circuits the check for the pre-existing, UNRELATED
+        # capability this must not disturb: a TM managing this Task's
+        # Team (or a genuine PM member of its Project) directly setting
+        # the status of a TEAMMATE's Task — already vetted by
+        # `require_task_update_access` plus the field-whitelist branch
+        # that let this code run in the first place, so re-deriving it
+        # here would be redundant, not safer.
+        direct_completion_ok = (
+            tenant.is_admin_or_owner
+            or task.assignee_id != tenant.user.id
+            or await can_complete_task_directly(tenant, task, team_repo, project_repo)
+        )
+        if direct_completion_ok:
+            task.completed_by_id = task.assignee_id or tenant.user.id
+            task.completed_at = datetime.now(timezone.utc)
+            task.reviewed_by_id = tenant.user.id
+            task.reviewed_at = datetime.now(timezone.utc)
+            task.review_note = "Marked done directly."
+        else:
+            # Ordinary assignee, not eligible for direct completion of
+            # THIS Task (not its Personal owner, not managing its Team/
+            # Project) — a "done" submission is a request for review,
+            # identical to update_task_status's own review-submission
+            # side effects (never a fabricated Approve) via the same
+            # shared `notify_task_pending_review` helper.
+            payload.status = "pending_review"
+            task.completed_by_id = tenant.user.id
+            task.completed_at = datetime.now(timezone.utc)
+            task.reviewed_by_id = None
+            task.reviewed_at = None
+            task.review_note = None
+            await notify_task_pending_review(db, background_tasks, tenant, task)
     elif payload.status is not None and payload.status != "done" and task.status == "done":
         task.completed_by_id = None
         task.completed_at = None
